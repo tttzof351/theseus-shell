@@ -1,0 +1,171 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: Detect version release
+    runs-on: ubuntu-24.04
+    outputs:
+      should_release: ${{ steps.detect.outputs.should_release }}
+      version: ${{ steps.detect.outputs.version }}
+      rust_version: ${{ steps.detect.outputs.rust_version }}
+      tag: ${{ steps.detect.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect version change
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          current_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          rust_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])')"
+          tag="v${current_version}"
+
+          should_release=false
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            should_release=true
+          else
+            previous_version=""
+            if git cat-file -e "${{ github.event.before }}:Cargo.toml" 2>/dev/null; then
+              git show "${{ github.event.before }}:Cargo.toml" > /tmp/previous-Cargo.toml
+              previous_version="$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["package"]["version"])' /tmp/previous-Cargo.toml)"
+            fi
+
+            if [[ "${previous_version}" != "${current_version}" ]]; then
+              should_release=true
+            fi
+          fi
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            should_release=false
+          fi
+
+          {
+            echo "should_release=${should_release}"
+            echo "version=${current_version}"
+            echo "rust_version=${rust_version}"
+            echo "tag=${tag}"
+          } >> "${GITHUB_OUTPUT}"
+
+          if [[ "${should_release}" == "true" ]]; then
+            echo "Will publish ${tag}"
+          else
+            echo "No release needed for ${tag}"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: version
+    if: needs.version.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: theseus-linux-amd64
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: theseus-linux-arm64
+          - name: macos-amd64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: theseus-macos-amd64
+          - name: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            archive: theseus-macos-arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: rustup toolchain install "${{ needs.version.outputs.rust_version }}" --profile minimal --target "${{ matrix.target }}"
+
+      - name: Build
+        run: cargo +"${{ needs.version.outputs.rust_version }}" build --locked --release --target "${{ matrix.target }}"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          staging="${{ matrix.archive }}"
+          mkdir -p "${staging}"
+          cp "target/${{ matrix.target }}/release/theseus" "${staging}/"
+          cp README.md "${staging}/"
+
+          tar -czf "${staging}.tar.gz" "${staging}"
+
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
+          else
+            sha256sum "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}.tar.gz
+            ${{ matrix.archive }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs:
+      - version
+      - build
+    if: needs.version.outputs.should_release == 'true'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release create "${{ needs.version.outputs.tag }}" \
+            dist/*.tar.gz \
+            dist/*.tar.gz.sha256 \
+            --title "theseus ${{ needs.version.outputs.version }}" \
+            --notes "Automated release for theseus ${{ needs.version.outputs.version }}."
+        env:
+          GH_TOKEN: ${{ github.token }}

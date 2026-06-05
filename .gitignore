@@ -1,0 +1,7 @@
+/target
+/drafts
+/reports
+/report
+/showcases
+*.DS_Store
+*.pyc
