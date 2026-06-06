@@ -8,12 +8,14 @@ use crossterm::{
 };
 
 use super::{
+    colorize_tag,
     completion::{CompletionState, completion_state, token_before_cursor},
     is_alt_key, is_command_key, is_key_press, is_plain_text_key,
     line_buffer::LineBuffer,
     raw_mode::RawModeGuard,
     text_length,
 };
+use crate::commands::slash_commands;
 
 #[cfg(test)]
 use super::completion::{Completion, CompletionToken};
@@ -321,7 +323,7 @@ impl<'a> LineEditor<'a> {
             execute!(stdout, MoveUp(self.rendered_rows - 1))?;
         }
 
-        write!(stdout, "{}{}", self.prompt, self.current_line())?;
+        write!(stdout, "{}{}", self.prompt, highlighted_input(&self.current_line()))?;
 
         let rendered_end_row = layout.rows - 1;
         if rendered_end_row > layout.cursor_row {
@@ -547,6 +549,20 @@ fn wrapped_rows(visible_len: usize, columns: usize) -> usize {
     visible_len / columns + 1
 }
 
+fn highlighted_input(input: &str) -> String {
+    let Some(spec) = slash_commands().iter().find(|spec| {
+        input == spec.name
+            || input
+                .strip_prefix(spec.name)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+    }) else {
+        return input.to_string();
+    };
+
+    let rest = &input[spec.name.len()..];
+    format!("{}{}", colorize_tag("bright-cyan", spec.name), rest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,5 +702,31 @@ mod tests {
         assert_eq!(layout.rows, 3);
         assert_eq!(layout.cursor_row, 2);
         assert_eq!(layout.cursor_col, 5);
+    }
+
+    #[test]
+    fn highlights_exact_slash_command() {
+        assert_eq!(
+            highlighted_input("/config"),
+            "\x1b[96m/config\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn highlights_slash_command_with_trailing_input() {
+        assert_eq!(
+            highlighted_input("/ask explain this"),
+            "\x1b[96m/ask\x1b[0m explain this"
+        );
+    }
+
+    #[test]
+    fn does_not_highlight_unknown_slash_command() {
+        assert_eq!(highlighted_input("/unknown"), "/unknown");
+    }
+
+    #[test]
+    fn does_not_highlight_slash_command_prefix_inside_word() {
+        assert_eq!(highlighted_input("/configure"), "/configure");
     }
 }
