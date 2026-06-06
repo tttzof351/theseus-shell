@@ -1,7 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 
 use crossterm::{
-    cursor::{MoveDown, MoveRight, MoveToColumn, MoveUp},
+    cursor::{self, MoveDown, MoveRight, MoveTo, MoveToColumn, MoveUp},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{self, Clear, ClearType},
@@ -54,6 +54,8 @@ pub fn read_masked_line(prompt: &str) -> io::Result<Option<String>> {
 struct MaskedLineEditor<'a> {
     prompt: &'a str,
     input: String,
+    start_col: u16,
+    start_row: u16,
     rendered_rows: u16,
     rendered_cursor_row: u16,
 }
@@ -63,12 +65,17 @@ impl<'a> MaskedLineEditor<'a> {
         Self {
             prompt,
             input: String::new(),
+            start_col: 0,
+            start_row: 0,
             rendered_rows: 1,
             rendered_cursor_row: 0,
         }
     }
 
     fn run(&mut self) -> io::Result<Option<String>> {
+        let (start_col, start_row) = cursor::position()?;
+        self.start_col = start_col;
+        self.start_row = start_row;
         print!("{}", self.prompt);
         io::stdout().flush()?;
 
@@ -110,12 +117,10 @@ impl<'a> MaskedLineEditor<'a> {
 
     fn render(&mut self) -> io::Result<()> {
         let mut stdout = io::stdout();
-        let layout = masked_render_layout(self.prompt, self.input.chars().count());
+        let layout = masked_render_layout(self.start_col, self.prompt, self.input.chars().count());
+        self.make_room_for_rows(layout.rows)?;
 
-        if self.rendered_cursor_row > 0 {
-            execute!(stdout, MoveUp(self.rendered_cursor_row))?;
-        }
-
+        execute!(stdout, MoveTo(self.start_col, self.start_row))?;
         for row in 0..self.rendered_rows {
             execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
             if row + 1 < self.rendered_rows {
@@ -127,6 +132,7 @@ impl<'a> MaskedLineEditor<'a> {
             execute!(stdout, MoveUp(self.rendered_rows - 1))?;
         }
 
+        execute!(stdout, MoveTo(self.start_col, self.start_row))?;
         write!(
             stdout,
             "{}{}",
@@ -134,22 +140,32 @@ impl<'a> MaskedLineEditor<'a> {
             "*".repeat(self.input.chars().count())
         )?;
 
-        let rendered_end_row = layout.rows - 1;
-        if rendered_end_row > layout.cursor_row {
-            execute!(stdout, MoveUp(rendered_end_row - layout.cursor_row))?;
-        } else if layout.cursor_row > rendered_end_row {
-            execute!(stdout, MoveDown(layout.cursor_row - rendered_end_row))?;
-        }
-
-        execute!(stdout, MoveToColumn(0))?;
-        if layout.cursor_col > 0 {
-            execute!(stdout, MoveRight(layout.cursor_col))?;
-        }
+        execute!(
+            stdout,
+            MoveTo(layout.cursor_col, self.start_row + layout.cursor_row)
+        )?;
 
         self.rendered_rows = layout.rows;
         self.rendered_cursor_row = layout.cursor_row;
 
         stdout.flush()
+    }
+
+    fn make_room_for_rows(&mut self, rows: u16) -> io::Result<()> {
+        let terminal_rows = terminal_height();
+        let required_end_row = self.start_row.saturating_add(rows);
+        if required_end_row <= terminal_rows {
+            return Ok(());
+        }
+
+        let scroll_rows = required_end_row - terminal_rows;
+        let mut stdout = io::stdout();
+        for _ in 0..scroll_rows {
+            write!(stdout, "\r\n")?;
+        }
+        stdout.flush()?;
+        self.start_row = self.start_row.saturating_sub(scroll_rows);
+        Ok(())
     }
 
     fn finish_line(&self) -> io::Result<()> {
@@ -323,7 +339,12 @@ impl<'a> LineEditor<'a> {
             execute!(stdout, MoveUp(self.rendered_rows - 1))?;
         }
 
-        write!(stdout, "{}{}", self.prompt, highlighted_input(&self.current_line()))?;
+        write!(
+            stdout,
+            "{}{}",
+            self.prompt,
+            highlighted_input(&self.current_line())
+        )?;
 
         let rendered_end_row = layout.rows - 1;
         if rendered_end_row > layout.cursor_row {
@@ -522,27 +543,36 @@ struct RenderLayout {
     cursor_col: u16,
 }
 
-fn masked_render_layout(prompt: &str, input_len: usize) -> RenderLayout {
+fn masked_render_layout(start_col: u16, prompt: &str, input_len: usize) -> RenderLayout {
     let columns = terminal::size()
         .ok()
         .map(|(columns, _)| columns.max(1) as usize)
         .unwrap_or(80);
-    masked_render_layout_for_columns(prompt, input_len, columns)
+    masked_render_layout_for_columns(start_col, prompt, input_len, columns)
 }
 
 fn masked_render_layout_for_columns(
+    start_col: u16,
     prompt: &str,
     input_len: usize,
     columns: usize,
 ) -> RenderLayout {
     let visible_len = text_length(prompt, false) + input_len;
-    let rows = wrapped_rows(visible_len, columns);
+    let total_len = start_col as usize + visible_len;
+    let rows = wrapped_rows(total_len, columns);
 
     RenderLayout {
         rows: rows as u16,
-        cursor_row: (visible_len / columns) as u16,
-        cursor_col: (visible_len % columns) as u16,
+        cursor_row: (total_len / columns) as u16,
+        cursor_col: (total_len % columns) as u16,
     }
+}
+
+fn terminal_height() -> u16 {
+    terminal::size()
+        .ok()
+        .map(|(_, rows)| rows.max(1))
+        .unwrap_or(24)
 }
 
 fn wrapped_rows(visible_len: usize, columns: usize) -> usize {
@@ -697,7 +727,7 @@ mod tests {
 
     #[test]
     fn masked_render_layout_wraps_long_secret() {
-        let layout = masked_render_layout_for_columns("Openrouter API key: ", 25, 20);
+        let layout = masked_render_layout_for_columns(0, "Openrouter API key: ", 25, 20);
 
         assert_eq!(layout.rows, 3);
         assert_eq!(layout.cursor_row, 2);
@@ -705,11 +735,17 @@ mod tests {
     }
 
     #[test]
+    fn masked_render_layout_accounts_for_start_column() {
+        let layout = masked_render_layout_for_columns(5, "key: ", 10, 12);
+
+        assert_eq!(layout.rows, 2);
+        assert_eq!(layout.cursor_row, 1);
+        assert_eq!(layout.cursor_col, 8);
+    }
+
+    #[test]
     fn highlights_exact_slash_command() {
-        assert_eq!(
-            highlighted_input("/config"),
-            "\x1b[96m/config\x1b[0m"
-        );
+        assert_eq!(highlighted_input("/config"), "\x1b[96m/config\x1b[0m");
     }
 
     #[test]

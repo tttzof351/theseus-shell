@@ -3,5 +3,6 @@
 /reports
 /report
 /showcases
+/playground
 *.DS_Store
 *.pyc
