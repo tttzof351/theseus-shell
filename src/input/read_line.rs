@@ -90,6 +90,9 @@ impl<'a> MaskedLineEditor<'a> {
                             return Ok(None);
                         }
                     }
+                    KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.clear_screen_and_render()?;
+                    }
                     KeyCode::Enter => {
                         self.finish_line()?;
                         return Ok(Some(self.input.clone()));
@@ -113,6 +116,17 @@ impl<'a> MaskedLineEditor<'a> {
                 _ => {}
             }
         }
+    }
+
+    fn clear_screen_and_render(&mut self) -> io::Result<()> {
+        let mut stdout = io::stdout();
+        execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
+        self.start_col = 0;
+        self.start_row = 0;
+        self.rendered_rows = 1;
+        self.rendered_cursor_row = 0;
+        stdout.flush()?;
+        self.render()
     }
 
     fn render(&mut self) -> io::Result<()> {
@@ -231,6 +245,9 @@ impl<'a> LineEditor<'a> {
                 if self.line.is_empty() {
                     return Ok(Some(None));
                 }
+            }
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.clear_screen_and_render()?;
             }
             KeyCode::Enter => {
                 self.finish_line()?;
@@ -362,6 +379,15 @@ impl<'a> LineEditor<'a> {
         self.rendered_cursor_row = layout.cursor_row;
 
         stdout.flush()
+    }
+
+    fn clear_screen_and_render(&mut self) -> io::Result<()> {
+        let mut stdout = io::stdout();
+        execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
+        self.rendered_rows = 1;
+        self.rendered_cursor_row = 0;
+        stdout.flush()?;
+        self.render()
     }
 
     fn render_layout(&self) -> RenderLayout {
