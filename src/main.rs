@@ -1,11 +1,8 @@
 use std::io::{self, Write};
 
 use theseus::agent::{Agent, AgentConfig};
-use theseus::commands::slash_commands;
-use theseus::common::{
-    system_tools::{SearchToolAvailability, search_tool_availability},
-    tmp_files::cleanup_expired_tmp_files_async,
-};
+use theseus::common::info::render_info;
+use theseus::common::tmp_files::cleanup_expired_tmp_files_async;
 use theseus::input::{BoxOptions, colorize_nested, wrap_in_box};
 use theseus::logging::AppLogger;
 use theseus::shell::{ShellConfig, run_shell};
@@ -114,61 +111,6 @@ fn print_help() {
     println!();
 }
 
-fn show_shell_demo() {
-    let command_help = slash_commands()
-        .iter()
-        .map(|command| format!("<bold>{:<8}</bold> — {}", command.name, command.description))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let mut sections = vec![
-        format!(
-            "<bold><green>Theseus shell wrapper (v{})</green></bold>",
-            theseus::commands::VERSION
-        ),
-        command_help,
-        "<cyan>~/.theseus/config.jsonc</cyan>\n<cyan>~/.theseus/logs</cyan>".to_string(),
-    ];
-
-    if let Some(tips) = missing_search_tool_tips(search_tool_availability()) {
-        sections.push(tips);
-    }
-
-    let content = sections.join("\n\n");
-
-    let boxed = wrap_in_box(
-        &content,
-        BoxOptions {
-            max_width: 58,
-            border_color: Some("orange".to_string()),
-            has_tags: true,
-        },
-    );
-
-    println!("{}", colorize_nested(&boxed));
-    println!();
-}
-
-fn missing_search_tool_tips(availability: SearchToolAvailability) -> Option<String> {
-    let _ = availability;
-
-    match (availability.rg, availability.jq) {
-        (true, true) => None,
-        (false, false) => Some(
-            "<bold>TIPS</bold>\n<bright-black>Install <bold>ripgrep (rg)</bold> for fast project search.</bright-black>\n<bright-black>Install <bold>jq</bold> for JSON filtering.</bright-black>"
-                .to_string(),
-        ),
-        (false, true) => Some(
-            "<bold>TIPS</bold>\n<bright-black>Install <bold>ripgrep (rg)</bold> for faster text and file search.</bright-black>"
-                .to_string(),
-        ),
-        (true, false) => Some(
-            "<bold>TIPS</bold>\n<bright-black>Install <bold>jq</bold> for JSON filtering and transformation.</bright-black>"
-                .to_string(),
-        ),
-    }
-}
-
 fn run_shell_command(args: Vec<String>) -> std::io::Result<i32> {
     let agent_init = AgentConfig::load_or_create_default()?;
     cleanup_expired_tmp_files_async(agent_init.config.agent_settings.tmp_files_ttl_min);
@@ -183,7 +125,7 @@ fn run_shell_command(args: Vec<String>) -> std::io::Result<i32> {
         ..ShellConfig::default()
     };
 
-    show_shell_demo();
+    print!("{}", render_info());
 
     run_shell(config)
 }

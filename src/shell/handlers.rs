@@ -9,6 +9,7 @@ use super::{
 };
 use crate::{
     agent::{Agent, AgentConfig, CompactOutcome, default_config_path},
+    common::info::render_info,
     common::output::CommandOutput,
     input::{MultiLineConfig, colorize_nested, read_multi_line_input},
     logging::AppLogger,
@@ -80,16 +81,9 @@ impl TheseusShell {
     }
 
     pub(super) fn handle_help_command(&self) -> CommandOutput {
-        let mut lines = String::new();
-        lines.push_str(&format!(
-            "  {:<10} v{}\n\n",
-            "theseus",
-            crate::commands::VERSION
-        ));
-        for spec in crate::commands::slash_commands() {
-            lines.push_str(&format!("  {:<10} {}\n", spec.name, spec.description));
-        }
-        CommandOutput::success(lines)
+        // Render the same boxed info screen that `run_shell_command` prints
+        // at shell startup so the two outputs can never diverge.
+        CommandOutput::success(render_info())
     }
 
     pub(super) fn handle_reset_command(&mut self) -> CommandOutput {
