@@ -19,12 +19,15 @@ impl Agent {
         &self,
         cancellation: &crate::common::cancellation::CancellationEvent,
     ) -> io::Result<TrajectoryMessage> {
-        let messages = self
-            .trajectory
-            .iter()
-            .map(|entry| entry.message.clone())
-            .collect::<Vec<_>>();
+        let messages = self.completion_messages();
         self.request_completion_for_messages(messages, true, "chat", cancellation)
+    }
+
+    fn completion_messages(&self) -> Vec<messages::ChatMessage> {
+        self.trajectory
+            .iter()
+            .filter_map(|entry| entry.message().cloned())
+            .collect()
     }
 
     pub(super) fn request_completion_for_messages(
@@ -343,13 +346,17 @@ fn is_retryable_llm_error(err: &io::Error) -> bool {
 }
 
 fn validate_trajectory_message(message: &TrajectoryMessage) -> io::Result<()> {
+    let Some(message) = message.message() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "LLM response choice did not contain a chat message",
+        ));
+    };
     let has_content = message
-        .message
         .content_text()
         .as_deref()
         .is_some_and(|content| !content.trim().is_empty());
     let has_tool_calls = message
-        .message
         .tool_calls
         .as_ref()
         .is_some_and(|tool_calls| !tool_calls.is_empty());
@@ -470,6 +477,18 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(tool_names, ["read_file"]);
+    }
+
+    #[test]
+    fn completion_messages_skip_trajectory_config_entries() {
+        let mut agent = Agent::new(AgentConfig::default_empty());
+        agent.push_message(ChatMessage::user("hello"));
+
+        let messages = agent.completion_messages();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
     }
 
     #[test]

@@ -74,7 +74,15 @@ impl Agent {
 
         let system_prompt = config.agent_settings.system_prompt.join("\n");
         let compact_prompt = config.agent_settings.compact_prompt.join("\n");
-        let system_message = ChatMessage::system(system_prompt.clone());
+        let trajectory = initial_trajectory(
+            config
+                .llm_request_settings
+                .body
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            system_prompt.clone(),
+        );
 
         Self {
             base_url: config.llm_request_settings.base_url,
@@ -99,14 +107,27 @@ impl Agent {
             system_prompt,
             compact_prompt,
             client: super::llm::llm_client(llm_request_timeout, llm_connect_timeout),
-            trajectory: vec![TrajectoryMessage::new(system_message)],
+            trajectory,
             logger: None,
         }
     }
 
     pub fn reset_context(&mut self) {
-        let system_message = ChatMessage::system(self.system_prompt.clone());
-        self.trajectory = vec![TrajectoryMessage::new(system_message)];
+        self.trajectory = initial_trajectory(self.model_name(), self.system_prompt.clone());
+    }
+
+    pub(crate) fn model_name(&self) -> Option<String> {
+        self.body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    pub(crate) fn chat_message_count(&self) -> usize {
+        self.trajectory
+            .iter()
+            .filter_map(TrajectoryMessage::message)
+            .count()
     }
 
     pub(crate) fn max_resume_traj(&self) -> usize {
@@ -182,6 +203,16 @@ impl Agent {
     }
 }
 
+pub(super) fn initial_trajectory(
+    model: Option<String>,
+    system_prompt: String,
+) -> Vec<TrajectoryMessage> {
+    vec![
+        TrajectoryMessage::config(model),
+        TrajectoryMessage::new(ChatMessage::system(system_prompt)),
+    ]
+}
+
 impl Default for AgentRunContext {
     fn default() -> Self {
         Self {
@@ -250,8 +281,12 @@ mod tests {
             .insert("Authorization".to_string(), "Bearer secret".to_string());
         let agent = Agent::new(config);
 
-        assert_eq!(agent.trajectory.len(), 1);
-        assert_eq!(agent.trajectory[0].message.role, "system");
+        assert_eq!(agent.trajectory.len(), 2);
+        assert!(matches!(
+            &agent.trajectory[0],
+            TrajectoryMessage::Config { config } if config.model.as_deref() == Some("openrouter/free")
+        ));
+        assert_eq!(agent.trajectory[1].message().unwrap().role, "system");
         assert_eq!(agent.max_agent_turns, models::DEFAULT_MAX_AGENT_TURNS);
         assert_eq!(
             agent.max_tool_output_bytes,
@@ -307,16 +342,24 @@ mod tests {
         let mut agent = Agent::new(config);
 
         assert_eq!(
-            agent.trajectory[0].message.content_text().as_deref(),
+            agent.trajectory[1]
+                .message()
+                .unwrap()
+                .content_text()
+                .as_deref(),
             Some("custom system prompt\nsecond line")
         );
 
         agent.push_message(ChatMessage::user("hello".to_string()));
         agent.reset_context();
 
-        assert_eq!(agent.trajectory.len(), 1);
+        assert_eq!(agent.trajectory.len(), 2);
         assert_eq!(
-            agent.trajectory[0].message.content_text().as_deref(),
+            agent.trajectory[1]
+                .message()
+                .unwrap()
+                .content_text()
+                .as_deref(),
             Some("custom system prompt\nsecond line")
         );
     }

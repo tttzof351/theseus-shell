@@ -100,6 +100,7 @@ impl TheseusShell {
 
         if let Some(logger) = new_logger.as_ref() {
             agent.set_logger(logger.clone());
+            self.config.logger = Some(logger.clone());
         }
 
         CommandOutput::success("Agent context has been reset.\n")
@@ -194,6 +195,12 @@ impl TheseusShell {
             .clone()
             .map(Ok)
             .unwrap_or_else(default_config_path)?;
+        let previous_model = self
+            .config
+            .agent_config
+            .as_ref()
+            .and_then(config_model_name)
+            .map(str::to_string);
         let config =
             match AgentConfig::configure_interactive_at(self.config.agent_config.as_ref(), &path) {
                 Ok(config) => config,
@@ -202,13 +209,21 @@ impl TheseusShell {
                 }
                 Err(err) => return Err(err),
             };
-        let agent = match self.config.logger.clone() {
+        let next_model = config_model_name(&config).map(str::to_string);
+        let model_changed = previous_model != next_model;
+        let logger = if model_changed && self.config.logger.is_some() {
+            Some(AppLogger::start_session()?)
+        } else {
+            self.config.logger.clone()
+        };
+        let agent = match logger.clone() {
             Some(logger) => Agent::new(config.clone()).with_logger(logger),
             None => Agent::new(config.clone()),
         };
         self.agent = Some(agent);
         self.config.agent_config = Some(config);
         self.config.agent_config_path = Some(path.clone());
+        self.config.logger = logger;
 
         Ok(CommandOutput::success(format!(
             "Config saved to {}\n",
@@ -259,6 +274,14 @@ impl TheseusShell {
             }
         }
     }
+}
+
+fn config_model_name(config: &AgentConfig) -> Option<&str> {
+    config
+        .llm_request_settings
+        .body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
 }
 
 fn wrap_agent_answer(text: &str, add_padding: bool) -> String {

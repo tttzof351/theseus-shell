@@ -10,7 +10,7 @@ impl Agent {
         self.trajectory
             .iter()
             .rev()
-            .filter_map(|entry| entry.usage.as_ref())
+            .filter_map(|entry| entry.usage())
             .find_map(|usage| usage.prompt_tokens)
     }
 
@@ -18,8 +18,13 @@ impl Agent {
         let usage_entries = self
             .trajectory
             .iter()
-            .filter_map(|entry| entry.usage.as_ref())
+            .filter_map(|entry| entry.usage())
             .collect::<Vec<_>>();
+        let message_count = self
+            .trajectory
+            .iter()
+            .filter_map(|entry| entry.message())
+            .count();
 
         let completion_tokens = usage_entries
             .iter()
@@ -68,7 +73,7 @@ impl Agent {
             "#,
             model,
             api_key,
-            format_human_count(self.trajectory.len() as u64),
+            format_human_count(message_count as u64),
             format_human_count(usage_entries.len() as u64),
             context_tokens,
             format_human_count(completion_tokens),

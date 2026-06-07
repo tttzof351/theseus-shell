@@ -54,7 +54,10 @@ impl Agent {
                 }
                 Err(err) => return Err(err),
             };
-            let message = trajectory_message.message.clone();
+            let message = trajectory_message
+                .message()
+                .cloned()
+                .ok_or_else(|| io::Error::other("LLM response did not contain a chat message"))?;
             let content = message.content_text().unwrap_or_default();
             let tool_message = message
                 .content_text()
@@ -243,7 +246,7 @@ mod tests {
             output,
             "Agent stopped: context tokens limit exceeded (11 > 10). Run /compact to summarize agent context or /reset to clear it.\n"
         );
-        assert_eq!(agent.trajectory.len(), 2);
+        assert_eq!(agent.trajectory.len(), 3);
     }
 
     #[test]

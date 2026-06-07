@@ -66,7 +66,7 @@ fn resume_session_from_path(path: &Path) -> io::Result<ResumeSession> {
 
     #[derive(Deserialize)]
     struct Message {
-        role: String,
+        role: Option<String>,
         content: Option<Value>,
     }
 
@@ -75,7 +75,7 @@ fn resume_session_from_path(path: &Path) -> io::Result<ResumeSession> {
     let question = snapshot
         .messages
         .iter()
-        .filter(|message| message.role == "user")
+        .filter(|message| message.role.as_deref() == Some("user"))
         .filter_map(|message| message.content.as_ref())
         .filter_map(content_value_to_string)
         .map(|question| question.trim().to_string())

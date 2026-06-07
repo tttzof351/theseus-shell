@@ -119,12 +119,24 @@ pub(super) struct ChatChoice {
     pub(super) message: ChatMessage,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct TrajectoryMessage {
-    #[serde(flatten)]
-    pub(super) message: ChatMessage,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct TrajectoryConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) usage: Option<ChatUsage>,
+    pub(super) model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(super) enum TrajectoryMessage {
+    Config {
+        config: TrajectoryConfig,
+    },
+    Chat {
+        #[serde(flatten)]
+        message: ChatMessage,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<ChatUsage>,
+    },
 }
 
 impl ChatMessage {
@@ -212,14 +224,34 @@ impl MessageContentPart {
 
 impl TrajectoryMessage {
     pub(super) fn new(message: ChatMessage) -> Self {
-        Self {
+        Self::Chat {
             message,
             usage: None,
         }
     }
 
     pub(super) fn with_usage(message: ChatMessage, usage: Option<ChatUsage>) -> Self {
-        Self { message, usage }
+        Self::Chat { message, usage }
+    }
+
+    pub(super) fn config(model: Option<String>) -> Self {
+        Self::Config {
+            config: TrajectoryConfig { model },
+        }
+    }
+
+    pub(super) fn message(&self) -> Option<&ChatMessage> {
+        match self {
+            Self::Chat { message, .. } => Some(message),
+            Self::Config { .. } => None,
+        }
+    }
+
+    pub(super) fn usage(&self) -> Option<&ChatUsage> {
+        match self {
+            Self::Chat { usage, .. } => usage.as_ref(),
+            Self::Config { .. } => None,
+        }
     }
 }
 

@@ -4,6 +4,7 @@ use serde_json::json;
 
 use super::{
     Agent,
+    core::initial_trajectory,
     messages::{ChatMessage, TrajectoryMessage},
 };
 use crate::common::{
@@ -43,7 +44,7 @@ struct RemovedCompactItem {
 
 impl Agent {
     pub(crate) fn compact_context(&mut self) -> io::Result<CompactOutcome> {
-        if self.trajectory.len() <= 2 {
+        if self.chat_message_count() <= 2 {
             return Ok(CompactOutcome::AlreadyMinimal);
         }
 
@@ -76,12 +77,13 @@ impl Agent {
             self.compact_recent_user_messages_max_bytes,
         );
         self.trajectory = compacted_trajectory(
+            self.model_name(),
             self.system_prompt.clone(),
             recent_user_messages,
             &summary_result.summary,
         );
         let after_messages = self.trajectory.len();
-        let recent_user_messages = after_messages.saturating_sub(2);
+        let recent_user_messages = after_messages.saturating_sub(3);
 
         Ok(CompactOutcome::Compacted(CompactResult {
             before_messages,
@@ -109,7 +111,7 @@ impl Agent {
         let mut messages = self
             .trajectory
             .iter()
-            .map(|entry| entry.message.clone())
+            .filter_map(|entry| entry.message().cloned())
             .collect::<Vec<_>>();
         messages.push(ChatMessage::user(self.compact_prompt.clone()));
         let mut trim_retries = 0;
@@ -146,8 +148,13 @@ impl Agent {
                 Err(err) => return Err(err),
             }
         };
+        let Some(message) = message.message() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compaction summary did not contain a chat message",
+            ));
+        };
         if message
-            .message
             .tool_calls
             .as_ref()
             .is_some_and(|tool_calls| !tool_calls.is_empty())
@@ -158,7 +165,7 @@ impl Agent {
             ));
         }
 
-        let summary = message.message.content_text().unwrap_or_default();
+        let summary = message.content_text().unwrap_or_default();
         let summary = summary.trim();
         if summary.is_empty() {
             return Err(io::Error::new(
@@ -181,12 +188,13 @@ fn compaction_bridge(summary: &str) -> String {
 }
 
 fn compacted_trajectory(
+    model: Option<String>,
     system_prompt: String,
     recent_user_messages: Vec<ChatMessage>,
     summary: &str,
 ) -> Vec<TrajectoryMessage> {
-    let mut trajectory = Vec::with_capacity(recent_user_messages.len() + 2);
-    trajectory.push(TrajectoryMessage::new(ChatMessage::system(system_prompt)));
+    let mut trajectory = initial_trajectory(model, system_prompt);
+    trajectory.reserve(recent_user_messages.len() + 1);
     trajectory.extend(recent_user_messages.into_iter().map(TrajectoryMessage::new));
     trajectory.push(TrajectoryMessage::new(ChatMessage::user(
         compaction_bridge(summary),
@@ -202,10 +210,13 @@ fn collect_recent_user_messages(
     let mut used = 0usize;
 
     for entry in trajectory.iter().rev() {
-        if entry.message.role != "user" {
+        let Some(message) = entry.message() else {
+            continue;
+        };
+        if message.role != "user" {
             continue;
         }
-        let Some(text) = compact_user_message_text(&entry.message) else {
+        let Some(text) = compact_user_message_text(message) else {
             continue;
         };
         if is_compaction_bridge(&text) {
@@ -387,21 +398,24 @@ mod tests {
     #[test]
     fn compacted_trajectory_keeps_system_recent_users_and_summary() {
         let trajectory = compacted_trajectory(
+            Some("test/model".to_string()),
             "system".to_string(),
             vec![ChatMessage::user("latest")],
             "summary",
         );
 
-        assert_eq!(trajectory.len(), 3);
-        assert_eq!(trajectory[0].message.role, "system");
-        assert_eq!(trajectory[1].message.role, "user");
+        assert_eq!(trajectory.len(), 4);
+        assert!(matches!(trajectory[0], TrajectoryMessage::Config { .. }));
+        assert_eq!(trajectory[1].message().unwrap().role, "system");
+        assert_eq!(trajectory[2].message().unwrap().role, "user");
         assert_eq!(
-            trajectory[1].message.content_text().as_deref(),
+            trajectory[2].message().unwrap().content_text().as_deref(),
             Some("latest")
         );
         assert!(
-            trajectory[2]
-                .message
+            trajectory[3]
+                .message()
+                .unwrap()
                 .content_text()
                 .unwrap()
                 .contains("summary")
@@ -485,7 +499,7 @@ mod tests {
         let outcome = agent.compact_context().unwrap();
 
         assert_eq!(outcome, CompactOutcome::AlreadyMinimal);
-        assert_eq!(agent.trajectory.len(), 1);
+        assert_eq!(agent.trajectory.len(), 2);
     }
 
     #[test]
@@ -497,6 +511,6 @@ mod tests {
         let outcome = agent.compact_context().unwrap();
 
         assert_eq!(outcome, CompactOutcome::MissingAuthorization);
-        assert_eq!(agent.trajectory.len(), 3);
+        assert_eq!(agent.trajectory.len(), 4);
     }
 }
