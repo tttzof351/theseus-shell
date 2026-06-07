@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, io};
 
+use jsonc_parser::{ParseOptions, parse_to_serde_value};
 use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 
@@ -21,11 +22,10 @@ impl AgentConfig {
     }
 
     pub(super) fn from_jsonc(text: &str) -> io::Result<Self> {
-        let json = strip_jsonc_comments(text);
-        let value = serde_json::from_str::<Value>(&json).map_err(|err| {
+        let value = parse_to_serde_value::<Value>(text, &jsonc_parse_options()).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("config must be valid JSON after comments are stripped: {err}"),
+                format!("config must be valid JSONC: {err}"),
             )
         })?;
         let object = value.as_object().ok_or_else(|| {
@@ -37,6 +37,18 @@ impl AgentConfig {
             llm_request_settings: read_llm_request_settings(object)?,
             mcp_servers: read_mcp_servers(object)?,
         })
+    }
+}
+
+pub(super) fn jsonc_parse_options() -> ParseOptions {
+    ParseOptions {
+        allow_comments: true,
+        allow_loose_object_property_names: false,
+        allow_trailing_commas: true,
+        allow_missing_commas: false,
+        allow_single_quoted_strings: false,
+        allow_hexadecimal_numbers: false,
+        allow_unary_plus_numbers: false,
     }
 }
 
@@ -745,58 +757,4 @@ fn read_string_map_field(
             Ok((header.clone(), value.to_string()))
         })
         .collect()
-}
-
-fn strip_jsonc_comments(text: &str) -> String {
-    let mut result = String::new();
-    let mut chars = text.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while let Some(ch) = chars.next() {
-        if in_string {
-            result.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if ch == '"' {
-            in_string = true;
-            result.push(ch);
-            continue;
-        }
-
-        if ch == '/' && chars.peek() == Some(&'/') {
-            chars.next();
-            for next in chars.by_ref() {
-                if next == '\n' {
-                    result.push('\n');
-                    break;
-                }
-            }
-            continue;
-        }
-
-        if ch == '/' && chars.peek() == Some(&'*') {
-            chars.next();
-            let mut previous = '\0';
-            for next in chars.by_ref() {
-                if previous == '*' && next == '/' {
-                    break;
-                }
-                previous = next;
-            }
-            continue;
-        }
-
-        result.push(ch);
-    }
-
-    result
 }

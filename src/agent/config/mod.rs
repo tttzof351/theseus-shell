@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde_json::{Map, Value, json};
 
+mod document;
 mod interactive;
 mod jsonc;
 mod model_catalog;
@@ -474,6 +475,44 @@ mod tests {
             config.llm_request_settings.base_url,
             "https://example.test/a//b"
         );
+    }
+
+    #[test]
+    fn reads_jsonc_config_with_trailing_commas() {
+        let text = r#"
+        {
+          "llm_request_settings": {
+            "base_url": "https://example.test/chat",
+            "retries": 4,
+            "request_timeout_seconds": 240,
+            "connect_timeout_seconds": 45,
+            "body": {
+              "model": "test/model",
+            },
+            "header": {
+              "Authorization": "Bearer secret",
+              "Content-Type": "application/json",
+            },
+          },
+          "agent_settings": {
+            "max_turns": 12,
+            "max_tool_output_bytes": 4096,
+            "max_context_tokens": 8192,
+            "max_resume_traj": 100,
+            "build_in_tools": ["read_file",],
+            "system_prompt": ["prompt",],
+          },
+          "mcp_servers": {},
+        }
+        "#;
+
+        let config = AgentConfig::from_jsonc(text).unwrap();
+
+        assert_eq!(
+            config.llm_request_settings.body.get("model"),
+            Some(&json!("test/model"))
+        );
+        assert_eq!(config.agent_settings.build_in_tools, ["read_file"]);
     }
 
     #[test]

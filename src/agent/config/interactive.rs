@@ -22,6 +22,7 @@ use crate::{
 
 use super::{
     AgentConfig,
+    document::{ConfigPatch, patch_config_jsonc_file},
     model_catalog::{self, ModelCatalog, ModelCatalogSource, ModelOption},
 };
 
@@ -54,6 +55,7 @@ impl AgentConfig {
         current: Option<&AgentConfig>,
         path: impl AsRef<Path>,
     ) -> io::Result<Self> {
+        let path = path.as_ref();
         let mut config = current.cloned().unwrap_or_else(Self::default_empty);
         warn_if_non_openrouter_base_url(&config.llm_request_settings.base_url);
         let option = select_config_option()?;
@@ -61,16 +63,23 @@ impl AgentConfig {
         match option {
             ConfigOption::ChangeModel => {
                 let model = select_model(current_model(&config))?;
+                if path.exists() {
+                    return patch_config_jsonc_file(path, ConfigPatch::SetModel(model));
+                }
                 config
                     .llm_request_settings
                     .body
                     .insert("model".to_string(), json!(model));
             }
             ConfigOption::SetApiKey => {
-                config.llm_request_settings.header.insert(
-                    "Authorization".to_string(),
-                    authorization_header_value(&prompt_api_key()?),
-                );
+                let value = authorization_header_value(&prompt_api_key()?);
+                if path.exists() {
+                    return patch_config_jsonc_file(path, ConfigPatch::SetAuthorization(value));
+                }
+                config
+                    .llm_request_settings
+                    .header
+                    .insert("Authorization".to_string(), value);
             }
         }
 

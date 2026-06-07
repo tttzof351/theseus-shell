@@ -8,6 +8,7 @@ rust-version = "1.96.0"
 crossterm = "0.29.0"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+jsonc-parser = { version = "0.32", features = ["cst", "serde"] }
 libc = "0.2"
 portable-pty = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
