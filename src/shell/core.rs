@@ -168,7 +168,7 @@ impl TheseusShell {
             Some(SlashCommand::History) => CommandOutput::success(format_history(&self.history)),
             Some(SlashCommand::Status) => CommandOutput::success(self.agent_status()),
             Some(SlashCommand::Mcp) => CommandOutput::success(self.mcp_status()),
-            Some(SlashCommand::Reset) => self.handle_reset_command(),
+            Some(SlashCommand::Reset) => self.handle_reset_command()?,
             Some(SlashCommand::Compact) => self.handle_compact_command()?,
             Some(SlashCommand::Resume) => self.handle_resume_command()?,
             Some(SlashCommand::Config) => self.handle_config_command()?,
@@ -303,11 +303,19 @@ mod tests {
     use super::*;
     use crate::input::colorize_nested;
     use std::sync::{Mutex, MutexGuard};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     fn cwd_lock() -> MutexGuard<'static, ()> {
         CWD_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    fn unique_test_suffix() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     }
 
     #[test]
@@ -413,6 +421,43 @@ mod tests {
         assert_eq!(output.status_code, Some(0));
         assert_eq!(text, "No MCP servers configured.\n");
         assert_eq!(shell.history()[0].input, "/mcp");
+    }
+
+    #[test]
+    fn reset_reloads_agent_config_from_disk() {
+        let path = env::temp_dir().join(format!(
+            "theseus-reset-config-{}-{}.jsonc",
+            std::process::id(),
+            unique_test_suffix()
+        ));
+        let mut initial_config = AgentConfig::default_empty();
+        initial_config
+            .llm_request_settings
+            .body
+            .insert("model".to_string(), serde_json::json!("test/old"));
+        initial_config.save_at(&path).unwrap();
+
+        let mut shell = TheseusShell::new(ShellConfig {
+            agent_config: Some(initial_config),
+            agent_config_path: Some(path.clone()),
+            ..ShellConfig::default()
+        });
+
+        let mut updated_config = AgentConfig::default_empty();
+        updated_config
+            .llm_request_settings
+            .body
+            .insert("model".to_string(), serde_json::json!("test/new"));
+        updated_config.save_at(&path).unwrap();
+
+        let output = shell.handle_command("/reset").unwrap();
+        let status = shell.agent.as_ref().unwrap().status_text();
+
+        assert_eq!(output.status_code, Some(0));
+        assert!(status.contains("| **model** | test/new |"));
+        assert_eq!(shell.config.agent_config, Some(updated_config));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -86,24 +86,37 @@ impl TheseusShell {
         CommandOutput::success(render_info())
     }
 
-    pub(super) fn handle_reset_command(&mut self) -> CommandOutput {
-        let Some(agent) = self.agent.as_mut() else {
-            return CommandOutput::failure("Agent is not configured.\n");
-        };
+    pub(super) fn handle_reset_command(&mut self) -> io::Result<CommandOutput> {
+        if self.agent.is_none() {
+            return Ok(CommandOutput::failure("Agent is not configured.\n"));
+        }
 
-        agent.reset_context();
+        let path = self
+            .config
+            .agent_config_path
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(default_config_path)?;
+        let agent_init = AgentConfig::load_or_create_at(path)?;
 
         let new_logger = match self.config.logger.as_ref() {
             Some(_) => AppLogger::start_session().ok(),
             None => None,
         };
 
-        if let Some(logger) = new_logger.as_ref() {
-            agent.set_logger(logger.clone());
-            self.config.logger = Some(logger.clone());
+        let agent = match new_logger.clone() {
+            Some(logger) => Agent::new(agent_init.config.clone()).with_logger(logger),
+            None => Agent::new(agent_init.config.clone()),
+        };
+
+        self.agent = Some(agent);
+        self.config.agent_config = Some(agent_init.config);
+        self.config.agent_config_path = Some(agent_init.path);
+        if let Some(logger) = new_logger {
+            self.config.logger = Some(logger);
         }
 
-        CommandOutput::success("Agent context has been reset.\n")
+        Ok(CommandOutput::success("Agent context has been reset.\n"))
     }
 
     pub(super) fn handle_compact_command(&mut self) -> io::Result<CommandOutput> {
