@@ -44,6 +44,18 @@ pub(super) fn completion_state(line: &str, cursor_chars: usize) -> Option<Comple
     })
 }
 
+pub(super) fn path_completion_state(line: &str, cursor_chars: usize) -> Option<CompletionState> {
+    let mut token = token_before_cursor(line, cursor_chars)?;
+    token.is_command = false;
+    let completions = path_completions(&token.value);
+
+    (!completions.is_empty()).then_some(CompletionState {
+        token,
+        completions,
+        selected: None,
+    })
+}
+
 pub(super) fn token_before_cursor(line: &str, cursor_chars: usize) -> Option<CompletionToken> {
     let chars = line.chars().collect::<Vec<_>>();
     if cursor_chars > chars.len() {
@@ -313,6 +325,11 @@ mod tests {
                 display: "/status".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn path_completion_state_does_not_complete_commands() {
+        assert!(path_completion_state("/stat", 5).is_none());
     }
 
     #[test]

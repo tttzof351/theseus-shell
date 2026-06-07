@@ -8,9 +8,14 @@ use crossterm::{
 };
 
 use super::{
-    is_alt_key, is_command_key, is_key_press, is_plain_text_key, raw_mode::RawModeGuard,
+    completion::{CompletionState, path_completion_state, token_before_cursor},
+    is_alt_key, is_command_key, is_key_press, is_plain_text_key,
+    raw_mode::RawModeGuard,
     text_length,
 };
+
+#[cfg(test)]
+use super::completion::{Completion, CompletionToken};
 
 #[derive(Debug, Clone)]
 pub struct MultiLineConfig {
@@ -32,6 +37,7 @@ struct MultiLineEditor {
     row: usize,
     col: usize,
     goal_col: usize,
+    completion: Option<CompletionState>,
     rendered_rows: u16,
     rendered_cursor_row: u16,
 }
@@ -69,6 +75,7 @@ impl MultiLineEditor {
             row: 0,
             col: 0,
             goal_col: 0,
+            completion: None,
             rendered_rows: 1,
             rendered_cursor_row: 0,
         }
@@ -104,6 +111,7 @@ impl MultiLineEditor {
                 return Ok(Some(join_lines(&self.lines)));
             }
             KeyCode::Enter => {
+                self.clear_completion();
                 if self.is_exit_line() {
                     self.finish_line()?;
                     let text = join_lines(&self.lines[..self.lines.len() - 1]);
@@ -113,49 +121,60 @@ impl MultiLineEditor {
                 self.render()?;
             }
             KeyCode::Backspace => {
+                self.clear_completion();
                 self.backspace();
                 self.render()?;
             }
             KeyCode::Delete => {
+                self.clear_completion();
                 self.delete();
                 self.render()?;
             }
             KeyCode::Left if is_command_key(key) => {
+                self.clear_completion();
                 self.col = 0;
                 self.goal_col = 0;
                 self.render()?;
             }
             KeyCode::Right if is_command_key(key) => {
+                self.clear_completion();
                 self.col = self.lines[self.row].len();
                 self.goal_col = self.col;
                 self.render()?;
             }
             KeyCode::Char('b') if is_alt_key(key) => {
+                self.clear_completion();
                 self.move_word_left();
                 self.render()?;
             }
             KeyCode::Char('f') if is_alt_key(key) => {
+                self.clear_completion();
                 self.move_word_right();
                 self.render()?;
             }
             KeyCode::Left if is_alt_key(key) => {
+                self.clear_completion();
                 self.move_word_left();
                 self.render()?;
             }
             KeyCode::Right if is_alt_key(key) => {
+                self.clear_completion();
                 self.move_word_right();
                 self.render()?;
             }
             KeyCode::Left => {
+                self.clear_completion();
                 self.move_left();
                 self.render()?;
             }
             KeyCode::Right => {
+                self.clear_completion();
                 self.move_right();
                 self.render()?;
             }
             KeyCode::Up => {
                 if self.row > 0 {
+                    self.clear_completion();
                     self.row -= 1;
                     self.col = self.goal_col.min(self.lines[self.row].len());
                     self.render()?;
@@ -163,22 +182,29 @@ impl MultiLineEditor {
             }
             KeyCode::Down => {
                 if self.row + 1 < self.lines.len() {
+                    self.clear_completion();
                     self.row += 1;
                     self.col = self.goal_col.min(self.lines[self.row].len());
                     self.render()?;
                 }
             }
             KeyCode::Home => {
+                self.clear_completion();
                 self.col = 0;
                 self.goal_col = 0;
                 self.render()?;
             }
             KeyCode::End => {
+                self.clear_completion();
                 self.col = self.lines[self.row].len();
                 self.goal_col = self.col;
                 self.render()?;
             }
+            KeyCode::Tab => {
+                self.complete()?;
+            }
             KeyCode::Char(ch) if is_plain_text_key(key) => {
+                self.clear_completion();
                 self.insert_char(ch);
                 self.render()?;
             }
@@ -284,7 +310,76 @@ impl MultiLineEditor {
         self.lines[self.row].iter().collect()
     }
 
+    fn complete(&mut self) -> io::Result<()> {
+        if self.should_restart_completed_directory_completion() {
+            self.clear_completion();
+        }
+
+        if self.advance_completion() {
+            return self.render();
+        }
+
+        let Some(state) = self.build_completion_state() else {
+            return self.render();
+        };
+        self.completion = Some(state);
+        self.advance_completion();
+        self.render()
+    }
+
+    fn should_restart_completed_directory_completion(&self) -> bool {
+        let Some(state) = &self.completion else {
+            return false;
+        };
+        if state.token.is_command || state.selected.is_none() || state.completions.len() != 1 {
+            return false;
+        }
+
+        let Some(completion) = state.completions.first() else {
+            return false;
+        };
+
+        completion.replacement.ends_with(['/', '\\'])
+            && token_before_cursor(&self.current_line(), self.col)
+                .is_some_and(|token| token.value == completion.replacement)
+    }
+
+    fn build_completion_state(&self) -> Option<CompletionState> {
+        path_completion_state(&self.current_line(), self.col)
+    }
+
+    fn advance_completion(&mut self) -> bool {
+        let Some(state) = self.completion.as_mut() else {
+            return false;
+        };
+        if state.completions.is_empty() {
+            return false;
+        }
+
+        let next_index = state
+            .selected
+            .map_or(0, |index| (index + 1) % state.completions.len());
+        let token = state.token.clone();
+        let replacement = state.completions[next_index].replacement.clone();
+        state.selected = Some(next_index);
+
+        self.replace_before_cursor(token.start, &replacement);
+        true
+    }
+
+    fn replace_before_cursor(&mut self, start: usize, replacement: &str) {
+        let replacement_chars = replacement.chars().collect::<Vec<_>>();
+        self.lines[self.row].splice(start..self.col, replacement_chars);
+        self.col = start + replacement.chars().count();
+        self.goal_col = self.col;
+    }
+
+    fn clear_completion(&mut self) {
+        self.completion = None;
+    }
+
     fn insert_text(&mut self, text: &str) {
+        self.clear_completion();
         for ch in text.chars() {
             match ch {
                 '\r' => {}
@@ -474,5 +569,87 @@ mod tests {
         editor.move_word_right();
 
         assert_eq!(editor.col, "find ".chars().count());
+    }
+
+    #[test]
+    fn repeated_completion_cycles_through_candidates() {
+        let mut editor = MultiLineEditor::new(MultiLineConfig::default());
+        editor.lines = vec!["open sr".chars().collect()];
+        editor.col = "open sr".chars().count();
+        editor.completion = Some(CompletionState {
+            token: CompletionToken {
+                value: "sr".to_string(),
+                start: "open ".chars().count(),
+                is_command: false,
+            },
+            completions: vec![
+                Completion {
+                    replacement: "src/".to_string(),
+                    display: "src/".to_string(),
+                },
+                Completion {
+                    replacement: "scripts/".to_string(),
+                    display: "scripts/".to_string(),
+                },
+            ],
+            selected: None,
+        });
+
+        assert!(editor.advance_completion());
+        assert_eq!(editor.current_line(), "open src/");
+        assert!(editor.advance_completion());
+        assert_eq!(editor.current_line(), "open scripts/");
+        assert!(editor.advance_completion());
+        assert_eq!(editor.current_line(), "open src/");
+    }
+
+    #[test]
+    fn completion_replaces_only_current_line_token() {
+        let mut editor = MultiLineEditor::new(MultiLineConfig::default());
+        editor.lines = vec!["before sr".chars().collect(), "after sr".chars().collect()];
+        editor.row = 1;
+        editor.col = "after sr".chars().count();
+        editor.goal_col = editor.col;
+        editor.completion = Some(CompletionState {
+            token: CompletionToken {
+                value: "sr".to_string(),
+                start: "after ".chars().count(),
+                is_command: false,
+            },
+            completions: vec![Completion {
+                replacement: "src/".to_string(),
+                display: "src/".to_string(),
+            }],
+            selected: None,
+        });
+
+        assert!(editor.advance_completion());
+
+        assert_eq!(join_lines(&editor.lines), "before sr\nafter src/");
+        assert_eq!(editor.col, "after src/".chars().count());
+        assert_eq!(editor.goal_col, editor.col);
+    }
+
+    #[test]
+    fn completed_single_directory_match_restarts_completion_session() {
+        let mut editor = MultiLineEditor::new(MultiLineConfig::default());
+        editor.lines = vec!["sr".chars().collect()];
+        editor.col = "sr".chars().count();
+        editor.completion = Some(CompletionState {
+            token: CompletionToken {
+                value: "sr".to_string(),
+                start: 0,
+                is_command: false,
+            },
+            completions: vec![Completion {
+                replacement: "src/".to_string(),
+                display: "src/".to_string(),
+            }],
+            selected: None,
+        });
+
+        assert!(editor.advance_completion());
+
+        assert!(editor.should_restart_completed_directory_completion());
     }
 }
