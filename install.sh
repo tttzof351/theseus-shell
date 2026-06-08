@@ -148,23 +148,21 @@ main() {
     exit 1
   fi
 
-  chmod +x "${extracted_bin}"
-
-  if [[ "${platform}" == "macos" ]]; then
-    # Local workaround for unsigned release binaries: remove quarantine metadata
-    # and apply an ad-hoc signature so macOS can execute the CLI binary.
-    if command -v xattr >/dev/null 2>&1; then
-      xattr -dr com.apple.quarantine "${extracted_bin}" 2>/dev/null || true
-    fi
-
-    if command -v codesign >/dev/null 2>&1; then
-      codesign --force --deep --sign - "${extracted_bin}" >/dev/null
-    fi
-  fi
-
   mkdir -p "${INSTALL_DIR}"
   cp "${extracted_bin}" "${install_path}"
   chmod +x "${install_path}"
+
+  if [[ "${platform}" == "macos" ]]; then
+    # Local workaround for unsigned release binaries: remove quarantine/provenance
+    # metadata and apply an ad-hoc signature to the final installed path.
+    if command -v xattr >/dev/null 2>&1; then
+      xattr -cr "${install_path}" 2>/dev/null || true
+    fi
+
+    if command -v codesign >/dev/null 2>&1; then
+      codesign --force --deep --sign - "${install_path}" >/dev/null
+    fi
+  fi
 
   echo
   echo "Installed ${BIN_NAME} to: ${install_path}"
