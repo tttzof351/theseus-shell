@@ -130,6 +130,7 @@ impl TheseusShell {
                 continue;
             }
 
+            let input = self.read_shell_continuation_lines(input)?;
             let trimmed_input = input.trim();
             let input_was_ask =
                 matches!(parse_slash_command(trimmed_input), Some(SlashCommand::Ask));
@@ -152,6 +153,23 @@ impl TheseusShell {
                 return Ok(0);
             }
         }
+    }
+
+    fn read_shell_continuation_lines(&self, first_input: String) -> io::Result<String> {
+        let mut input = first_input;
+
+        while should_read_shell_continuation(&input) {
+            let next = match read_line_with_history("", &[]) {
+                Ok(Some(next)) => next,
+                Ok(None) => break,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => return Err(err),
+                Err(err) => return Err(err),
+            };
+            input.push('\n');
+            input.push_str(&next);
+        }
+
+        Ok(input)
     }
 
     pub fn handle_command(&mut self, input: &str) -> io::Result<CommandOutput> {
@@ -296,6 +314,19 @@ fn is_exit_command(command: &str) -> bool {
 
 fn is_special_command(command: &str) -> bool {
     command.starts_with('/')
+}
+
+fn should_read_shell_continuation(input: &str) -> bool {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || is_special_command(trimmed) || is_exit_command(trimmed) {
+        return false;
+    }
+
+    has_unescaped_trailing_backslash(input)
+}
+
+fn has_unescaped_trailing_backslash(input: &str) -> bool {
+    input.chars().rev().take_while(|ch| *ch == '\\').count() % 2 == 1
 }
 
 #[cfg(test)]
@@ -699,6 +730,25 @@ mod tests {
         assert!(is_exit_command("exit"));
         assert!(is_exit_command("/exit"));
         assert!(!is_exit_command("/exit now"));
+    }
+
+    #[test]
+    fn detects_shell_continuation_with_single_trailing_backslash() {
+        assert!(should_read_shell_continuation(r#"echo \"#));
+        assert!(should_read_shell_continuation(r#"printf '%s' \"#));
+    }
+
+    #[test]
+    fn ignores_even_trailing_backslashes_for_shell_continuation() {
+        assert!(!should_read_shell_continuation(r#"echo \\"#));
+        assert!(!should_read_shell_continuation(r#"echo \\\\"#));
+    }
+
+    #[test]
+    fn ignores_non_shell_inputs_for_shell_continuation() {
+        assert!(!should_read_shell_continuation(r#"/ask \"#));
+        assert!(!should_read_shell_continuation(r#"/exit \"#));
+        assert!(!should_read_shell_continuation(""));
     }
 
     #[test]
