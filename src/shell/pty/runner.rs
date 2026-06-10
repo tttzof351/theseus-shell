@@ -20,7 +20,7 @@ pub fn run_pty_command(config: PtyCommandConfig) -> io::Result<CommandOutput> {
         .map_err(|err| io::Error::other(err.to_string()))?;
 
     let mut command = CommandBuilder::new(&config.shell);
-    command.args(shell_command_args(&config.command));
+    command.args(shell_command_args(&config.shell, &config.command));
 
     for (key, value) in config.env_vars {
         command.env(key, value);

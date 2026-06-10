@@ -22,6 +22,16 @@ Regular input is executed as a shell command. Natural-language input is routed t
 the agent when it does not look like a shell command. Use `/ask ...` to
 explicitly talk to the agent.
 
+To start Theseus automatically from `~/.zshrc`, guard it with
+`THESEUS_ACTIVE` so commands executed by Theseus can still load your aliases
+from `~/.zshrc` without recursively starting another wrapper:
+
+```sh
+if [[ -z "${THESEUS_ACTIVE:-}" ]]; then
+  theseus
+fi
+```
+
 Natural-language shell workflow:
 
 ![Natural language shell workflow](assets/largest_files.gif)

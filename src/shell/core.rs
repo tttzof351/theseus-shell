@@ -393,7 +393,10 @@ mod tests {
 
     #[test]
     fn stores_external_command_input_and_status() {
-        let mut shell = TheseusShell::new(ShellConfig::default());
+        let mut shell = TheseusShell::new(ShellConfig {
+            executable: PathBuf::from("/bin/sh"),
+            ..ShellConfig::default()
+        });
 
         let output = shell.handle_command("true").unwrap();
 
