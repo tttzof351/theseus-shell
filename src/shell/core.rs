@@ -203,7 +203,12 @@ impl TheseusShell {
                 {
                     self.agent_output(command)
                 }
-                command if is_cd_command(command) => self.change_directory(command),
+                command
+                    if !crate::feature_flags::PERSISTENT_SHELL_SESSION
+                        && is_cd_command(command) =>
+                {
+                    self.change_directory(command)
+                }
                 command => self.run_external_command(command)?,
             },
         };
@@ -309,6 +314,13 @@ pub fn run_shell(config: ShellConfig) -> io::Result<i32> {
 
 fn is_cd_command(command: &str) -> bool {
     matches!(command.split_whitespace().next(), Some("cd"))
+        && !contains_shell_control_syntax(command)
+}
+
+fn contains_shell_control_syntax(command: &str) -> bool {
+    command
+        .chars()
+        .any(|ch| matches!(ch, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '{' | '}'))
 }
 
 fn is_exit_command(command: &str) -> bool {
@@ -350,6 +362,24 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos()
+    }
+
+    struct CurrentDirGuard {
+        original: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn new() -> Self {
+            Self {
+                original: env::current_dir().unwrap(),
+            }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.original);
+        }
     }
 
     #[test]
@@ -741,6 +771,8 @@ mod tests {
         assert!(is_cd_command("cd /tmp"));
         assert!(is_cd_command("cd"));
         assert!(!is_cd_command("cdd /tmp"));
+        assert!(!is_cd_command(r#"cd ~ && echo "test""#));
+        assert!(!is_cd_command("cd /tmp; pwd"));
     }
 
     #[test]
@@ -782,5 +814,94 @@ mod tests {
 
         assert_eq!(shell.config.prompt, default_prompt(Some(&temp_dir)));
         env::set_current_dir(current_dir).unwrap();
+    }
+
+    #[test]
+    fn compound_cd_command_runs_in_shell() {
+        let _guard = cwd_lock();
+        let mut shell = TheseusShell::new(ShellConfig {
+            executable: PathBuf::from("/bin/sh"),
+            ..ShellConfig::default()
+        });
+
+        let output = shell.handle_command(r#"cd ~ && echo "test""#).unwrap();
+
+        assert_eq!(output.status_code, Some(0));
+        assert_eq!(output.transcript_lossy().replace("\r\n", "\n"), "test\n");
+    }
+
+    #[test]
+    fn compound_cd_command_syncs_working_dir_after_output() {
+        let _guard = cwd_lock();
+        let _cwd = CurrentDirGuard::new();
+        let temp_dir = env::temp_dir();
+        let expected_dir = temp_dir.canonicalize().unwrap_or_else(|_| temp_dir.clone());
+        let mut shell = TheseusShell::new(ShellConfig {
+            executable: PathBuf::from("/bin/sh"),
+            ..ShellConfig::default()
+        });
+
+        let output = shell
+            .handle_command(&format!(r#"echo "test" && cd "{}""#, temp_dir.display()))
+            .unwrap();
+
+        assert_eq!(output.status_code, Some(0));
+        assert_eq!(output.transcript_lossy().replace("\r\n", "\n"), "test\n");
+        assert_eq!(
+            shell
+                .config
+                .working_dir
+                .as_ref()
+                .and_then(|path| path.canonicalize().ok())
+                .as_deref(),
+            Some(expected_dir.as_path())
+        );
+        assert_eq!(
+            shell.config.prompt,
+            default_prompt(shell.config.working_dir.as_ref())
+        );
+        assert_eq!(env::current_dir().unwrap(), expected_dir);
+    }
+
+    #[test]
+    fn builtin_cd_syncs_existing_persistent_shell_session() {
+        let _guard = cwd_lock();
+        let _cwd = CurrentDirGuard::new();
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("HOME must be set for cd ~ test");
+        let expected_home = home.canonicalize().unwrap_or(home);
+        let temp_dir = env::temp_dir();
+        let mut shell = TheseusShell::new(ShellConfig {
+            executable: PathBuf::from("/bin/sh"),
+            ..ShellConfig::default()
+        });
+
+        let output = shell
+            .handle_command(&format!(r#"echo "test" && cd "{}""#, temp_dir.display()))
+            .unwrap();
+        assert_eq!(output.status_code, Some(0));
+        assert_eq!(output.transcript_lossy().replace("\r\n", "\n"), "test\n");
+
+        let output = shell.handle_command("cd ~").unwrap();
+        assert_eq!(output.status_code, Some(0));
+        assert_eq!(
+            shell
+                .config
+                .working_dir
+                .as_ref()
+                .and_then(|path| path.canonicalize().ok())
+                .as_deref(),
+            Some(expected_home.as_path())
+        );
+
+        let output = shell.handle_command("pwd").unwrap();
+        let pwd = PathBuf::from(output.transcript_lossy().trim_end_matches(['\r', '\n']));
+
+        assert_eq!(output.status_code, Some(0));
+        assert_eq!(
+            pwd.canonicalize().ok().as_deref(),
+            Some(expected_home.as_path())
+        );
     }
 }

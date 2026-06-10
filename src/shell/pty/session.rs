@@ -87,16 +87,8 @@ impl PersistentShellSession {
     }
 
     pub fn run_command(&mut self, command: &str) -> io::Result<CommandOutput> {
-        if let Some(status) = self.child.try_wait()? {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                format!("shell exited with status {}", status.exit_code()),
-            ));
-        }
-
-        self.master
-            .resize(current_pty_size())
-            .map_err(|err| io::Error::other(err.to_string()))?;
+        self.ensure_shell_is_running()?;
+        self.resize_to_current_terminal()?;
 
         let payload = self.command_payload(command);
         self.write_to_shell(payload.as_bytes())?;
@@ -115,6 +107,51 @@ impl PersistentShellSession {
             transcript: completed.transcript,
             status_code: Some(completed.status_code),
             streamed: stream_output,
+        })
+    }
+
+    pub fn current_working_dir(&mut self) -> io::Result<PathBuf> {
+        let output = self.run_internal_command("pwd")?;
+        let cwd = output
+            .transcript_lossy()
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
+
+        if cwd.is_empty() {
+            return Err(io::Error::other("persistent shell returned empty cwd"));
+        }
+
+        Ok(PathBuf::from(cwd))
+    }
+
+    fn ensure_shell_is_running(&mut self) -> io::Result<()> {
+        if let Some(status) = self.child.try_wait()? {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("shell exited with status {}", status.exit_code()),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn resize_to_current_terminal(&mut self) -> io::Result<()> {
+        self.master
+            .resize(current_pty_size())
+            .map_err(|err| io::Error::other(err.to_string()))
+    }
+
+    fn run_internal_command(&mut self, command: &str) -> io::Result<CommandOutput> {
+        self.ensure_shell_is_running()?;
+        self.resize_to_current_terminal()?;
+        let payload = self.command_payload(command);
+        self.write_to_shell(payload.as_bytes())?;
+        let completed = self.read_until_sentinel(&payload, false)?;
+
+        Ok(CommandOutput {
+            transcript: completed.transcript,
+            status_code: Some(completed.status_code),
+            streamed: false,
         })
     }
 

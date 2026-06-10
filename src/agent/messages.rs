@@ -135,7 +135,7 @@ pub(super) enum TrajectoryMessage {
         #[serde(flatten)]
         message: ChatMessage,
         #[serde(skip_serializing_if = "Option::is_none")]
-        usage: Option<ChatUsage>,
+        usage: Option<Box<ChatUsage>>,
     },
 }
 
@@ -231,7 +231,10 @@ impl TrajectoryMessage {
     }
 
     pub(super) fn with_usage(message: ChatMessage, usage: Option<ChatUsage>) -> Self {
-        Self::Chat { message, usage }
+        Self::Chat {
+            message,
+            usage: usage.map(Box::new),
+        }
     }
 
     pub(super) fn config(model: Option<String>) -> Self {
@@ -249,7 +252,7 @@ impl TrajectoryMessage {
 
     pub(super) fn usage(&self) -> Option<&ChatUsage> {
         match self {
-            Self::Chat { usage, .. } => usage.as_ref(),
+            Self::Chat { usage, .. } => usage.as_deref(),
             Self::Config { .. } => None,
         }
     }

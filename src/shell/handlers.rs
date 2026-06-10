@@ -75,7 +75,10 @@ impl TheseusShell {
                 .shell_session
                 .as_mut()
                 .ok_or_else(|| io::Error::other("persistent shell session was not initialized"))?;
-            return session.run_command(command);
+            let output = session.run_command(command)?;
+            self.sync_working_dir_from_shell();
+
+            return Ok(output);
         }
 
         run_pty_command(PtyCommandConfig {
@@ -85,6 +88,20 @@ impl TheseusShell {
             working_dir: self.config.working_dir.clone(),
             cancellation: None,
         })
+    }
+
+    fn sync_working_dir_from_shell(&mut self) {
+        let Some(session) = self.shell_session.as_mut() else {
+            return;
+        };
+        let Ok(working_dir) = session.current_working_dir() else {
+            return;
+        };
+
+        if env::set_current_dir(&working_dir).is_ok() {
+            self.config.working_dir = Some(working_dir);
+            self.config.prompt = default_prompt(self.config.working_dir.as_ref());
+        }
     }
 
     pub(super) fn handle_ask_command(&mut self, command: &str) -> io::Result<CommandOutput> {
