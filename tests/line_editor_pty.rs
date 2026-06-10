@@ -11,6 +11,8 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_TIMEOUT: Duration = Duration::from_millis(500);
+const KEY_UP: &str = "\x1b[A";
+const KEY_DOWN: &str = "\x1b[B";
 static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct PtyShell {
@@ -273,6 +275,89 @@ fn long_running_command_moves_to_next_line_immediately_after_enter() -> io::Resu
     );
 
     shell.wait_for_after(offset, "theseus-shell")?;
+    shell.exit()
+}
+
+#[test]
+fn history_up_replays_latest_command() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    shell.write("echo HISTORY_UP_LATEST\r")?;
+    shell.wait_for("HISTORY_UP_LATEST")?;
+    shell.wait_for_after(shell.transcript_len(), "theseus-shell")?;
+
+    let offset = shell.transcript_len();
+    shell.write(KEY_UP)?;
+    shell.write("\r")?;
+    let transcript = shell.wait_until_after(offset, |tail| {
+        count_matches(tail, "HISTORY_UP_LATEST") >= 2
+    })?;
+
+    assert!(
+        count_matches(&transcript[offset..], "HISTORY_UP_LATEST") >= 2,
+        "Up did not recall and execute the latest history entry:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.exit()
+}
+
+#[test]
+fn history_up_down_walks_between_entries() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    shell.write("echo HISTORY_WALK_OLDER\r")?;
+    shell.wait_for("HISTORY_WALK_OLDER")?;
+    shell.wait_for_after(shell.transcript_len(), "theseus-shell")?;
+
+    shell.write("echo HISTORY_WALK_NEWER\r")?;
+    shell.wait_for("HISTORY_WALK_NEWER")?;
+    shell.wait_for_after(shell.transcript_len(), "theseus-shell")?;
+
+    let offset = shell.transcript_len();
+    shell.write(KEY_UP)?;
+    shell.write(KEY_UP)?;
+    shell.write(KEY_DOWN)?;
+    shell.write("\r")?;
+    let transcript = shell.wait_until_after(offset, |tail| {
+        count_matches(tail, "HISTORY_WALK_NEWER") >= 2
+    })?;
+
+    assert!(
+        count_matches(&transcript[offset..], "HISTORY_WALK_NEWER") >= 2,
+        "Up/Up/Down did not select and execute the newer history entry:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.exit()
+}
+
+#[test]
+fn history_down_after_latest_restores_current_draft() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    shell.write("echo HISTORY_FOR_DRAFT\r")?;
+    shell.wait_for("HISTORY_FOR_DRAFT")?;
+    shell.wait_for_after(shell.transcript_len(), "theseus-shell")?;
+
+    let offset = shell.transcript_len();
+    shell.write("echo HISTORY_DRAFT_RESTORED")?;
+    shell.write(KEY_UP)?;
+    shell.write(KEY_DOWN)?;
+    shell.write("\r")?;
+    let transcript = shell.wait_until_after(offset, |tail| {
+        count_matches(tail, "HISTORY_DRAFT_RESTORED") >= 2
+    })?;
+
+    assert!(
+        count_matches(&transcript[offset..], "HISTORY_DRAFT_RESTORED") >= 2,
+        "Down after the latest history entry did not restore and execute the draft:\n{}",
+        &transcript[offset..]
+    );
+
     shell.exit()
 }
 
