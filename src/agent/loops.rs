@@ -12,6 +12,8 @@ use crate::{
 };
 use serde_json::json;
 
+const INTERRUPTED_TOOL_OUTPUT: &str = "Tool execution was interrupted by the user.";
+
 impl Agent {
     pub fn run(&mut self, prompt: &str) -> io::Result<String> {
         self.run_with_context(prompt, AgentRunContext::default())
@@ -81,14 +83,15 @@ impl Agent {
 
             log_assistant_tool_message(&tool_message)?;
 
-            for tool_call in tool_calls {
+            let mut tool_calls = tool_calls.into_iter();
+            while let Some(tool_call) = tool_calls.next() {
                 let mut output = match self.execute_agent_tool_call(&tool_call, &context) {
                     Ok(_output) if context.cancellation.cancel_if_interrupted() => {
-                        ToolOutput::text("Tool execution was interrupted by the user.")
+                        ToolOutput::text(INTERRUPTED_TOOL_OUTPUT)
                     }
                     Ok(output) => output,
                     Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                        ToolOutput::text("Tool execution was interrupted by the user.")
+                        ToolOutput::text(INTERRUPTED_TOOL_OUTPUT)
                     }
                     Err(err) => return Err(err),
                 };
@@ -97,10 +100,17 @@ impl Agent {
                     self.max_tool_output_bytes,
                     TruncatePosition::Middle,
                 );
-                let interrupted = output.text == "Tool execution was interrupted by the user.";
+                let interrupted = output.text == INTERRUPTED_TOOL_OUTPUT;
                 self.push_tool_output_message(tool_call.id, output);
                 self.write_trajectory();
                 if interrupted {
+                    for pending_tool_call in tool_calls {
+                        self.push_tool_output_message(
+                            pending_tool_call.id,
+                            ToolOutput::text(INTERRUPTED_TOOL_OUTPUT),
+                        );
+                    }
+                    self.write_trajectory();
                     return Ok("Agent tool execution interrupted.\n".to_string());
                 }
             }
@@ -186,7 +196,12 @@ mod tests {
     use super::*;
     use crate::agent::{
         AgentConfig,
-        messages::{ChatUsage, TrajectoryMessage},
+        messages::{ChatUsage, MessageContent, TrajectoryMessage},
+    };
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
     };
 
     #[test]
@@ -255,5 +270,101 @@ mod tests {
             format_assistant_tool_message("Reading <src> before calling a tool."),
             "\x1b[90m\x1b[3mReading <src> before calling a tool.\x1b[0m\x1b[0m"
         );
+    }
+
+    #[test]
+    fn interrupted_parallel_tool_calls_record_outputs_for_all_pending_calls() {
+        let context = AgentRunContext::default();
+        let cancellation = context.cancellation.clone();
+        let (base_url, server) = one_response_chat_server(
+            json!({
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "bash",
+                                        "arguments": "{\"command\":\"sleep 10\"}"
+                                    }
+                                },
+                                {
+                                    "id": "call_2",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "bash",
+                                        "arguments": "{\"command\":\"echo later\"}"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }),
+            cancellation,
+        );
+        let mut config = AgentConfig::default_empty();
+        config.llm_request_settings.base_url = base_url;
+        config
+            .llm_request_settings
+            .header
+            .insert("Authorization".to_string(), "Bearer secret".to_string());
+        config.agent_settings.max_turns = 1;
+        let mut agent = Agent::new(config);
+
+        let output = agent.run_with_context("run tools", context).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(output, "Agent tool execution interrupted.\n");
+        assert_eq!(
+            tool_message_texts(&agent, "call_1"),
+            ["Tool execution was interrupted by the user."]
+        );
+        assert_eq!(
+            tool_message_texts(&agent, "call_2"),
+            ["Tool execution was interrupted by the user."]
+        );
+    }
+
+    fn one_response_chat_server(
+        response: serde_json::Value,
+        cancellation: crate::common::cancellation::CancellationEvent,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 8192];
+            let _ = stream.read(&mut buffer).unwrap();
+            let body = response.to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            cancellation.cancel();
+        });
+
+        (format!("http://{address}/chat"), handle)
+    }
+
+    fn tool_message_texts(agent: &Agent, tool_call_id: &str) -> Vec<String> {
+        agent
+            .trajectory
+            .iter()
+            .filter_map(TrajectoryMessage::message)
+            .filter(|message| {
+                message.role == "tool" && message.tool_call_id.as_deref() == Some(tool_call_id)
+            })
+            .filter_map(|message| match message.content.as_ref() {
+                Some(MessageContent::Text(text)) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
     }
 }

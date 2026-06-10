@@ -420,7 +420,7 @@ fn streamable_prefix_len(bytes: &[u8], nonce: &str) -> usize {
         .unwrap_or(0);
 
     if hold == 0 {
-        return bytes.len();
+        return bytes.len().saturating_sub(trailing_line_break_len(bytes));
     }
 
     let marker_start = bytes.len() - hold;
@@ -430,6 +430,16 @@ fn streamable_prefix_len(bytes: &[u8], nonce: &str) -> usize {
         marker_start - 1
     } else {
         marker_start
+    }
+}
+
+fn trailing_line_break_len(bytes: &[u8]) -> usize {
+    if bytes.ends_with(b"\r\n") {
+        2
+    } else if bytes.ends_with(b"\n") || bytes.ends_with(b"\r") {
+        1
+    } else {
+        0
     }
 }
 
@@ -668,6 +678,16 @@ mod tests {
     }
 
     #[test]
+    fn streaming_holds_trailing_line_break_until_sentinel_arrives() {
+        assert_eq!(streamable_prefix_len(b"a b\r\n", "nonce"), 3);
+        assert_eq!(streamable_prefix_len(b"hello\r\n\r\n", "nonce"), 7);
+        assert_eq!(
+            streamable_prefix_len(b"hello\r\n\r\n__THESEUS_D", "nonce"),
+            7
+        );
+    }
+
+    #[test]
     fn streaming_does_not_hold_marker_like_user_output() {
         let bytes = b"literal __THESEUS_DONE_other_0__";
 
@@ -718,7 +738,7 @@ mod tests {
 
         assert_eq!(output.status_code, Some(1));
         assert_eq!(output.transcript_lossy(), "shell-ok");
-        assert!(!output.streamed);
+        assert_eq!(output.streamed, io::stdout().is_terminal());
     }
 
     #[cfg(unix)]
