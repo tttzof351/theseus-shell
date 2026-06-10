@@ -1,18 +1,16 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 
 use crossterm::{
-    cursor::{MoveDown, MoveRight, MoveToColumn, MoveUp},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-    execute,
-    terminal::{self, Clear, ClearType},
+    terminal,
 };
 
 use super::{
     completion::{CompletionState, path_completion_state, token_before_cursor},
+    editor_render::{EditorLine, RenderLayout, render_editor_lines, render_layout_for_lines},
     is_alt_key, is_command_key, is_key_press, is_plain_text_key,
     raw_mode::RawModeGuard,
     text_buffer::TextBuffer,
-    text_length,
 };
 
 #[cfg(test)]
@@ -204,44 +202,14 @@ impl MultiLineEditor {
     fn render(&mut self) -> io::Result<()> {
         let layout = self.render_layout();
         let mut stdout = io::stdout();
-
-        if self.rendered_cursor_row > 0 {
-            execute!(stdout, MoveUp(self.rendered_cursor_row))?;
-        }
-
-        for row in 0..self.rendered_rows {
-            execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-            if row + 1 < self.rendered_rows {
-                execute!(stdout, MoveDown(1))?;
-            }
-        }
-
-        if self.rendered_rows > 1 {
-            execute!(stdout, MoveUp(self.rendered_rows - 1))?;
-        }
-
-        for (index, line) in self.buffer.lines().iter().enumerate() {
-            write!(
-                stdout,
-                "{}{}",
-                self.config.prefix,
-                line.iter().collect::<String>()
-            )?;
-            if index + 1 < self.buffer.lines_len() {
-                write!(stdout, "\r\n")?;
-            }
-        }
-
-        let rows_up = layout.rows - 1 - layout.cursor_row;
-        if rows_up > 0 {
-            execute!(stdout, MoveUp(rows_up))?;
-        }
-
-        execute!(stdout, MoveToColumn(0))?;
-        if layout.cursor_col > 0 {
-            execute!(stdout, MoveRight(layout.cursor_col))?;
-        }
-        stdout.flush()?;
+        let lines = self.render_lines();
+        render_editor_lines(
+            &mut stdout,
+            &lines,
+            layout,
+            self.rendered_rows,
+            self.rendered_cursor_row,
+        )?;
 
         self.rendered_rows = layout.rows;
         self.rendered_cursor_row = layout.cursor_row;
@@ -257,27 +225,20 @@ impl MultiLineEditor {
     }
 
     fn render_layout_for_columns(&self, columns: usize) -> RenderLayout {
-        let prefix_len = text_length(&self.config.prefix, false);
-        let mut rows_before_cursor = 0usize;
-        let mut total_rows = 0usize;
+        render_layout_for_lines(
+            &self.render_lines(),
+            self.buffer.row(),
+            self.buffer.col(),
+            columns,
+        )
+    }
 
-        for (index, line) in self.buffer.lines().iter().enumerate() {
-            let line_len = prefix_len + line.len();
-            let line_rows = wrapped_rows(line_len, columns);
-
-            if index < self.buffer.row() {
-                rows_before_cursor += line_rows;
-            }
-            total_rows += line_rows;
-        }
-
-        let cursor_len = prefix_len + self.buffer.col();
-
-        RenderLayout {
-            rows: total_rows as u16,
-            cursor_row: (rows_before_cursor + cursor_len / columns) as u16,
-            cursor_col: (cursor_len % columns) as u16,
-        }
+    fn render_lines(&self) -> Vec<EditorLine<'_>> {
+        self.buffer
+            .lines()
+            .iter()
+            .map(|line| EditorLine::new(&self.config.prefix, line.iter().collect::<String>()))
+            .collect()
     }
 
     fn finish_line(&self) -> io::Result<()> {
@@ -392,19 +353,10 @@ impl MultiLineEditor {
     }
 }
 
-struct RenderLayout {
-    rows: u16,
-    cursor_row: u16,
-    cursor_col: u16,
-}
-
-fn wrapped_rows(visible_len: usize, columns: usize) -> usize {
-    visible_len / columns + 1
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::editor_render::wrapped_rows;
 
     #[test]
     fn text_buffer_joins_lines_with_newlines() {

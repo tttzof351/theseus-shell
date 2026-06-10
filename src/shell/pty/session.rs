@@ -393,7 +393,11 @@ fn parse_completed_command(bytes: &[u8], nonce: &str) -> Option<CompletedCommand
         let status_end = find_subslice(&bytes[status_start..], b"__")? + status_start;
 
         if let Ok(status_text) = std::str::from_utf8(&bytes[status_start..status_end])
-            && let Ok(status) = status_text.parse::<i32>()
+            && let Ok(status) = if status_text.is_empty() {
+                Ok(1)
+            } else {
+                status_text.parse::<i32>()
+            }
         {
             let mut transcript = bytes[..marker_start].to_vec();
             strip_sentinel_separator(&mut transcript);
@@ -639,6 +643,16 @@ mod tests {
 
         assert_eq!(completed.transcript, b"");
         assert_eq!(completed.status_code, 127);
+    }
+
+    #[test]
+    fn parses_empty_status_as_error() {
+        let completed =
+            parse_completed_command(b"(eval):2: unmatched \"\r\n__THESEUS_DONE_nonce___\r\n", "nonce")
+                .unwrap();
+
+        assert_eq!(completed.transcript, b"(eval):2: unmatched \"");
+        assert_eq!(completed.status_code, 1);
     }
 
     #[test]
@@ -912,6 +926,39 @@ mod tests {
             assert_ne!(output.status_code, Some(0), "shell: {shell}");
             assert!(
                 normalized_transcript(&output).contains("`"),
+                "shell: {shell}, output: {:?}",
+                output.transcript_lossy()
+            );
+
+            let recovery = recovery.unwrap();
+            assert_eq!(recovery.status_code, Some(0), "shell: {shell}");
+            assert_eq!(normalized_transcript(&recovery), "recovered");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_shell_returns_after_unmatched_quote_in_multiline_command() {
+        for shell in available_shells() {
+            let (tx, rx) = test_mpsc::channel();
+            let thread_shell = shell.clone();
+
+            thread::spawn(move || {
+                let (mut session, _home) = start_clean_test_session(&thread_shell);
+                let output = session.run_command("echo \\\n \"test");
+                let recovery = session.run_command("printf recovered");
+                let _ = tx.send((output, recovery));
+            });
+
+            let (output, recovery) = rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|_| panic!("command hung for shell: {shell}"));
+            let output = output.unwrap();
+            assert_ne!(output.status_code, Some(0), "shell: {shell}");
+            assert!(
+                normalized_transcript(&output).contains("unmatched")
+                    || normalized_transcript(&output).contains("unexpected EOF")
+                    || normalized_transcript(&output).contains("unterminated"),
                 "shell: {shell}, output: {:?}",
                 output.transcript_lossy()
             );

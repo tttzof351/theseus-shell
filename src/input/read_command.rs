@@ -1,7 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 
 use crossterm::{
-    cursor::{MoveDown, MoveRight, MoveTo, MoveToColumn, MoveUp},
+    cursor::{MoveDown, MoveTo},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{self, Clear, ClearType},
@@ -10,10 +10,10 @@ use crossterm::{
 use super::{
     colorize_tag,
     completion::{CompletionState, completion_state, path_completion_state, token_before_cursor},
+    editor_render::{EditorLine, RenderLayout, render_editor_lines, render_layout_for_lines},
     is_alt_key, is_command_key, is_key_press, is_plain_text_key,
     raw_mode::RawModeGuard,
     text_buffer::TextBuffer,
-    text_length,
 };
 use crate::commands::slash_commands;
 
@@ -199,44 +199,14 @@ impl<'a> CommandEditor<'a> {
     fn render(&mut self) -> io::Result<()> {
         let layout = self.render_layout();
         let mut stdout = io::stdout();
-
-        if self.rendered_cursor_row > 0 {
-            execute!(stdout, MoveUp(self.rendered_cursor_row))?;
-        }
-
-        for row in 0..self.rendered_rows {
-            execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-            if row + 1 < self.rendered_rows {
-                execute!(stdout, MoveDown(1))?;
-            }
-        }
-
-        if self.rendered_rows > 1 {
-            execute!(stdout, MoveUp(self.rendered_rows - 1))?;
-        }
-
-        for index in 0..self.buffer.lines_len() {
-            write!(stdout, "{}", self.prompt_for_row(index))?;
-            if index == 0 {
-                write!(stdout, "{}", highlighted_input(&self.line_text(index)))?;
-            } else {
-                write!(stdout, "{}", self.line_text(index))?;
-            }
-            if index + 1 < self.buffer.lines_len() {
-                write!(stdout, "\r\n")?;
-            }
-        }
-
-        let rows_up = layout.rows - 1 - layout.cursor_row;
-        if rows_up > 0 {
-            execute!(stdout, MoveUp(rows_up))?;
-        }
-
-        execute!(stdout, MoveToColumn(0))?;
-        if layout.cursor_col > 0 {
-            execute!(stdout, MoveRight(layout.cursor_col))?;
-        }
-        stdout.flush()?;
+        let lines = self.render_lines();
+        render_editor_lines(
+            &mut stdout,
+            &lines,
+            layout,
+            self.rendered_rows,
+            self.rendered_cursor_row,
+        )?;
 
         self.rendered_rows = layout.rows;
         self.rendered_cursor_row = layout.cursor_row;
@@ -261,28 +231,30 @@ impl<'a> CommandEditor<'a> {
     }
 
     fn render_layout_for_columns(&self, columns: usize) -> RenderLayout {
-        let mut rows_before_cursor = 0usize;
-        let mut total_rows = 0usize;
+        render_layout_for_lines(
+            &self.render_lines(),
+            self.buffer.row(),
+            self.buffer.col(),
+            columns,
+        )
+    }
 
-        for index in 0..self.buffer.lines_len() {
-            let line_len =
-                text_length(self.prompt_for_row(index), false) + self.buffer.lines()[index].len();
-            let line_rows = wrapped_rows(line_len, columns);
-
-            if index < self.buffer.row() {
-                rows_before_cursor += line_rows;
-            }
-            total_rows += line_rows;
-        }
-
-        let cursor_len =
-            text_length(self.prompt_for_row(self.buffer.row()), false) + self.buffer.col();
-
-        RenderLayout {
-            rows: total_rows as u16,
-            cursor_row: (rows_before_cursor + cursor_len / columns) as u16,
-            cursor_col: (cursor_len % columns) as u16,
-        }
+    fn render_lines(&self) -> Vec<EditorLine<'_>> {
+        (0..self.buffer.lines_len())
+            .map(|index| {
+                let line = self.line_text(index);
+                let rendered_line = if index == 0 {
+                    highlighted_input(&line)
+                } else {
+                    line.clone()
+                };
+                EditorLine::with_visible_len(
+                    self.prompt_for_row(index),
+                    rendered_line,
+                    line.chars().count(),
+                )
+            })
+            .collect()
     }
 
     fn finish_line(&self) -> io::Result<()> {
@@ -492,16 +464,6 @@ impl<'a> CommandEditor<'a> {
     fn replace_before_cursor(&mut self, start: usize, replacement: &str) {
         self.buffer.replace_before_cursor(start, replacement);
     }
-}
-
-struct RenderLayout {
-    rows: u16,
-    cursor_row: u16,
-    cursor_col: u16,
-}
-
-fn wrapped_rows(visible_len: usize, columns: usize) -> usize {
-    visible_len / columns + 1
 }
 
 fn highlighted_input(input: &str) -> String {

@@ -2,6 +2,7 @@ mod box_text;
 mod colorize;
 mod completion;
 mod dedent;
+mod editor_render;
 mod highlight;
 mod key;
 mod line_buffer;

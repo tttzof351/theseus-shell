@@ -1,7 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 
 use crossterm::{
-    cursor::{self, MoveDown, MoveRight, MoveTo, MoveToColumn, MoveUp},
+    cursor::{self, MoveDown, MoveTo, MoveToColumn, MoveUp},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{self, Clear, ClearType},
@@ -10,6 +10,9 @@ use crossterm::{
 use super::{
     colorize_tag,
     completion::{CompletionState, completion_state, token_before_cursor},
+    editor_render::{
+        EditorLine, RenderLayout, render_editor_lines, render_layout_for_lines, wrapped_rows,
+    },
     is_alt_key, is_command_key, is_key_press, is_plain_text_key,
     line_buffer::LineBuffer,
     raw_mode::RawModeGuard,
@@ -340,45 +343,19 @@ impl<'a> LineEditor<'a> {
     fn render(&mut self) -> io::Result<()> {
         let mut stdout = io::stdout();
         let layout = self.render_layout();
-
-        if self.rendered_cursor_row > 0 {
-            execute!(stdout, MoveUp(self.rendered_cursor_row))?;
-        }
-
-        for row in 0..self.rendered_rows {
-            execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-            if row + 1 < self.rendered_rows {
-                execute!(stdout, MoveDown(1))?;
-            }
-        }
-
-        if self.rendered_rows > 1 {
-            execute!(stdout, MoveUp(self.rendered_rows - 1))?;
-        }
-
-        write!(
-            stdout,
-            "{}{}",
-            self.prompt,
-            highlighted_input(&self.current_line())
+        let lines = self.render_lines();
+        render_editor_lines(
+            &mut stdout,
+            &lines,
+            layout,
+            self.rendered_rows,
+            self.rendered_cursor_row,
         )?;
-
-        let rendered_end_row = layout.rows - 1;
-        if rendered_end_row > layout.cursor_row {
-            execute!(stdout, MoveUp(rendered_end_row - layout.cursor_row))?;
-        } else if layout.cursor_row > rendered_end_row {
-            execute!(stdout, MoveDown(layout.cursor_row - rendered_end_row))?;
-        }
-
-        execute!(stdout, MoveToColumn(0))?;
-        if layout.cursor_col > 0 {
-            execute!(stdout, MoveRight(layout.cursor_col))?;
-        }
 
         self.rendered_rows = layout.rows;
         self.rendered_cursor_row = layout.cursor_row;
 
-        stdout.flush()
+        Ok(())
     }
 
     fn clear_screen_and_render(&mut self) -> io::Result<()> {
@@ -395,15 +372,16 @@ impl<'a> LineEditor<'a> {
             .ok()
             .map(|(columns, _)| columns.max(1) as usize)
             .unwrap_or(80);
-        let visible_len = text_length(self.prompt, false) + self.line.text().chars().count();
-        let cursor_len = text_length(self.prompt, false) + self.line.cursor();
-        let rows = wrapped_rows(visible_len, columns).max(wrapped_rows(cursor_len, columns));
+        render_layout_for_lines(&self.render_lines(), 0, self.line.cursor(), columns)
+    }
 
-        RenderLayout {
-            rows: rows as u16,
-            cursor_row: (cursor_len / columns) as u16,
-            cursor_col: (cursor_len % columns) as u16,
-        }
+    fn render_lines(&self) -> Vec<EditorLine<'_>> {
+        let line = self.current_line();
+        vec![EditorLine::with_visible_len(
+            self.prompt,
+            highlighted_input(&line),
+            line.chars().count(),
+        )]
     }
 
     fn finish_line(&self) -> io::Result<()> {
@@ -563,12 +541,6 @@ impl<'a> LineEditor<'a> {
     }
 }
 
-struct RenderLayout {
-    rows: u16,
-    cursor_row: u16,
-    cursor_col: u16,
-}
-
 fn masked_render_layout(start_col: u16, prompt: &str, input_len: usize) -> RenderLayout {
     let columns = terminal::size()
         .ok()
@@ -599,10 +571,6 @@ fn terminal_height() -> u16 {
         .ok()
         .map(|(_, rows)| rows.max(1))
         .unwrap_or(24)
-}
-
-fn wrapped_rows(visible_len: usize, columns: usize) -> usize {
-    visible_len / columns + 1
 }
 
 fn highlighted_input(input: &str) -> String {

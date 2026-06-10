@@ -82,10 +82,31 @@ impl PtyShell {
     }
 
     fn wait_for_after(&self, offset: usize, needle: &str) -> io::Result<String> {
-        self.wait_until_after(offset, |text| text.contains(needle))
+        self.wait_for_after_with_timeout(offset, needle, WAIT_TIMEOUT)
+    }
+
+    fn wait_for_after_with_timeout(
+        &self,
+        offset: usize,
+        needle: &str,
+        timeout: Duration,
+    ) -> io::Result<String> {
+        self.wait_until_after_with_timeout(offset, timeout, |text| text.contains(needle))
     }
 
     fn wait_until_after<F>(&self, offset: usize, predicate: F) -> io::Result<String>
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.wait_until_after_with_timeout(offset, WAIT_TIMEOUT, predicate)
+    }
+
+    fn wait_until_after_with_timeout<F>(
+        &self,
+        offset: usize,
+        timeout: Duration,
+        predicate: F,
+    ) -> io::Result<String>
     where
         F: Fn(&str) -> bool,
     {
@@ -96,7 +117,7 @@ impl PtyShell {
             if predicate(tail) {
                 return Ok(text);
             }
-            if start.elapsed() > WAIT_TIMEOUT {
+            if start.elapsed() > timeout {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("timed out waiting for terminal output; tail was:\n{tail}"),
@@ -230,6 +251,50 @@ fn pasted_multiline_command_executes_as_one_shell_command() -> io::Result<()> {
     assert!(
         count_matches(&transcript[offset..], "THESEUS_PASTE_OK") >= 2,
         "pasted multiline command did not execute as one joined command:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.exit()
+}
+
+#[test]
+fn long_running_command_moves_to_next_line_immediately_after_enter() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    let offset = shell.transcript_len();
+    shell.write("sleep 2\r")?;
+    let transcript = shell.wait_for_after_with_timeout(offset, "\r\n", Duration::from_millis(200))?;
+
+    assert!(
+        transcript[offset..].contains("\r\n"),
+        "command line was not finished immediately after Enter:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.wait_for_after(offset, "theseus-shell")?;
+    shell.exit()
+}
+
+#[test]
+fn unmatched_quote_after_continuation_returns_to_prompt() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    shell.write("echo \\\r \"test\r")?;
+    shell.wait_for("unmatched")?;
+    let prompt_offset = shell.transcript_len();
+    shell.wait_for_after(prompt_offset, "theseus-shell")?;
+
+    let offset = shell.transcript_len();
+    shell.write("echo AFTER_UNMATCHED_QUOTE_OK\r")?;
+    let transcript = shell.wait_until_after(offset, |tail| {
+        count_matches(tail, "AFTER_UNMATCHED_QUOTE_OK") >= 2
+    })?;
+
+    assert!(
+        count_matches(&transcript[offset..], "AFTER_UNMATCHED_QUOTE_OK") >= 2,
+        "shell did not recover after unmatched quote:\n{}",
         &transcript[offset..]
     );
 
