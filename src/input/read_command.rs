@@ -479,7 +479,7 @@ impl<'a> CommandEditor<'a> {
     }
 
     fn can_navigate_history(&self) -> bool {
-        self.lines.len() == 1 && self.row == 0
+        self.history_index.is_some() || (self.lines.len() == 1 && self.row == 0)
     }
 
     fn set_history_index(&mut self, index: usize) {
@@ -693,6 +693,32 @@ mod tests {
         assert_eq!(editor.current_text(), "second");
         assert_eq!(editor.row, 0);
         assert_eq!(editor.col, "second".chars().count());
+    }
+
+    #[test]
+    fn history_navigation_can_leave_multiline_history_entry() {
+        let history = vec![
+            "first".to_string(),
+            "echo \\\n \"test\"".to_string(),
+            "third".to_string(),
+        ];
+        let mut editor = CommandEditor::new(config(&history));
+
+        editor.history_previous();
+        assert_eq!(editor.current_text(), "third");
+
+        editor.history_previous();
+        assert_eq!(editor.current_text(), "echo \\\n \"test\"");
+        assert_eq!(editor.lines.len(), 2);
+
+        editor.history_previous();
+        assert_eq!(editor.current_text(), "first");
+
+        editor.history_next();
+        assert_eq!(editor.current_text(), "echo \\\n \"test\"");
+
+        editor.history_next();
+        assert_eq!(editor.current_text(), "third");
     }
 
     #[test]
