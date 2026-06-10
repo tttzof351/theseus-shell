@@ -18,7 +18,7 @@ use crate::common::{
     cancellation::{CancellationEvent, clear_sigint_request, install_sigint_handler},
     text::{TruncatePosition, truncate_utf8_to_bytes},
 };
-use crate::input::read_line_with_history;
+use crate::input::{CommandInputConfig, read_command_input, read_line_with_history};
 use crate::logging::AppLogger;
 
 #[cfg(not(test))]
@@ -26,6 +26,7 @@ use super::history::default_command_history_path;
 
 const MAX_AGENT_SHELL_CONTEXT_OUTPUT_BYTES: usize = 32 * 1024;
 const INTERRUPTED_EXIT_HINT: &str = "Interrupted. Type /exit to exit the shell.";
+const SHELL_CONTINUATION_PROMPT: &str = "> ";
 
 #[derive(Debug, Clone)]
 pub struct ShellConfig {
@@ -116,7 +117,7 @@ impl TheseusShell {
         }
 
         loop {
-            let input = match read_line_with_history(&self.config.prompt, &self.input_history) {
+            let input = match self.read_command_input() {
                 Ok(Some(input)) => input,
                 Ok(None) => {
                     println!();
@@ -133,7 +134,6 @@ impl TheseusShell {
                 continue;
             }
 
-            let input = self.read_shell_continuation_lines(input)?;
             let trimmed_input = input.trim();
             let input_was_ask =
                 matches!(parse_slash_command(trimmed_input), Some(SlashCommand::Ask));
@@ -158,11 +158,28 @@ impl TheseusShell {
         }
     }
 
+    fn read_command_input(&self) -> io::Result<Option<String>> {
+        if crate::feature_flags::COMMAND_LINE_EDITOR_V2 {
+            return read_command_input(CommandInputConfig {
+                prompt: &self.config.prompt,
+                continuation_prompt: SHELL_CONTINUATION_PROMPT,
+                history: &self.input_history,
+                should_continue: should_read_shell_continuation,
+            });
+        }
+
+        let Some(input) = read_line_with_history(&self.config.prompt, &self.input_history)? else {
+            return Ok(None);
+        };
+
+        self.read_shell_continuation_lines(input).map(Some)
+    }
+
     fn read_shell_continuation_lines(&self, first_input: String) -> io::Result<String> {
         let mut input = first_input;
 
         while should_read_shell_continuation(&input) {
-            let next = match read_line_with_history("", &[]) {
+            let next = match read_line_with_history(SHELL_CONTINUATION_PROMPT, &[]) {
                 Ok(Some(next)) => next,
                 Ok(None) => break,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => return Err(err),
