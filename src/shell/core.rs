@@ -1,5 +1,6 @@
 use std::{env, io, path::PathBuf};
 
+use super::pty::PersistentShellSession;
 use super::{
     command_routing::{CommandRoute, classify_command},
     history::{
@@ -68,6 +69,7 @@ impl Default for ShellConfig {
 pub struct TheseusShell {
     pub(super) config: ShellConfig,
     pub(super) agent: Option<Agent>,
+    pub(super) shell_session: Option<PersistentShellSession>,
     history: Vec<CommandRecord>,
     input_history: Vec<String>,
 }
@@ -93,6 +95,7 @@ impl TheseusShell {
         Self {
             config,
             agent,
+            shell_session: None,
             history: Vec::new(),
             input_history,
         }
@@ -408,7 +411,7 @@ mod tests {
     #[test]
     fn intercepts_slash_history_command() {
         let mut shell = TheseusShell::new(ShellConfig {
-            executable: PathBuf::from("false"),
+            executable: PathBuf::from("/bin/sh"),
             ..ShellConfig::default()
         });
 
@@ -584,7 +587,7 @@ mod tests {
     #[test]
     fn shell_command_with_non_english_path_stays_external() {
         let mut shell = TheseusShell::new(ShellConfig {
-            executable: PathBuf::from("false"),
+            executable: PathBuf::from("/bin/sh"),
             ..ShellConfig::default()
         });
 
@@ -646,7 +649,7 @@ mod tests {
     #[test]
     fn english_plain_command_found_in_path_stays_external() {
         let mut shell = TheseusShell::new(ShellConfig {
-            executable: PathBuf::from("false"),
+            executable: PathBuf::from("/bin/sh"),
             ..ShellConfig::default()
         });
 
@@ -658,26 +661,36 @@ mod tests {
     #[test]
     fn english_shell_command_with_shell_arguments_stays_external() {
         let mut shell = TheseusShell::new(ShellConfig {
-            executable: PathBuf::from("false"),
+            executable: PathBuf::from("/bin/sh"),
             ..ShellConfig::default()
         });
 
-        let output = shell.handle_command(r#"find . -name "*.jpg""#).unwrap();
+        let output = shell
+            .handle_command(r#"find /definitely-missing-theseus-path -name "*.jpg""#)
+            .unwrap();
 
-        assert_eq!(shell.history()[0].input, r#"find . -name "*.jpg""#);
+        assert_eq!(
+            shell.history()[0].input,
+            r#"find /definitely-missing-theseus-path -name "*.jpg""#
+        );
         assert_ne!(output.status_code, Some(0));
     }
 
     #[test]
     fn english_shell_command_with_question_mark_glob_stays_external() {
         let mut shell = TheseusShell::new(ShellConfig {
-            executable: PathBuf::from("false"),
+            executable: PathBuf::from("/bin/sh"),
             ..ShellConfig::default()
         });
 
-        let output = shell.handle_command(r#"find . -name "file?.mp3""#).unwrap();
+        let output = shell
+            .handle_command(r#"find /definitely-missing-theseus-path -name "file?.mp3""#)
+            .unwrap();
 
-        assert_eq!(shell.history()[0].input, r#"find . -name "file?.mp3""#);
+        assert_eq!(
+            shell.history()[0].input,
+            r#"find /definitely-missing-theseus-path -name "file?.mp3""#
+        );
         assert_ne!(output.status_code, Some(0));
     }
 
@@ -691,7 +704,7 @@ mod tests {
         std::fs::create_dir_all(&existing_dir).unwrap();
 
         let mut shell = TheseusShell::new(ShellConfig {
-            executable: PathBuf::from("false"),
+            executable: PathBuf::from("/bin/sh"),
             working_dir: Some(temp_dir.clone()),
             ..ShellConfig::default()
         });
@@ -703,7 +716,8 @@ mod tests {
             ))
             .unwrap();
 
-        assert_ne!(output.status_code, Some(0));
+        assert!(shell.shell_session.is_some());
+        assert_eq!(output.status_code, Some(0));
         std::fs::remove_dir_all(existing_dir).unwrap();
         env::set_current_dir(current_dir).unwrap();
     }
@@ -711,14 +725,15 @@ mod tests {
     #[test]
     fn plain_history_is_external_command() {
         let mut shell = TheseusShell::new(ShellConfig {
-            executable: PathBuf::from("false"),
+            executable: PathBuf::from("/bin/sh"),
             ..ShellConfig::default()
         });
 
         let output = shell.handle_command("history").unwrap();
 
         assert_eq!(shell.history()[0].input, "history");
-        assert_ne!(output.status_code, Some(0));
+        assert!(shell.shell_session.is_some());
+        assert_eq!(output.status_code, Some(0));
     }
 
     #[test]

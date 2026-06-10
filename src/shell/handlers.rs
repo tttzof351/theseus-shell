@@ -3,7 +3,7 @@ use std::{env, io};
 use super::{
     core::TheseusShell,
     prompt::{default_prompt, expand_home},
-    pty::{PtyCommandConfig, run_pty_command},
+    pty::{PersistentShellConfig, PersistentShellSession, PtyCommandConfig, run_pty_command},
     render::render_markdown,
     resume::select_resume_session,
 };
@@ -11,6 +11,7 @@ use crate::{
     agent::{Agent, AgentConfig, CompactOutcome, default_config_path},
     common::info::render_info,
     common::output::CommandOutput,
+    feature_flags,
     input::{MultiLineConfig, colorize_nested, read_multi_line_input},
     logging::AppLogger,
 };
@@ -60,7 +61,23 @@ impl TheseusShell {
         }
     }
 
-    pub(super) fn run_external_command(&self, command: &str) -> io::Result<CommandOutput> {
+    pub(super) fn run_external_command(&mut self, command: &str) -> io::Result<CommandOutput> {
+        if feature_flags::PERSISTENT_SHELL_SESSION {
+            if self.shell_session.is_none() {
+                self.shell_session = Some(PersistentShellSession::start(PersistentShellConfig {
+                    shell: self.config.executable.clone(),
+                    env_vars: self.config.env_vars.clone(),
+                    working_dir: self.config.working_dir.clone(),
+                })?);
+            }
+
+            let session = self
+                .shell_session
+                .as_mut()
+                .ok_or_else(|| io::Error::other("persistent shell session was not initialized"))?;
+            return session.run_command(command);
+        }
+
         run_pty_command(PtyCommandConfig {
             shell: self.config.executable.clone(),
             command: command.to_string(),

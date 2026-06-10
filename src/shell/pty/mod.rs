@@ -5,8 +5,10 @@ use crate::common::cancellation::CancellationEvent;
 mod input;
 mod platform;
 mod runner;
+mod session;
 
 pub use runner::run_pty_command;
+pub use session::{PersistentShellConfig, PersistentShellSession};
 
 #[derive(Debug, Clone)]
 pub struct PtyCommandConfig {

@@ -53,9 +53,23 @@ pub(super) fn shell_command_args(shell: &Path, command: &str) -> Vec<String> {
     vec![command_flag.to_string(), command.to_string()]
 }
 
+#[cfg(unix)]
+pub(super) fn interactive_shell_args(shell: &Path) -> Vec<String> {
+    if loads_interactive_startup_files(shell) {
+        vec!["-i".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 #[cfg(windows)]
 pub(super) fn shell_command_args(_shell: &Path, command: &str) -> Vec<String> {
     vec!["/C".to_string(), command.to_string()]
+}
+
+#[cfg(windows)]
+pub(super) fn interactive_shell_args(_shell: &Path) -> Vec<String> {
+    Vec::new()
 }
 
 #[cfg(unix)]
@@ -130,6 +144,15 @@ mod tests {
         assert_eq!(
             shell_command_args(Path::new("/bin/sh"), "ll"),
             vec!["-c".to_string(), "ll".to_string()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zsh_persistent_session_starts_interactive() {
+        assert_eq!(
+            interactive_shell_args(Path::new("/bin/zsh")),
+            vec!["-i".to_string()]
         );
     }
 }
