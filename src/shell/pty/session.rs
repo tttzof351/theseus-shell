@@ -32,6 +32,7 @@ pub struct PersistentShellConfig {
 
 pub struct PersistentShellSession {
     nonce: String,
+    uses_zsh_protocol: bool,
     child: Box<dyn Child + Send + Sync>,
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -46,8 +47,10 @@ impl PersistentShellSession {
             .openpty(current_pty_size())
             .map_err(|err| io::Error::other(err.to_string()))?;
 
-        let mut command = CommandBuilder::new(&config.shell);
-        command.args(interactive_shell_args(&config.shell));
+        let shell = config.shell;
+        let uses_zsh_protocol = is_zsh_shell(&shell);
+        let mut command = CommandBuilder::new(&shell);
+        command.args(interactive_shell_args(&shell));
 
         for (key, value) in config.env_vars {
             command.env(key, value);
@@ -75,6 +78,7 @@ impl PersistentShellSession {
 
         let mut session = Self {
             nonce: new_nonce(),
+            uses_zsh_protocol,
             child,
             master: pair.master,
             writer: Arc::new(Mutex::new(writer)),
@@ -181,7 +185,7 @@ impl PersistentShellSession {
     }
 
     fn command_payload(&self, command: &str) -> String {
-        let payload = shell_group_payload(command, &self.nonce);
+        let payload = shell_group_payload(command, &self.nonce, self.uses_zsh_protocol);
 
         payload.replace('\n', "\r")
     }
@@ -559,8 +563,24 @@ fn new_nonce() -> String {
     format!("{}_{}", std::process::id(), nanos)
 }
 
-fn shell_group_payload(command: &str, nonce: &str) -> String {
+fn shell_group_payload(command: &str, nonce: &str, uses_zsh_protocol: bool) -> String {
     let command = shell_single_quote(command);
+    if uses_zsh_protocol {
+        return format!(
+            "{{ \n\
+             unset __theseus_status\n\
+             {{ \n\
+             eval -- {command}\n\
+             __theseus_status=$?\n\
+             }} always {{ \n\
+             __theseus_status=${{__theseus_status:-$?}}\n\
+             printf '\\n__THESEUS_DONE_{nonce}_%s__\\n' \"$__theseus_status\"\n\
+             unset __theseus_status\n\
+             }}\n\
+             }}\n"
+        );
+    }
+
     format!(
         "{{ \n\
          eval -- {command}\n\
@@ -572,6 +592,13 @@ fn shell_group_payload(command: &str, nonce: &str) -> String {
 
 fn shell_single_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+fn is_zsh_shell(shell: &std::path::Path) -> bool {
+    shell
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "zsh" || name.ends_with("-zsh"))
 }
 
 #[cfg(test)]
@@ -650,7 +677,7 @@ mod tests {
     #[test]
     fn waits_for_complete_long_echoed_payload_before_draining() {
         let command = format!("printf '{}'", "x".repeat(STREAM_HOLD_BACK_BYTES + 100));
-        let payload = shell_group_payload(&command, "nonce").replace('\n', "\r");
+        let payload = shell_group_payload(&command, "nonce", false).replace('\n', "\r");
         let echoed = echoed_payload(&payload);
         let mut partial = echoed[..STREAM_HOLD_BACK_BYTES + 1].to_vec();
 
@@ -668,7 +695,7 @@ mod tests {
 
     #[test]
     fn command_payload_groups_protocol_with_command() {
-        let payload = shell_group_payload("vim", "nonce");
+        let payload = shell_group_payload("vim", "nonce", false);
 
         assert_eq!(
             payload,
@@ -678,12 +705,21 @@ mod tests {
 
     #[test]
     fn command_payload_shell_quotes_user_command_for_eval() {
-        let payload = shell_group_payload("printf '%s' 'a b'", "nonce");
+        let payload = shell_group_payload("printf '%s' 'a b'", "nonce", false);
 
         assert_eq!(
             payload,
             "{ \neval -- 'printf '\\''%s'\\'' '\\''a b'\\'''\n__theseus_status=$?\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\n}\n"
         );
+    }
+
+    #[test]
+    fn zsh_command_payload_prints_sentinel_from_always_block() {
+        let payload = shell_group_payload("sleep 100", "nonce", true);
+
+        assert!(payload.contains("} always {"));
+        assert!(payload.contains("eval -- 'sleep 100'"));
+        assert!(payload.contains("__THESEUS_DONE_nonce_%s__"));
     }
 
     #[test]
@@ -879,6 +915,39 @@ mod tests {
                 "shell: {shell}, output: {:?}",
                 output.transcript_lossy()
             );
+
+            let recovery = recovery.unwrap();
+            assert_eq!(recovery.status_code, Some(0), "shell: {shell}");
+            assert_eq!(normalized_transcript(&recovery), "recovered");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_shell_ctrl_c_interrupts_foreground_command() {
+        for shell in available_shells() {
+            let (mut session, _home) = start_clean_test_session(&shell);
+            let writer = Arc::clone(&session.writer);
+            let (tx, rx) = test_mpsc::channel();
+
+            thread::spawn(move || {
+                let output = session.run_command("sleep 100");
+                let recovery = session.run_command("printf recovered");
+                let _ = tx.send((output, recovery));
+            });
+
+            thread::sleep(Duration::from_millis(200));
+            {
+                let mut writer = writer.lock().unwrap();
+                writer.write_all(&[3]).unwrap();
+                writer.flush().unwrap();
+            }
+
+            let (output, recovery) = rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|_| panic!("Ctrl+C did not interrupt command for shell: {shell}"));
+            let output = output.unwrap();
+            assert_ne!(output.status_code, Some(0), "shell: {shell}");
 
             let recovery = recovery.unwrap();
             assert_eq!(recovery.status_code, Some(0), "shell: {shell}");
