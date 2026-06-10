@@ -560,13 +560,18 @@ fn new_nonce() -> String {
 }
 
 fn shell_group_payload(command: &str, nonce: &str) -> String {
+    let command = shell_single_quote(command);
     format!(
         "{{ \n\
-         {command}\n\
+         eval -- {command}\n\
          __theseus_status=$?\n\
          printf '\\n__THESEUS_DONE_{nonce}_%s__\\n' \"$__theseus_status\"\n\
          }}\n"
     )
+}
+
+fn shell_single_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -577,7 +582,10 @@ mod tests {
         fs,
         path::Path,
         process::Command,
-        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        sync::{
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            mpsc as test_mpsc,
+        },
     };
 
     #[test]
@@ -664,7 +672,17 @@ mod tests {
 
         assert_eq!(
             payload,
-            "{ \nvim\n__theseus_status=$?\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\n}\n"
+            "{ \neval -- 'vim'\n__theseus_status=$?\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn command_payload_shell_quotes_user_command_for_eval() {
+        let payload = shell_group_payload("printf '%s' 'a b'", "nonce");
+
+        assert_eq!(
+            payload,
+            "{ \neval -- 'printf '\\''%s'\\'' '\\''a b'\\'''\n__theseus_status=$?\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\n}\n"
         );
     }
 
@@ -834,6 +852,37 @@ mod tests {
             let output = session.run_command("sh -c 'exit 42'").unwrap();
             assert_eq!(output.status_code, Some(42), "shell: {shell}");
             assert_eq!(output.transcript_lossy(), "", "shell: {shell}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_shell_returns_after_unmatched_backtick_syntax_error() {
+        for shell in available_shells() {
+            let (tx, rx) = test_mpsc::channel();
+            let thread_shell = shell.clone();
+
+            thread::spawn(move || {
+                let (mut session, _home) = start_clean_test_session(&thread_shell);
+                let output = session.run_command("du -h vscode-plugin` (19G)");
+                let recovery = session.run_command("printf recovered");
+                let _ = tx.send((output, recovery));
+            });
+
+            let (output, recovery) = rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|_| panic!("command hung for shell: {shell}"));
+            let output = output.unwrap();
+            assert_ne!(output.status_code, Some(0), "shell: {shell}");
+            assert!(
+                normalized_transcript(&output).contains("`"),
+                "shell: {shell}, output: {:?}",
+                output.transcript_lossy()
+            );
+
+            let recovery = recovery.unwrap();
+            assert_eq!(recovery.status_code, Some(0), "shell: {shell}");
+            assert_eq!(normalized_transcript(&recovery), "recovered");
         }
     }
 
