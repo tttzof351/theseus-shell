@@ -2,6 +2,7 @@ use std::{env, io};
 
 use super::{
     core::TheseusShell,
+    history::{push_string_history, save_string_history},
     prompt::{default_prompt, expand_home},
     pty::{PersistentShellConfig, PersistentShellSession, PtyCommandConfig, run_pty_command},
     render::render_markdown,
@@ -111,6 +112,7 @@ impl TheseusShell {
             return self.read_ask_input();
         }
 
+        self.store_ask_history(prompt);
         Ok(self.agent_output(prompt))
     }
 
@@ -286,18 +288,40 @@ impl TheseusShell {
             )
         );
 
-        let text = match read_multi_line_input(MultiLineConfig {
-            prefix: "> ".to_string(),
-            exit_word: Some("/end".to_string()),
-        }) {
-            Ok(text) => text,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                return Ok(CommandOutput::success("\nAsk cancelled.\n"));
+        let history = self.ask_history.clone();
+        let draft_slot = self.ask_history.len();
+        let ask_history_path = self.config.ask_history_path.clone();
+        let text = {
+            let ask_history = &mut self.ask_history;
+            match read_multi_line_input(MultiLineConfig {
+                prefix: "> ".to_string(),
+                exit_word: Some("/end".to_string()),
+                history: &history,
+                on_change: Some(Box::new(move |text| {
+                    update_ask_history_draft(ask_history, draft_slot, text);
+                    save_ask_history(&ask_history_path, ask_history);
+                })),
+            }) {
+                Ok(text) => text,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                    return Ok(CommandOutput::success("\nAsk cancelled.\n"));
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => return Err(err),
         };
 
+        update_ask_history_draft(&mut self.ask_history, draft_slot, &text);
+        self.save_ask_history();
         Ok(self.agent_output(&text))
+    }
+
+    fn store_ask_history(&mut self, prompt: &str) {
+        push_string_history(&mut self.ask_history, prompt);
+        self.save_ask_history();
+    }
+
+    fn save_ask_history(&self) {
+        save_ask_history(&self.config.ask_history_path, &self.ask_history);
     }
 
     pub(super) fn agent_output(&mut self, prompt: &str) -> CommandOutput {
@@ -320,6 +344,30 @@ impl TheseusShell {
                 CommandOutput::failure(wrap_agent_answer(&body, has_agent))
             }
         }
+    }
+}
+
+fn update_ask_history_draft(history: &mut Vec<String>, slot: usize, prompt: &str) {
+    if prompt.trim().is_empty() {
+        history.truncate(slot);
+        return;
+    }
+
+    if history.len() > slot {
+        history[slot] = prompt.to_string();
+        history.truncate(slot + 1);
+    } else if history.last().is_none_or(|last| last != prompt) {
+        history.push(prompt.to_string());
+    }
+}
+
+fn save_ask_history(path: &Option<std::path::PathBuf>, history: &[String]) {
+    let Some(path) = path else {
+        return;
+    };
+
+    if let Err(err) = save_string_history(path, history) {
+        eprintln!("warning: failed to save ask history: {err}");
     }
 }
 

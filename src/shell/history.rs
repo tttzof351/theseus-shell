@@ -5,7 +5,7 @@ use std::env;
 
 use crate::common::output::CommandOutput;
 
-const MAX_PERSISTED_COMMAND_HISTORY: usize = 99;
+const MAX_PERSISTED_HISTORY: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandRecord {
@@ -15,16 +15,22 @@ pub struct CommandRecord {
 
 #[cfg(not(test))]
 pub(super) fn default_command_history_path() -> io::Result<std::path::PathBuf> {
+    default_history_path("history_command.json")
+}
+
+#[cfg(not(test))]
+pub(super) fn default_ask_history_path() -> io::Result<std::path::PathBuf> {
+    default_history_path("history_ask.json")
+}
+
+#[cfg(not(test))]
+fn default_history_path(file_name: &str) -> io::Result<std::path::PathBuf> {
     home_dir()
-        .map(|home| {
-            home.join(".theseus")
-                .join("persist")
-                .join("history_command.json")
-        })
+        .map(|home| home.join(".theseus").join("persist").join(file_name))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))
 }
 
-pub(super) fn load_command_history(path: impl AsRef<Path>) -> io::Result<Vec<String>> {
+pub(super) fn load_string_history(path: impl AsRef<Path>) -> io::Result<Vec<String>> {
     let path = path.as_ref();
     if !path.exists() {
         return Ok(Vec::new());
@@ -36,7 +42,7 @@ pub(super) fn load_command_history(path: impl AsRef<Path>) -> io::Result<Vec<Str
     Ok(trim_command_history(history))
 }
 
-pub(super) fn save_command_history(path: impl AsRef<Path>, history: &[String]) -> io::Result<()> {
+pub(super) fn save_string_history(path: impl AsRef<Path>, history: &[String]) -> io::Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -48,7 +54,7 @@ pub(super) fn save_command_history(path: impl AsRef<Path>, history: &[String]) -
     fs::write(path, text)
 }
 
-pub(super) fn push_command_history(history: &mut Vec<String>, input: &str) {
+pub(super) fn push_string_history(history: &mut Vec<String>, input: &str) {
     let input = input.trim();
     if input.is_empty() {
         return;
@@ -100,8 +106,8 @@ fn trim_command_history(mut history: Vec<String>) -> Vec<String> {
 }
 
 fn trim_command_history_in_place(history: &mut Vec<String>) {
-    if history.len() > MAX_PERSISTED_COMMAND_HISTORY {
-        history.drain(..history.len() - MAX_PERSISTED_COMMAND_HISTORY);
+    if history.len() > MAX_PERSISTED_HISTORY {
+        history.drain(..history.len() - MAX_PERSISTED_HISTORY);
     }
 }
 
@@ -115,26 +121,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn persisted_command_history_keeps_latest_entries() {
+    fn persisted_string_history_keeps_latest_entries() {
         let mut history = (0..105)
             .map(|index| format!("command-{index}"))
             .collect::<Vec<_>>();
 
-        push_command_history(&mut history, "latest");
+        push_string_history(&mut history, "latest");
 
-        assert_eq!(history.len(), MAX_PERSISTED_COMMAND_HISTORY);
-        assert_eq!(history.first().map(String::as_str), Some("command-7"));
+        assert_eq!(history.len(), MAX_PERSISTED_HISTORY);
+        assert_eq!(history.first().map(String::as_str), Some("command-6"));
         assert_eq!(history.last().map(String::as_str), Some("latest"));
     }
 
     #[test]
-    fn persisted_command_history_skips_empty_and_adjacent_duplicates() {
+    fn persisted_string_history_skips_empty_and_adjacent_duplicates() {
         let mut history = vec!["ls".to_string()];
 
-        push_command_history(&mut history, "  ");
-        push_command_history(&mut history, "ls");
-        push_command_history(&mut history, "pwd");
+        push_string_history(&mut history, "  ");
+        push_string_history(&mut history, "ls");
+        push_string_history(&mut history, "pwd");
 
         assert_eq!(history, vec!["ls", "pwd"]);
+    }
+
+    #[test]
+    fn string_history_round_trips_with_limit() {
+        let path = std::env::temp_dir().join(format!(
+            "theseus-string-history-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let history = (0..105)
+            .map(|index| format!("ask-{index}"))
+            .collect::<Vec<_>>();
+
+        save_string_history(&path, &history).unwrap();
+        let loaded = load_string_history(&path).unwrap();
+
+        assert_eq!(loaded.len(), MAX_PERSISTED_HISTORY);
+        assert_eq!(loaded.first().map(String::as_str), Some("ask-5"));
+        assert_eq!(loaded.last().map(String::as_str), Some("ask-104"));
+
+        let _ = std::fs::remove_file(path);
     }
 }

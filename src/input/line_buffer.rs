@@ -5,6 +5,11 @@ pub(crate) struct LineBuffer {
 }
 
 impl LineBuffer {
+    /// Strict single-line editing model.
+    ///
+    /// Keep this for prompts where Enter submits the input and pasted newlines
+    /// must not create additional logical rows. Use `TextBuffer` for editors
+    /// that can own multiline input, such as shell continuations or `/ask`.
     pub(crate) fn new() -> Self {
         Self::default()
     }

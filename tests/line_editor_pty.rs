@@ -266,7 +266,8 @@ fn long_running_command_moves_to_next_line_immediately_after_enter() -> io::Resu
 
     let offset = shell.transcript_len();
     shell.write("sleep 2\r")?;
-    let transcript = shell.wait_for_after_with_timeout(offset, "\r\n", Duration::from_millis(200))?;
+    let transcript =
+        shell.wait_for_after_with_timeout(offset, "\r\n", Duration::from_millis(200))?;
 
     assert!(
         transcript[offset..].contains("\r\n"),
@@ -290,9 +291,8 @@ fn history_up_replays_latest_command() -> io::Result<()> {
     let offset = shell.transcript_len();
     shell.write(KEY_UP)?;
     shell.write("\r")?;
-    let transcript = shell.wait_until_after(offset, |tail| {
-        count_matches(tail, "HISTORY_UP_LATEST") >= 2
-    })?;
+    let transcript =
+        shell.wait_until_after(offset, |tail| count_matches(tail, "HISTORY_UP_LATEST") >= 2)?;
 
     assert!(
         count_matches(&transcript[offset..], "HISTORY_UP_LATEST") >= 2,
@@ -358,6 +358,82 @@ fn history_down_after_latest_restores_current_draft() -> io::Result<()> {
         &transcript[offset..]
     );
 
+    shell.exit()
+}
+
+#[test]
+fn ask_multiline_history_up_recalls_previous_prompt() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    shell.write("/ask\r")?;
+    shell.wait_for("Enter multiline input")?;
+    let submit_offset = shell.transcript_len();
+    shell.write("ASK_HISTORY_LINE_ONE\rASK_HISTORY_LINE_TWO\r/end\r")?;
+    shell.wait_for_after(submit_offset, "theseus-shell")?;
+
+    let offset = shell.transcript_len();
+    shell.write("/ask\r")?;
+    shell.wait_for_after(offset, "Enter multiline input")?;
+    shell.write(KEY_UP)?;
+    let transcript = shell.wait_until_after(offset, |tail| {
+        tail.contains("ASK_HISTORY_LINE_ONE") && tail.contains("ASK_HISTORY_LINE_TWO")
+    })?;
+
+    assert!(
+        transcript[offset..].contains("ASK_HISTORY_LINE_ONE")
+            && transcript[offset..].contains("ASK_HISTORY_LINE_TWO"),
+        "Up did not recall the previous multiline /ask prompt:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Ask cancelled")?;
+    shell.exit()
+}
+
+#[test]
+fn ask_multiline_history_preserves_cancelled_draft() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    shell.write("/ask\r")?;
+    shell.wait_for("Enter multiline input")?;
+    shell.write("ASK_CANCELLED_DRAFT_ONE\rASK_CANCELLED_DRAFT_TWO")?;
+    shell.wait_for("ASK_CANCELLED_DRAFT_TWO")?;
+    let cancel_offset = shell.transcript_len();
+    shell.write("\u{3}")?;
+    shell.wait_for_after(cancel_offset, "Ask cancelled")?;
+    shell.wait_for_after(cancel_offset, "theseus-shell")?;
+    let saved = fs::read_to_string(
+        shell
+            .home
+            .join(".theseus")
+            .join("persist")
+            .join("history_ask.json"),
+    )?;
+    assert!(
+        saved.contains("ASK_CANCELLED_DRAFT_ONE") && saved.contains("ASK_CANCELLED_DRAFT_TWO"),
+        "cancelled /ask draft was not persisted:\n{saved}"
+    );
+
+    let offset = shell.transcript_len();
+    shell.write("/ask\r")?;
+    shell.wait_for_after(offset, "Enter multiline input")?;
+    shell.write(KEY_UP)?;
+    let transcript = shell.wait_until_after(offset, |tail| {
+        tail.contains("ASK_CANCELLED_DRAFT_ONE") && tail.contains("ASK_CANCELLED_DRAFT_TWO")
+    })?;
+
+    assert!(
+        transcript[offset..].contains("ASK_CANCELLED_DRAFT_ONE")
+            && transcript[offset..].contains("ASK_CANCELLED_DRAFT_TWO"),
+        "Up did not recall the cancelled multiline /ask draft:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Ask cancelled")?;
     shell.exit()
 }
 

@@ -4,8 +4,8 @@ use super::pty::PersistentShellSession;
 use super::{
     command_routing::{CommandRoute, classify_command},
     history::{
-        CommandRecord, format_history, load_command_history, push_command_history,
-        save_command_history,
+        CommandRecord, format_history, load_string_history, push_string_history,
+        save_string_history,
     },
     prompt::{default_prompt, default_shell},
     render::print_command_output,
@@ -22,7 +22,7 @@ use crate::input::{CommandInputConfig, read_command_input, read_line_with_histor
 use crate::logging::AppLogger;
 
 #[cfg(not(test))]
-use super::history::default_command_history_path;
+use super::history::{default_ask_history_path, default_command_history_path};
 
 const MAX_AGENT_SHELL_CONTEXT_OUTPUT_BYTES: usize = 32 * 1024;
 const INTERRUPTED_EXIT_HINT: &str = "Interrupted. Type /exit to exit the shell.";
@@ -40,6 +40,7 @@ pub struct ShellConfig {
     pub agent: Option<Agent>,
     pub logger: Option<AppLogger>,
     pub command_history_path: Option<PathBuf>,
+    pub ask_history_path: Option<PathBuf>,
 }
 
 impl Default for ShellConfig {
@@ -51,6 +52,10 @@ impl Default for ShellConfig {
         let command_history_path = default_command_history_path().ok();
         #[cfg(test)]
         let command_history_path = None;
+        #[cfg(not(test))]
+        let ask_history_path = default_ask_history_path().ok();
+        #[cfg(test)]
+        let ask_history_path = None;
 
         Self {
             executable: default_shell(),
@@ -63,6 +68,7 @@ impl Default for ShellConfig {
             agent: None,
             logger: None,
             command_history_path,
+            ask_history_path,
         }
     }
 }
@@ -73,6 +79,7 @@ pub struct TheseusShell {
     pub(super) shell_session: Option<PersistentShellSession>,
     history: Vec<CommandRecord>,
     input_history: Vec<String>,
+    pub(super) ask_history: Vec<String>,
 }
 
 impl TheseusShell {
@@ -90,7 +97,12 @@ impl TheseusShell {
         let input_history = config
             .command_history_path
             .as_ref()
-            .and_then(|path| load_command_history(path).ok())
+            .and_then(|path| load_string_history(path).ok())
+            .unwrap_or_default();
+        let ask_history = config
+            .ask_history_path
+            .as_ref()
+            .and_then(|path| load_string_history(path).ok())
             .unwrap_or_default();
 
         Self {
@@ -99,6 +111,7 @@ impl TheseusShell {
             shell_session: None,
             history: Vec::new(),
             input_history,
+            ask_history,
         }
     }
 
@@ -255,13 +268,13 @@ impl TheseusShell {
     }
 
     fn store_input_history(&mut self, input: &str) {
-        push_command_history(&mut self.input_history, input);
+        push_string_history(&mut self.input_history, input);
 
         let Some(path) = &self.config.command_history_path else {
             return;
         };
 
-        if let Err(err) = save_command_history(path, &self.input_history) {
+        if let Err(err) = save_string_history(path, &self.input_history) {
             self.log_event(
                 "error",
                 "command_history_save_failed",
@@ -556,6 +569,46 @@ mod tests {
         assert_eq!(output.status_code, Some(0));
         assert_eq!(output.transcript_lossy(), "say hello\n");
         assert_eq!(shell.history()[0].input, "/ask say hello");
+    }
+
+    #[test]
+    fn loads_persisted_ask_history() {
+        let path = env::temp_dir().join(format!(
+            "theseus-ask-history-load-{}-{}.json",
+            std::process::id(),
+            unique_test_suffix()
+        ));
+        std::fs::write(&path, "[\"old ask\"]\n").unwrap();
+
+        let shell = TheseusShell::new(ShellConfig {
+            ask_history_path: Some(path.clone()),
+            ..ShellConfig::default()
+        });
+
+        assert_eq!(shell.ask_history, vec!["old ask"]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ask_command_persists_single_line_prompt() {
+        let path = env::temp_dir().join(format!(
+            "theseus-ask-history-save-{}-{}.json",
+            std::process::id(),
+            unique_test_suffix()
+        ));
+        let mut shell = TheseusShell::new(ShellConfig {
+            executable: PathBuf::from("false"),
+            ask_history_path: Some(path.clone()),
+            ..ShellConfig::default()
+        });
+
+        shell.handle_command("/ask say hello").unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+
+        assert_eq!(saved, "[\n  \"say hello\"\n]\n");
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

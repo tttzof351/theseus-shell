@@ -13,6 +13,10 @@ impl Default for TextBuffer {
 }
 
 impl TextBuffer {
+    /// Multiline editing model.
+    ///
+    /// This buffer preserves pasted newlines and lets the editor move across
+    /// logical rows. Use `LineBuffer` for strict single-line prompts.
     pub(crate) fn new() -> Self {
         Self {
             lines: vec![Vec::new()],

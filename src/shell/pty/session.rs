@@ -647,9 +647,11 @@ mod tests {
 
     #[test]
     fn parses_empty_status_as_error() {
-        let completed =
-            parse_completed_command(b"(eval):2: unmatched \"\r\n__THESEUS_DONE_nonce___\r\n", "nonce")
-                .unwrap();
+        let completed = parse_completed_command(
+            b"(eval):2: unmatched \"\r\n__THESEUS_DONE_nonce___\r\n",
+            "nonce",
+        )
+        .unwrap();
 
         assert_eq!(completed.transcript, b"(eval):2: unmatched \"");
         assert_eq!(completed.status_code, 1);
