@@ -18,7 +18,7 @@ use crate::common::{
     cancellation::{CancellationEvent, clear_sigint_request, install_sigint_handler},
     text::{TruncatePosition, truncate_utf8_to_bytes},
 };
-use crate::input::{CommandInputConfig, read_command_input, read_line_with_history};
+use crate::input::{CommandInputConfig, read_command_input};
 use crate::logging::AppLogger;
 
 #[cfg(not(test))]
@@ -130,7 +130,12 @@ impl TheseusShell {
         }
 
         loop {
-            let input = match self.read_command_input() {
+            let input = match read_command_input(CommandInputConfig {
+                prompt: &self.config.prompt,
+                continuation_prompt: SHELL_CONTINUATION_PROMPT,
+                history: &self.input_history,
+                should_continue: should_read_shell_continuation,
+            }) {
                 Ok(Some(input)) => input,
                 Ok(None) => {
                     println!();
@@ -169,40 +174,6 @@ impl TheseusShell {
                 return Ok(0);
             }
         }
-    }
-
-    fn read_command_input(&self) -> io::Result<Option<String>> {
-        if crate::feature_flags::COMMAND_LINE_EDITOR_V2 {
-            return read_command_input(CommandInputConfig {
-                prompt: &self.config.prompt,
-                continuation_prompt: SHELL_CONTINUATION_PROMPT,
-                history: &self.input_history,
-                should_continue: should_read_shell_continuation,
-            });
-        }
-
-        let Some(input) = read_line_with_history(&self.config.prompt, &self.input_history)? else {
-            return Ok(None);
-        };
-
-        self.read_shell_continuation_lines(input).map(Some)
-    }
-
-    fn read_shell_continuation_lines(&self, first_input: String) -> io::Result<String> {
-        let mut input = first_input;
-
-        while should_read_shell_continuation(&input) {
-            let next = match read_line_with_history(SHELL_CONTINUATION_PROMPT, &[]) {
-                Ok(Some(next)) => next,
-                Ok(None) => break,
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => return Err(err),
-                Err(err) => return Err(err),
-            };
-            input.push('\n');
-            input.push_str(&next);
-        }
-
-        Ok(input)
     }
 
     pub fn handle_command(&mut self, input: &str) -> io::Result<CommandOutput> {
