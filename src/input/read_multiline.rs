@@ -11,6 +11,7 @@ use super::{
     completion::{CompletionState, path_completion_state, token_before_cursor},
     is_alt_key, is_command_key, is_key_press, is_plain_text_key,
     raw_mode::RawModeGuard,
+    text_buffer::TextBuffer,
     text_length,
 };
 
@@ -33,10 +34,7 @@ impl Default for MultiLineConfig {
 }
 struct MultiLineEditor {
     config: MultiLineConfig,
-    lines: Vec<Vec<char>>,
-    row: usize,
-    col: usize,
-    goal_col: usize,
+    buffer: TextBuffer,
     completion: Option<CompletionState>,
     rendered_rows: u16,
     rendered_cursor_row: u16,
@@ -71,10 +69,7 @@ impl MultiLineEditor {
     fn new(config: MultiLineConfig) -> Self {
         Self {
             config,
-            lines: vec![Vec::new()],
-            row: 0,
-            col: 0,
-            goal_col: 0,
+            buffer: TextBuffer::new(),
             completion: None,
             rendered_rows: 1,
             rendered_cursor_row: 0,
@@ -108,16 +103,16 @@ impl MultiLineEditor {
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.finish_line()?;
-                return Ok(Some(join_lines(&self.lines)));
+                return Ok(Some(self.buffer.text()));
             }
             KeyCode::Enter => {
                 self.clear_completion();
                 if self.is_exit_line() {
                     self.finish_line()?;
-                    let text = join_lines(&self.lines[..self.lines.len() - 1]);
+                    let text = self.buffer.text_before_last_line();
                     return Ok(Some(text));
                 }
-                self.split_line();
+                self.buffer.split_line();
                 self.render()?;
             }
             KeyCode::Backspace => {
@@ -132,14 +127,12 @@ impl MultiLineEditor {
             }
             KeyCode::Left if is_command_key(key) => {
                 self.clear_completion();
-                self.col = 0;
-                self.goal_col = 0;
+                self.buffer.set_col(0);
                 self.render()?;
             }
             KeyCode::Right if is_command_key(key) => {
                 self.clear_completion();
-                self.col = self.lines[self.row].len();
-                self.goal_col = self.col;
+                self.buffer.set_col_to_line_end();
                 self.render()?;
             }
             KeyCode::Char('b') if is_alt_key(key) => {
@@ -173,31 +166,25 @@ impl MultiLineEditor {
                 self.render()?;
             }
             KeyCode::Up => {
-                if self.row > 0 {
+                if self.buffer.move_up() {
                     self.clear_completion();
-                    self.row -= 1;
-                    self.col = self.goal_col.min(self.lines[self.row].len());
                     self.render()?;
                 }
             }
             KeyCode::Down => {
-                if self.row + 1 < self.lines.len() {
+                if self.buffer.move_down() {
                     self.clear_completion();
-                    self.row += 1;
-                    self.col = self.goal_col.min(self.lines[self.row].len());
                     self.render()?;
                 }
             }
             KeyCode::Home => {
                 self.clear_completion();
-                self.col = 0;
-                self.goal_col = 0;
+                self.buffer.set_col(0);
                 self.render()?;
             }
             KeyCode::End => {
                 self.clear_completion();
-                self.col = self.lines[self.row].len();
-                self.goal_col = self.col;
+                self.buffer.set_col_to_line_end();
                 self.render()?;
             }
             KeyCode::Tab => {
@@ -205,7 +192,7 @@ impl MultiLineEditor {
             }
             KeyCode::Char(ch) if is_plain_text_key(key) => {
                 self.clear_completion();
-                self.insert_char(ch);
+                self.buffer.insert_char(ch);
                 self.render()?;
             }
             _ => {}
@@ -233,14 +220,14 @@ impl MultiLineEditor {
             execute!(stdout, MoveUp(self.rendered_rows - 1))?;
         }
 
-        for (index, line) in self.lines.iter().enumerate() {
+        for (index, line) in self.buffer.lines().iter().enumerate() {
             write!(
                 stdout,
                 "{}{}",
                 self.config.prefix,
                 line.iter().collect::<String>()
             )?;
-            if index + 1 < self.lines.len() {
+            if index + 1 < self.buffer.lines_len() {
                 write!(stdout, "\r\n")?;
             }
         }
@@ -274,17 +261,17 @@ impl MultiLineEditor {
         let mut rows_before_cursor = 0usize;
         let mut total_rows = 0usize;
 
-        for (index, line) in self.lines.iter().enumerate() {
+        for (index, line) in self.buffer.lines().iter().enumerate() {
             let line_len = prefix_len + line.len();
             let line_rows = wrapped_rows(line_len, columns);
 
-            if index < self.row {
+            if index < self.buffer.row() {
                 rows_before_cursor += line_rows;
             }
             total_rows += line_rows;
         }
 
-        let cursor_len = prefix_len + self.col;
+        let cursor_len = prefix_len + self.buffer.col();
 
         RenderLayout {
             rows: total_rows as u16,
@@ -303,11 +290,11 @@ impl MultiLineEditor {
         let current_line = self.current_line();
 
         self.config.exit_word.as_deref() == Some(current_line.trim())
-            && self.row + 1 == self.lines.len()
+            && self.buffer.row() + 1 == self.buffer.lines_len()
     }
 
     fn current_line(&self) -> String {
-        self.lines[self.row].iter().collect()
+        self.buffer.current_line_text()
     }
 
     fn complete(&mut self) -> io::Result<()> {
@@ -340,12 +327,12 @@ impl MultiLineEditor {
         };
 
         completion.replacement.ends_with(['/', '\\'])
-            && token_before_cursor(&self.current_line(), self.col)
+            && token_before_cursor(&self.current_line(), self.buffer.col())
                 .is_some_and(|token| token.value == completion.replacement)
     }
 
     fn build_completion_state(&self) -> Option<CompletionState> {
-        path_completion_state(&self.current_line(), self.col)
+        path_completion_state(&self.current_line(), self.buffer.col())
     }
 
     fn advance_completion(&mut self) -> bool {
@@ -368,10 +355,7 @@ impl MultiLineEditor {
     }
 
     fn replace_before_cursor(&mut self, start: usize, replacement: &str) {
-        let replacement_chars = replacement.chars().collect::<Vec<_>>();
-        self.lines[self.row].splice(start..self.col, replacement_chars);
-        self.col = start + replacement.chars().count();
-        self.goal_col = self.col;
+        self.buffer.replace_before_cursor(start, replacement);
     }
 
     fn clear_completion(&mut self) {
@@ -380,104 +364,31 @@ impl MultiLineEditor {
 
     fn insert_text(&mut self, text: &str) {
         self.clear_completion();
-        for ch in text.chars() {
-            match ch {
-                '\r' => {}
-                '\n' => self.split_line(),
-                ch => self.insert_char(ch),
-            }
-        }
-    }
-
-    fn insert_char(&mut self, ch: char) {
-        self.lines[self.row].insert(self.col, ch);
-        self.col += 1;
-        self.goal_col = self.col;
-    }
-
-    fn split_line(&mut self) {
-        let right = self.lines[self.row].split_off(self.col);
-        self.row += 1;
-        self.col = 0;
-        self.goal_col = 0;
-        self.lines.insert(self.row, right);
+        self.buffer.insert_text(text);
     }
 
     fn backspace(&mut self) {
-        if self.col > 0 {
-            self.col -= 1;
-            self.lines[self.row].remove(self.col);
-            self.goal_col = self.col;
-        } else if self.row > 0 {
-            let current = self.lines.remove(self.row);
-            self.row -= 1;
-            self.col = self.lines[self.row].len();
-            self.goal_col = self.col;
-            self.lines[self.row].extend(current);
-        }
+        self.buffer.backspace();
     }
 
     fn delete(&mut self) {
-        if self.col < self.lines[self.row].len() {
-            self.lines[self.row].remove(self.col);
-        } else if self.row + 1 < self.lines.len() {
-            let next = self.lines.remove(self.row + 1);
-            self.lines[self.row].extend(next);
-        }
+        self.buffer.delete();
     }
 
     fn move_left(&mut self) {
-        if self.col > 0 {
-            self.col -= 1;
-        } else if self.row > 0 {
-            self.row -= 1;
-            self.col = self.lines[self.row].len();
-        }
-        self.goal_col = self.col;
+        self.buffer.move_left();
     }
 
     fn move_right(&mut self) {
-        if self.col < self.lines[self.row].len() {
-            self.col += 1;
-        } else if self.row + 1 < self.lines.len() {
-            self.row += 1;
-            self.col = 0;
-        }
-        self.goal_col = self.col;
+        self.buffer.move_right();
     }
 
     fn move_word_left(&mut self) {
-        if self.col == 0 {
-            self.move_left();
-            return;
-        }
-
-        while self.col > 0 && self.lines[self.row][self.col - 1].is_whitespace() {
-            self.col -= 1;
-        }
-        while self.col > 0 && !self.lines[self.row][self.col - 1].is_whitespace() {
-            self.col -= 1;
-        }
-        self.goal_col = self.col;
+        self.buffer.move_word_left();
     }
 
     fn move_word_right(&mut self) {
-        if self.col == self.lines[self.row].len() {
-            self.move_right();
-            return;
-        }
-
-        while self.col < self.lines[self.row].len()
-            && !self.lines[self.row][self.col].is_whitespace()
-        {
-            self.col += 1;
-        }
-        while self.col < self.lines[self.row].len()
-            && self.lines[self.row][self.col].is_whitespace()
-        {
-            self.col += 1;
-        }
-        self.goal_col = self.col;
+        self.buffer.move_word_right();
     }
 }
 
@@ -485,14 +396,6 @@ struct RenderLayout {
     rows: u16,
     cursor_row: u16,
     cursor_col: u16,
-}
-
-fn join_lines(lines: &[Vec<char>]) -> String {
-    lines
-        .iter()
-        .map(|line| line.iter().collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn wrapped_rows(visible_len: usize, columns: usize) -> usize {
@@ -504,10 +407,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn joins_lines_with_newlines() {
-        let lines = vec![vec!['a'], vec!['b', 'c']];
+    fn text_buffer_joins_lines_with_newlines() {
+        let buffer = TextBuffer::from_text("a\nbc");
 
-        assert_eq!(join_lines(&lines), "a\nbc");
+        assert_eq!(buffer.text(), "a\nbc");
     }
 
     #[test]
@@ -524,12 +427,8 @@ mod tests {
             prefix: "> ".to_string(),
             exit_word: None,
         });
-        editor.lines = vec![
-            "abcdefgh".chars().collect(),
-            "ijklmnopqrst".chars().collect(),
-        ];
-        editor.row = 1;
-        editor.col = 4;
+        editor.buffer = TextBuffer::from_text("abcdefgh\nijklmnopqrst");
+        editor.buffer.set_position(1, 4);
 
         let layout = editor.render_layout_for_columns(10);
 
@@ -544,7 +443,7 @@ mod tests {
             prefix: "> ".to_string(),
             exit_word: Some("/end".to_string()),
         });
-        editor.lines = vec!["/end ".chars().collect()];
+        editor.buffer = TextBuffer::from_text("/end ");
 
         assert!(editor.is_exit_line());
     }
@@ -552,30 +451,28 @@ mod tests {
     #[test]
     fn moves_left_by_word_on_current_line() {
         let mut editor = MultiLineEditor::new(MultiLineConfig::default());
-        editor.lines = vec!["find biggest file".chars().collect()];
-        editor.col = editor.lines[0].len();
+        editor.buffer = TextBuffer::from_text("find biggest file");
 
         editor.move_word_left();
 
-        assert_eq!(editor.col, "find biggest ".chars().count());
+        assert_eq!(editor.buffer.col(), "find biggest ".chars().count());
     }
 
     #[test]
     fn moves_right_by_word_on_current_line() {
         let mut editor = MultiLineEditor::new(MultiLineConfig::default());
-        editor.lines = vec!["find biggest file".chars().collect()];
-        editor.col = 0;
+        editor.buffer = TextBuffer::from_text("find biggest file");
+        editor.buffer.set_position(0, 0);
 
         editor.move_word_right();
 
-        assert_eq!(editor.col, "find ".chars().count());
+        assert_eq!(editor.buffer.col(), "find ".chars().count());
     }
 
     #[test]
     fn repeated_completion_cycles_through_candidates() {
         let mut editor = MultiLineEditor::new(MultiLineConfig::default());
-        editor.lines = vec!["open sr".chars().collect()];
-        editor.col = "open sr".chars().count();
+        editor.buffer = TextBuffer::from_text("open sr");
         editor.completion = Some(CompletionState {
             token: CompletionToken {
                 value: "sr".to_string(),
@@ -606,10 +503,7 @@ mod tests {
     #[test]
     fn completion_replaces_only_current_line_token() {
         let mut editor = MultiLineEditor::new(MultiLineConfig::default());
-        editor.lines = vec!["before sr".chars().collect(), "after sr".chars().collect()];
-        editor.row = 1;
-        editor.col = "after sr".chars().count();
-        editor.goal_col = editor.col;
+        editor.buffer = TextBuffer::from_text("before sr\nafter sr");
         editor.completion = Some(CompletionState {
             token: CompletionToken {
                 value: "sr".to_string(),
@@ -625,16 +519,14 @@ mod tests {
 
         assert!(editor.advance_completion());
 
-        assert_eq!(join_lines(&editor.lines), "before sr\nafter src/");
-        assert_eq!(editor.col, "after src/".chars().count());
-        assert_eq!(editor.goal_col, editor.col);
+        assert_eq!(editor.buffer.text(), "before sr\nafter src/");
+        assert_eq!(editor.buffer.col(), "after src/".chars().count());
     }
 
     #[test]
     fn completed_single_directory_match_restarts_completion_session() {
         let mut editor = MultiLineEditor::new(MultiLineConfig::default());
-        editor.lines = vec!["sr".chars().collect()];
-        editor.col = "sr".chars().count();
+        editor.buffer = TextBuffer::from_text("sr");
         editor.completion = Some(CompletionState {
             token: CompletionToken {
                 value: "sr".to_string(),

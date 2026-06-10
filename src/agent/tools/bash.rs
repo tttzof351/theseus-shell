@@ -285,9 +285,11 @@ mod tests {
 
     #[test]
     fn bash_output_includes_log_path_and_truncated_preview() {
-        let mut context = AgentRunContext::default();
-        context.max_tool_bash_bytes = 8;
-        context.tmp_dir = Some(test_tmp_dir());
+        let context = AgentRunContext {
+            max_tool_bash_bytes: 8,
+            tmp_dir: Some(test_tmp_dir()),
+            ..Default::default()
+        };
         let output = BashTool
             .execute(
                 &json!({
@@ -316,9 +318,10 @@ mod tests {
     }
 
     fn test_context() -> AgentRunContext {
-        let mut context = AgentRunContext::default();
-        context.tmp_dir = Some(test_tmp_dir());
-        context
+        AgentRunContext {
+            tmp_dir: Some(test_tmp_dir()),
+            ..Default::default()
+        }
     }
 
     fn test_tmp_dir() -> PathBuf {

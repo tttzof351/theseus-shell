@@ -12,6 +12,7 @@ use super::{
     completion::{CompletionState, completion_state, path_completion_state, token_before_cursor},
     is_alt_key, is_command_key, is_key_press, is_plain_text_key,
     raw_mode::RawModeGuard,
+    text_buffer::TextBuffer,
     text_length,
 };
 use crate::commands::slash_commands;
@@ -28,10 +29,7 @@ pub struct CommandInputConfig<'a> {
 
 struct CommandEditor<'a> {
     config: CommandInputConfig<'a>,
-    lines: Vec<Vec<char>>,
-    row: usize,
-    col: usize,
-    goal_col: usize,
+    buffer: TextBuffer,
     history_index: Option<usize>,
     draft: String,
     completion: Option<CompletionState>,
@@ -62,10 +60,7 @@ impl<'a> CommandEditor<'a> {
     fn new(config: CommandInputConfig<'a>) -> Self {
         Self {
             config,
-            lines: vec![Vec::new()],
-            row: 0,
-            col: 0,
-            goal_col: 0,
+            buffer: TextBuffer::new(),
             history_index: None,
             draft: String::new(),
             completion: None,
@@ -129,14 +124,12 @@ impl<'a> CommandEditor<'a> {
             }
             KeyCode::Left if is_command_key(key) => {
                 self.clear_completion();
-                self.col = 0;
-                self.goal_col = 0;
+                self.buffer.set_col(0);
                 self.render()?;
             }
             KeyCode::Right if is_command_key(key) => {
                 self.clear_completion();
-                self.col = self.lines[self.row].len();
-                self.goal_col = self.col;
+                self.buffer.set_col_to_line_end();
                 self.render()?;
             }
             KeyCode::Char('b') if is_alt_key(key) => {
@@ -181,14 +174,12 @@ impl<'a> CommandEditor<'a> {
             }
             KeyCode::Home => {
                 self.clear_completion();
-                self.col = 0;
-                self.goal_col = 0;
+                self.buffer.set_col(0);
                 self.render()?;
             }
             KeyCode::End => {
                 self.clear_completion();
-                self.col = self.lines[self.row].len();
-                self.goal_col = self.col;
+                self.buffer.set_col_to_line_end();
                 self.render()?;
             }
             KeyCode::Tab => {
@@ -224,14 +215,14 @@ impl<'a> CommandEditor<'a> {
             execute!(stdout, MoveUp(self.rendered_rows - 1))?;
         }
 
-        for index in 0..self.lines.len() {
+        for index in 0..self.buffer.lines_len() {
             write!(stdout, "{}", self.prompt_for_row(index))?;
             if index == 0 {
                 write!(stdout, "{}", highlighted_input(&self.line_text(index)))?;
             } else {
                 write!(stdout, "{}", self.line_text(index))?;
             }
-            if index + 1 < self.lines.len() {
+            if index + 1 < self.buffer.lines_len() {
                 write!(stdout, "\r\n")?;
             }
         }
@@ -273,17 +264,19 @@ impl<'a> CommandEditor<'a> {
         let mut rows_before_cursor = 0usize;
         let mut total_rows = 0usize;
 
-        for index in 0..self.lines.len() {
-            let line_len = text_length(self.prompt_for_row(index), false) + self.lines[index].len();
+        for index in 0..self.buffer.lines_len() {
+            let line_len =
+                text_length(self.prompt_for_row(index), false) + self.buffer.lines()[index].len();
             let line_rows = wrapped_rows(line_len, columns);
 
-            if index < self.row {
+            if index < self.buffer.row() {
                 rows_before_cursor += line_rows;
             }
             total_rows += line_rows;
         }
 
-        let cursor_len = text_length(self.prompt_for_row(self.row), false) + self.col;
+        let cursor_len =
+            text_length(self.prompt_for_row(self.buffer.row()), false) + self.buffer.col();
 
         RenderLayout {
             rows: total_rows as u16,
@@ -320,127 +313,62 @@ impl<'a> CommandEditor<'a> {
     }
 
     fn is_empty(&self) -> bool {
-        self.lines.len() == 1 && self.lines[0].is_empty()
+        self.buffer.is_empty()
     }
 
     fn current_text(&self) -> String {
-        join_lines(&self.lines)
+        self.buffer.text()
     }
 
     fn current_line(&self) -> String {
-        self.line_text(self.row)
+        self.buffer.current_line_text()
     }
 
     fn line_text(&self, row: usize) -> String {
-        self.lines[row].iter().collect()
+        self.buffer.line_text(row)
     }
 
     fn insert_text(&mut self, text: &str) {
         self.clear_completion();
         self.stop_history_navigation();
-        for ch in text.chars() {
-            match ch {
-                '\r' => {}
-                '\n' => self.split_line(),
-                ch => self.insert_char(ch),
-            }
-        }
+        self.buffer.insert_text(text);
     }
 
     fn insert_char(&mut self, ch: char) {
         self.stop_history_navigation();
-        self.lines[self.row].insert(self.col, ch);
-        self.col += 1;
-        self.goal_col = self.col;
+        self.buffer.insert_char(ch);
     }
 
     fn split_line(&mut self) {
-        let right = self.lines[self.row].split_off(self.col);
-        self.row += 1;
-        self.col = 0;
-        self.goal_col = 0;
-        self.lines.insert(self.row, right);
+        self.buffer.split_line();
     }
 
     fn backspace(&mut self) {
-        if self.col > 0 {
+        if self.buffer.backspace() {
             self.stop_history_navigation();
-            self.col -= 1;
-            self.lines[self.row].remove(self.col);
-            self.goal_col = self.col;
-        } else if self.row > 0 {
-            self.stop_history_navigation();
-            let current = self.lines.remove(self.row);
-            self.row -= 1;
-            self.col = self.lines[self.row].len();
-            self.goal_col = self.col;
-            self.lines[self.row].extend(current);
         }
     }
 
     fn delete(&mut self) {
-        if self.col < self.lines[self.row].len() {
+        if self.buffer.delete() {
             self.stop_history_navigation();
-            self.lines[self.row].remove(self.col);
-        } else if self.row + 1 < self.lines.len() {
-            self.stop_history_navigation();
-            let next = self.lines.remove(self.row + 1);
-            self.lines[self.row].extend(next);
         }
     }
 
     fn move_left(&mut self) {
-        if self.col > 0 {
-            self.col -= 1;
-        } else if self.row > 0 {
-            self.row -= 1;
-            self.col = self.lines[self.row].len();
-        }
-        self.goal_col = self.col;
+        self.buffer.move_left();
     }
 
     fn move_right(&mut self) {
-        if self.col < self.lines[self.row].len() {
-            self.col += 1;
-        } else if self.row + 1 < self.lines.len() {
-            self.row += 1;
-            self.col = 0;
-        }
-        self.goal_col = self.col;
+        self.buffer.move_right();
     }
 
     fn move_word_left(&mut self) {
-        if self.col == 0 {
-            self.move_left();
-            return;
-        }
-
-        while self.col > 0 && self.lines[self.row][self.col - 1].is_whitespace() {
-            self.col -= 1;
-        }
-        while self.col > 0 && !self.lines[self.row][self.col - 1].is_whitespace() {
-            self.col -= 1;
-        }
-        self.goal_col = self.col;
+        self.buffer.move_word_left();
     }
 
     fn move_word_right(&mut self) {
-        if self.col == self.lines[self.row].len() {
-            self.move_right();
-            return;
-        }
-
-        while self.col < self.lines[self.row].len()
-            && !self.lines[self.row][self.col].is_whitespace()
-        {
-            self.col += 1;
-        }
-        while self.col < self.lines[self.row].len()
-            && self.lines[self.row][self.col].is_whitespace()
-        {
-            self.col += 1;
-        }
-        self.goal_col = self.col;
+        self.buffer.move_word_right();
     }
 
     fn history_previous(&mut self) {
@@ -479,7 +407,7 @@ impl<'a> CommandEditor<'a> {
     }
 
     fn can_navigate_history(&self) -> bool {
-        self.history_index.is_some() || (self.lines.len() == 1 && self.row == 0)
+        self.history_index.is_some() || (self.buffer.lines_len() == 1 && self.buffer.row() == 0)
     }
 
     fn set_history_index(&mut self, index: usize) {
@@ -488,16 +416,7 @@ impl<'a> CommandEditor<'a> {
     }
 
     fn replace_with_text(&mut self, text: &str) {
-        self.lines = text
-            .split('\n')
-            .map(|line| line.chars().collect::<Vec<_>>())
-            .collect::<Vec<_>>();
-        if self.lines.is_empty() {
-            self.lines.push(Vec::new());
-        }
-        self.row = self.lines.len() - 1;
-        self.col = self.lines[self.row].len();
-        self.goal_col = self.col;
+        self.buffer.replace_with_text(text);
     }
 
     fn stop_history_navigation(&mut self) {
@@ -539,15 +458,15 @@ impl<'a> CommandEditor<'a> {
         };
 
         completion.replacement.ends_with(['/', '\\'])
-            && token_before_cursor(&self.current_line(), self.col)
+            && token_before_cursor(&self.current_line(), self.buffer.col())
                 .is_some_and(|token| token.value == completion.replacement)
     }
 
     fn build_completion_state(&self) -> Option<CompletionState> {
-        if self.row == 0 {
-            completion_state(&self.current_line(), self.col)
+        if self.buffer.row() == 0 {
+            completion_state(&self.current_line(), self.buffer.col())
         } else {
-            path_completion_state(&self.current_line(), self.col)
+            path_completion_state(&self.current_line(), self.buffer.col())
         }
     }
 
@@ -571,10 +490,7 @@ impl<'a> CommandEditor<'a> {
     }
 
     fn replace_before_cursor(&mut self, start: usize, replacement: &str) {
-        let replacement_chars = replacement.chars().collect::<Vec<_>>();
-        self.lines[self.row].splice(start..self.col, replacement_chars);
-        self.col = start + replacement.chars().count();
-        self.goal_col = self.col;
+        self.buffer.replace_before_cursor(start, replacement);
     }
 }
 
@@ -582,14 +498,6 @@ struct RenderLayout {
     rows: u16,
     cursor_row: u16,
     cursor_col: u16,
-}
-
-fn join_lines(lines: &[Vec<char>]) -> String {
-    lines
-        .iter()
-        .map(|line| line.iter().collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn wrapped_rows(visible_len: usize, columns: usize) -> usize {
@@ -653,9 +561,9 @@ mod tests {
         editor.split_line();
 
         assert!(should_continue);
-        assert_eq!(editor.lines.len(), 2);
-        assert_eq!(editor.row, 1);
-        assert_eq!(editor.col, 0);
+        assert_eq!(editor.buffer.lines_len(), 2);
+        assert_eq!(editor.buffer.row(), 1);
+        assert_eq!(editor.buffer.col(), 0);
     }
 
     #[test]
@@ -673,8 +581,7 @@ mod tests {
         let history = Vec::new();
         let mut editor = CommandEditor::new(config(&history));
         editor.insert_text("abcd\nef");
-        editor.row = 1;
-        editor.col = 2;
+        editor.buffer.set_position(1, 2);
 
         let layout = editor.render_layout_for_columns(8);
 
@@ -691,8 +598,8 @@ mod tests {
         editor.history_previous();
 
         assert_eq!(editor.current_text(), "second");
-        assert_eq!(editor.row, 0);
-        assert_eq!(editor.col, "second".chars().count());
+        assert_eq!(editor.buffer.row(), 0);
+        assert_eq!(editor.buffer.col(), "second".chars().count());
     }
 
     #[test]
@@ -709,7 +616,7 @@ mod tests {
 
         editor.history_previous();
         assert_eq!(editor.current_text(), "echo \\\n \"test\"");
-        assert_eq!(editor.lines.len(), 2);
+        assert_eq!(editor.buffer.lines_len(), 2);
 
         editor.history_previous();
         assert_eq!(editor.current_text(), "first");

@@ -9,6 +9,7 @@ mod raw_mode;
 mod read_command;
 mod read_line;
 mod read_multiline;
+mod text_buffer;
 mod viewport;
 
 pub use box_text::{BoxOptions, wrap_in_box};

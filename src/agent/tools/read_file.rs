@@ -394,11 +394,13 @@ mod tests {
         let image = image::RgbImage::from_pixel(4, 2, image::Rgb([255, 0, 0]));
         image.save(&path).unwrap();
         let arguments = json!({ "path": path });
-        let mut context = AgentRunContext::default();
-        context.image_input = ImageInputSettings {
-            enable: true,
-            max_width: 2,
-            max_height: 2,
+        let context = AgentRunContext {
+            image_input: ImageInputSettings {
+                enable: true,
+                max_width: 2,
+                max_height: 2,
+            },
+            ..Default::default()
         };
 
         let output = ReadFileTool::default()
