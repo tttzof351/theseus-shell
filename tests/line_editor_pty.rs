@@ -517,24 +517,126 @@ fn ask_multiline_history_preserves_cancelled_draft() -> io::Result<()> {
 }
 
 #[test]
-fn unmatched_quote_after_continuation_returns_to_prompt() -> io::Result<()> {
+fn ctrl_c_during_quote_continuation_returns_to_clean_prompt() -> io::Result<()> {
     let _lock = pty_test_lock();
     let mut shell = PtyShell::start()?;
 
     shell.write("echo \\\r \"test\r")?;
-    shell.wait_for("unmatched")?;
+    shell.wait_for("\r\n> ")?;
+
     let prompt_offset = shell.transcript_len();
+    shell.write("\u{3}")?;
+    shell.wait_for_after(prompt_offset, "Interrupted. Type /exit to exit the shell.")?;
     shell.wait_for_after(prompt_offset, "theseus-shell")?;
 
     let offset = shell.transcript_len();
-    shell.write("echo AFTER_UNMATCHED_QUOTE_OK\r")?;
+    shell.write("echo AFTER_QUOTE_CANCEL_OK\r")?;
     let transcript = shell.wait_until_after(offset, |tail| {
-        count_matches(tail, "AFTER_UNMATCHED_QUOTE_OK") >= 2
+        count_matches(tail, "AFTER_QUOTE_CANCEL_OK") >= 2
     })?;
 
     assert!(
-        count_matches(&transcript[offset..], "AFTER_UNMATCHED_QUOTE_OK") >= 2,
-        "shell did not recover after unmatched quote:\n{}",
+        count_matches(&transcript[offset..], "AFTER_QUOTE_CANCEL_OK") >= 2,
+        "shell did not recover after cancelling quote continuation:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.exit()
+}
+
+#[test]
+fn single_quote_continuation_executes_after_closing_quote() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    shell.write("printf '%s\\n' 'THESEUS_SINGLE_QUOTE")?;
+    shell.write("\r")?;
+    shell.wait_for("\r\n> ")?;
+
+    let offset = shell.transcript_len();
+    shell.write("CONTINUATION_OK'\r")?;
+    let transcript = shell.wait_until_after(offset, |tail| {
+        tail.contains("THESEUS_SINGLE_QUOTE\nCONTINUATION_OK")
+            || tail.contains("THESEUS_SINGLE_QUOTE\r\nCONTINUATION_OK")
+    })?;
+
+    assert!(
+        transcript[offset..].contains("CONTINUATION_OK"),
+        "single quote continuation did not execute after closing quote:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.exit()
+}
+
+#[test]
+fn command_substitution_continuation_executes_after_closing_paren() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    shell.write("echo \"$(")?;
+    shell.write("\r")?;
+    shell.wait_for("\r\n> ")?;
+
+    let offset = shell.transcript_len();
+    shell.write("printf THESEUS_CMD_SUB_OK)\"\r")?;
+    let transcript = shell.wait_until_after(offset, |tail| {
+        count_matches(tail, "THESEUS_CMD_SUB_OK") >= 2
+    })?;
+
+    assert!(
+        count_matches(&transcript[offset..], "THESEUS_CMD_SUB_OK") >= 2,
+        "command substitution continuation did not execute after closing paren:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.exit()
+}
+
+#[test]
+fn if_block_continuation_executes_after_fi() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    shell.write("if true; then\r")?;
+    shell.wait_for("\r\n> ")?;
+    shell.write("echo THESEUS_IF_BLOCK_OK\r")?;
+    shell.wait_for("\r\n> ")?;
+
+    let offset = shell.transcript_len();
+    shell.write("fi\r")?;
+    let transcript = shell.wait_until_after(offset, |tail| {
+        count_matches(tail, "THESEUS_IF_BLOCK_OK") >= 1
+    })?;
+
+    assert!(
+        transcript[offset..].contains("THESEUS_IF_BLOCK_OK"),
+        "if block continuation did not execute after fi:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.exit()
+}
+
+#[test]
+fn pasted_if_block_executes_as_one_shell_command() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    let offset = shell.transcript_len();
+    shell.write("if true; then\recho THESEUS_PASTED_IF_OK\rfi\r")?;
+    let transcript =
+        shell.wait_until_after(offset, |tail| tail.contains("THESEUS_PASTED_IF_OK"))?;
+
+    assert!(
+        !transcript[offset..].contains("parse error")
+            && !transcript[offset..].contains("syntax error"),
+        "pasted if block produced a syntax error:\n{}",
+        &transcript[offset..]
+    );
+    assert!(
+        transcript[offset..].contains("THESEUS_PASTED_IF_OK"),
+        "pasted if block did not execute:\n{}",
         &transcript[offset..]
     );
 

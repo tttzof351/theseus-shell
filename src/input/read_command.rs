@@ -85,7 +85,9 @@ impl<'a> CommandEditor<'a> {
                     }
                 }
                 Event::Paste(text) => {
-                    self.insert_text(&text);
+                    if let Some(line) = self.handle_paste(&text)? {
+                        return Ok(line);
+                    }
                     self.render()?;
                 }
                 _ => {}
@@ -195,6 +197,31 @@ impl<'a> CommandEditor<'a> {
                 self.render()?;
             }
             _ => {}
+        }
+
+        Ok(None)
+    }
+
+    fn handle_paste(&mut self, text: &str) -> io::Result<Option<Option<String>>> {
+        self.clear_completion();
+        self.stop_history_navigation();
+
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        for segment in normalized.split_inclusive('\n') {
+            let Some(line) = segment.strip_suffix('\n') else {
+                if !segment.is_empty() {
+                    self.buffer.insert_text(segment);
+                }
+                continue;
+            };
+
+            self.buffer.insert_text(line);
+            if self.enter_should_continue() {
+                self.split_line();
+            } else {
+                self.finish_line()?;
+                return Ok(Some(Some(self.current_text())));
+            }
         }
 
         Ok(None)
@@ -315,6 +342,7 @@ impl<'a> CommandEditor<'a> {
         self.buffer.line_text(row)
     }
 
+    #[cfg(test)]
     fn insert_text(&mut self, text: &str) {
         self.clear_completion();
         self.stop_history_navigation();
@@ -507,6 +535,10 @@ mod tests {
         text.ends_with('\\')
     }
 
+    fn simple_if_block(text: &str) -> bool {
+        text.trim_start().starts_with("if ") && !text.trim_end().ends_with("\nfi")
+    }
+
     fn config<'a>(history: &'a [String]) -> CommandInputConfig<'a> {
         CommandInputConfig {
             prompt: "main> ",
@@ -551,6 +583,49 @@ mod tests {
 
         assert!(!editor.enter_should_continue());
         assert_eq!(editor.current_text(), "echo ok");
+    }
+
+    #[test]
+    fn paste_submits_complete_command_with_trailing_newline() {
+        let history = Vec::new();
+        let mut editor = CommandEditor::new(config(&history));
+
+        let submitted = editor.handle_paste("echo ok\n").unwrap();
+
+        assert_eq!(submitted, Some(Some("echo ok".to_string())));
+    }
+
+    #[test]
+    fn paste_continues_incomplete_block_until_closing_line() {
+        let history = Vec::new();
+        let mut editor = CommandEditor::new(CommandInputConfig {
+            should_continue: simple_if_block,
+            ..config(&history)
+        });
+
+        let submitted = editor
+            .handle_paste("if true; then\necho IF_FROM_PASTE\nfi\n")
+            .unwrap();
+
+        assert_eq!(
+            submitted,
+            Some(Some("if true; then\necho IF_FROM_PASTE\nfi".to_string()))
+        );
+    }
+
+    #[test]
+    fn paste_keeps_incomplete_block_in_editor_without_submit() {
+        let history = Vec::new();
+        let mut editor = CommandEditor::new(CommandInputConfig {
+            should_continue: simple_if_block,
+            ..config(&history)
+        });
+
+        let submitted = editor.handle_paste("if true; then\necho waiting").unwrap();
+
+        assert_eq!(submitted, None);
+        assert_eq!(editor.current_text(), "if true; then\necho waiting");
+        assert_eq!(editor.buffer.lines_len(), 2);
     }
 
     #[test]
