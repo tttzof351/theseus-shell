@@ -543,6 +543,31 @@ fn wrapped_first_line_keeps_continuation_prompt_on_next_logical_line() -> io::Re
 }
 
 #[test]
+fn long_emoji_continuation_input_does_not_panic() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start_with_size(narrow_pty_size())?;
+
+    shell.write("echo \\\r")?;
+    shell.wait_for("\r\n> ")?;
+
+    let offset = shell.transcript_len();
+    shell.write(&"🤿".repeat(80))?;
+    let transcript = shell.wait_until_after(offset, |tail| {
+        tail.contains("panicked at") || tail.contains(&"🤿".repeat(20))
+    })?;
+
+    assert!(
+        !transcript[offset..].contains("panicked at"),
+        "long emoji continuation input panicked:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for("Interrupted. Type /exit to exit the shell.")?;
+    shell.exit()
+}
+
+#[test]
 fn wrapped_shell_input_does_not_erase_previous_output_row() -> io::Result<()> {
     let _lock = pty_test_lock();
     let size = compact_pty_size();

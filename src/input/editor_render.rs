@@ -80,7 +80,9 @@ pub(crate) fn render_layout_for_lines_with_cursor_wrap(
     };
 
     RenderLayout {
-        rows: total_rows.max(cursor_wrap_row + 1).max(1) as u16,
+        rows: total_rows
+            .max(rows_before_cursor + cursor_wrap_row + 1)
+            .max(1) as u16,
         cursor_row: (rows_before_cursor + cursor_wrap_row) as u16,
         cursor_col: cursor_wrap_col as u16,
         cursor_wraps_at_boundary,
@@ -285,6 +287,20 @@ mod tests {
         assert_eq!(layout.cursor_row, 1);
         assert_eq!(layout.cursor_col, 2);
         assert!(!layout.cursor_wraps_at_boundary);
+    }
+
+    #[test]
+    fn layout_includes_boundary_cursor_row_after_previous_lines() {
+        let lines = vec![
+            EditorLine::new("main> ", "echo \\".to_string()),
+            EditorLine::new("> ", "🤿".repeat(16)),
+        ];
+
+        let layout = render_layout_for_lines_with_cursor_wrap(&lines, 1, 32, 34, true);
+
+        assert_eq!(layout.rows, 3);
+        assert_eq!(layout.cursor_row, 2);
+        assert_eq!(layout.cursor_col, 0);
     }
 
     #[test]
