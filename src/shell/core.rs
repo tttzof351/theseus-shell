@@ -338,11 +338,164 @@ fn should_read_shell_continuation(input: &str) -> bool {
         return false;
     }
 
-    has_unescaped_trailing_backslash(input)
+    has_unescaped_trailing_backslash(input) || has_open_heredoc(input)
 }
 
 fn has_unescaped_trailing_backslash(input: &str) -> bool {
     input.chars().rev().take_while(|ch| *ch == '\\').count() % 2 == 1
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HereDoc {
+    delimiter: String,
+    strip_tabs: bool,
+}
+
+fn has_open_heredoc(input: &str) -> bool {
+    let mut pending = Vec::<HereDoc>::new();
+
+    for line in input.split('\n') {
+        if let Some(heredoc) = pending.first() {
+            if heredoc_line_matches(line, heredoc) {
+                pending.remove(0);
+            }
+            continue;
+        }
+
+        pending.extend(parse_heredocs_from_command_line(line));
+    }
+
+    !pending.is_empty()
+}
+
+fn heredoc_line_matches(line: &str, heredoc: &HereDoc) -> bool {
+    let candidate = if heredoc.strip_tabs {
+        line.trim_start_matches('\t')
+    } else {
+        line
+    };
+    candidate == heredoc.delimiter
+}
+
+fn parse_heredocs_from_command_line(line: &str) -> Vec<HereDoc> {
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut heredocs = Vec::new();
+    let mut index = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+
+    while index < chars.len() {
+        let ch = chars[index];
+
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+
+        if ch == '\\' && !in_single_quote {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+
+        if ch == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            index += 1;
+            continue;
+        }
+
+        if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            index += 1;
+            continue;
+        }
+
+        if in_single_quote || in_double_quote {
+            index += 1;
+            continue;
+        }
+
+        if ch == '#' && is_shell_comment_start(&chars, index) {
+            break;
+        }
+
+        if ch != '<'
+            || chars.get(index + 1) != Some(&'<')
+            || chars.get(index + 2) == Some(&'<')
+            || (index > 0 && chars[index - 1] == '<')
+        {
+            index += 1;
+            continue;
+        }
+
+        index += 2;
+        let strip_tabs = chars.get(index) == Some(&'-');
+        if strip_tabs {
+            index += 1;
+        }
+
+        while chars.get(index).is_some_and(|ch| ch.is_whitespace()) {
+            index += 1;
+        }
+
+        if let Some((delimiter, next_index)) = parse_heredoc_delimiter(&chars, index) {
+            heredocs.push(HereDoc {
+                delimiter,
+                strip_tabs,
+            });
+            index = next_index;
+        }
+    }
+
+    heredocs
+}
+
+fn parse_heredoc_delimiter(chars: &[char], mut index: usize) -> Option<(String, usize)> {
+    let mut delimiter = String::new();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while index < chars.len() {
+        let ch = chars[index];
+
+        if !in_single_quote && !in_double_quote && is_shell_word_boundary(ch) {
+            break;
+        }
+
+        match ch {
+            '\'' if !in_double_quote => {
+                in_single_quote = !in_single_quote;
+                index += 1;
+            }
+            '"' if !in_single_quote => {
+                in_double_quote = !in_double_quote;
+                index += 1;
+            }
+            '\\' if !in_single_quote => {
+                index += 1;
+                if let Some(escaped) = chars.get(index) {
+                    delimiter.push(*escaped);
+                    index += 1;
+                }
+            }
+            ch => {
+                delimiter.push(ch);
+                index += 1;
+            }
+        }
+    }
+
+    (!delimiter.is_empty()).then_some((delimiter, index))
+}
+
+fn is_shell_word_boundary(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')' | '<' | '>')
+}
+
+fn is_shell_comment_start(chars: &[char], index: usize) -> bool {
+    index == 0 || chars[index - 1].is_whitespace()
 }
 
 #[cfg(test)]
@@ -827,6 +980,32 @@ mod tests {
     fn detects_shell_continuation_with_single_trailing_backslash() {
         assert!(should_read_shell_continuation(r#"echo \"#));
         assert!(should_read_shell_continuation(r#"printf '%s' \"#));
+    }
+
+    #[test]
+    fn detects_open_quoted_heredoc_continuation() {
+        assert!(should_read_shell_continuation("bash <<'REMOTE'"));
+        assert!(should_read_shell_continuation(
+            "bash <<'REMOTE'\nset -euo pipefail\ncd /tmp"
+        ));
+    }
+
+    #[test]
+    fn stops_heredoc_continuation_after_terminator() {
+        assert!(!should_read_shell_continuation(
+            "bash <<'REMOTE'\nset -euo pipefail\nREMOTE"
+        ));
+    }
+
+    #[test]
+    fn detects_dash_heredoc_and_strips_tabs_for_terminator() {
+        assert!(should_read_shell_continuation("cat <<-EOF\n\tbody"));
+        assert!(!should_read_shell_continuation("cat <<-EOF\n\tbody\n\tEOF"));
+    }
+
+    #[test]
+    fn ignores_here_strings_for_continuation() {
+        assert!(!should_read_shell_continuation("cat <<< 'value'"));
     }
 
     #[test]

@@ -310,6 +310,35 @@ fn pasted_multiline_command_executes_as_one_shell_command() -> io::Result<()> {
 }
 
 #[test]
+fn pasted_heredoc_command_executes_after_terminator() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    let command = concat!(
+        "bash <<'REMOTE'\r",
+        "set -euo pipefail\r",
+        "cd /tmp\r",
+        "echo THESEUS_HEREDOC_RUNNING\r",
+        "echo THESEUS_HEREDOC_USER: $(whoami)\r",
+        "ls -la /tmp | head -5\r",
+        "REMOTE\r",
+    );
+
+    let offset = shell.transcript_len();
+    shell.write(command)?;
+    let transcript =
+        shell.wait_until_after(offset, |tail| tail.contains("THESEUS_HEREDOC_RUNNING"))?;
+
+    assert!(
+        transcript[offset..].contains("THESEUS_HEREDOC_USER:"),
+        "pasted heredoc did not execute the complete command:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.exit()
+}
+
+#[test]
 fn long_running_command_moves_to_next_line_immediately_after_enter() -> io::Result<()> {
     let _lock = pty_test_lock();
     let mut shell = PtyShell::start()?;
