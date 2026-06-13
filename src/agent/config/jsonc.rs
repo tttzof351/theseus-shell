@@ -4,9 +4,11 @@ use jsonc_parser::{ParseOptions, parse_to_serde_value};
 use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 
+use crate::input::{ShellHighlightStyle, is_known_color_tag};
+
 use super::{
     AgentConfig, AgentSettings, ImageInputSettings, LlmRequestSettings, McpServerConfig,
-    McpTransport, default_compact_prompt, models,
+    McpTransport, ShellSettings, default_compact_prompt, models,
 };
 
 const DEFAULT_MCP_TIMEOUT_SECONDS: usize = 60;
@@ -14,9 +16,10 @@ const DEFAULT_MCP_TIMEOUT_SECONDS: usize = 60;
 impl AgentConfig {
     pub(super) fn to_jsonc(&self) -> String {
         format!(
-            "{{\n  \"llm_request_settings\": {},\n  \"agent_settings\": {},\n  \"mcp_servers\": {}\n}}\n",
+            "{{\n  \"llm_request_settings\": {},\n  \"agent_settings\": {},\n  \"shell_settings\": {},\n  \"mcp_servers\": {}\n}}\n",
             llm_request_settings_jsonc(&self.llm_request_settings),
             agent_settings_jsonc(&self.agent_settings),
+            shell_settings_jsonc(&self.shell_settings),
             mcp_servers_jsonc(&self.mcp_servers),
         )
     }
@@ -34,6 +37,7 @@ impl AgentConfig {
 
         Ok(Self {
             agent_settings: read_agent_settings(object)?,
+            shell_settings: read_shell_settings(object)?,
             llm_request_settings: read_llm_request_settings(object)?,
             mcp_servers: read_mcp_servers(object)?,
         })
@@ -88,6 +92,31 @@ fn image_input_settings_jsonc(settings: &ImageInputSettings) -> String {
         "{{\n      \"enable\": {},\n      \"max_width\": {},\n      \"max_height\": {}\n    }}",
         settings.enable, settings.max_width, settings.max_height,
     )
+}
+
+fn shell_settings_jsonc(settings: &ShellSettings) -> String {
+    format!(
+        "{{\n    \"shell_highlight\": {}\n  }}",
+        pretty_json_indented(
+            &shell_highlight_palette_json(&settings.shell_highlight),
+            "      "
+        ),
+    )
+}
+
+fn shell_highlight_palette_json(palette: &BTreeMap<String, Option<ShellHighlightStyle>>) -> Value {
+    let values = palette
+        .iter()
+        .map(|(key, style)| {
+            let value = match style {
+                Some(ShellHighlightStyle::Tags(tags)) if tags.len() == 1 => json!(tags[0]),
+                Some(ShellHighlightStyle::Tags(tags)) => json!(tags),
+                None => Value::Null,
+            };
+            (key.clone(), value)
+        })
+        .collect::<Map<_, _>>();
+    Value::Object(values)
 }
 
 fn mcp_servers_jsonc(servers: &BTreeMap<String, McpServerConfig>) -> String {
@@ -251,6 +280,65 @@ fn read_image_input_settings(settings: &Map<String, Value>) -> io::Result<ImageI
     };
     validate_image_input_settings(&image_input)?;
     Ok(image_input)
+}
+
+fn read_shell_settings(object: &Map<String, Value>) -> io::Result<ShellSettings> {
+    let Some(value) = object.get("shell_settings") else {
+        return Ok(ShellSettings::default());
+    };
+    let settings = value.as_object().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config field `shell_settings` must be an object",
+        )
+    })?;
+    let mut shell_highlight = ShellSettings::default().shell_highlight;
+    if let Some(overrides) = read_optional_nullable_string_map_field(settings, "shell_highlight")? {
+        validate_shell_highlight_palette(&overrides, &shell_highlight)?;
+        shell_highlight.extend(overrides);
+    }
+
+    Ok(ShellSettings { shell_highlight })
+}
+
+fn validate_shell_highlight_palette(
+    overrides: &BTreeMap<String, Option<ShellHighlightStyle>>,
+    defaults: &BTreeMap<String, Option<ShellHighlightStyle>>,
+) -> io::Result<()> {
+    for (key, style) in overrides {
+        if !defaults.contains_key(key) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "config field `shell_settings.shell_highlight` contains unknown key `{key}`"
+                ),
+            ));
+        }
+        let Some(style) = style else {
+            continue;
+        };
+        let ShellHighlightStyle::Tags(tags) = style;
+        if tags.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "config field `shell_settings.shell_highlight.{key}` must not be an empty array"
+                ),
+            ));
+        }
+        for tag in tags {
+            if !is_known_color_tag(tag) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "config field `shell_settings.shell_highlight.{key}` contains unknown color tag `{tag}`"
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_image_input_settings(settings: &ImageInputSettings) -> io::Result<()> {
@@ -623,6 +711,52 @@ fn read_optional_string_map_field(
         )),
         None => Ok(BTreeMap::new()),
     }
+}
+
+fn read_optional_nullable_string_map_field(
+    object: &Map<String, Value>,
+    key: &str,
+) -> io::Result<Option<BTreeMap<String, Option<ShellHighlightStyle>>>> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    let values = value.as_object().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("config field `{key}` must be an object"),
+        )
+    })?;
+
+    values
+        .iter()
+        .map(|(name, value)| match value {
+            Value::String(style) => Ok((
+                name.clone(),
+                Some(ShellHighlightStyle::single(style.as_str())),
+            )),
+            Value::Array(styles) => styles
+                .iter()
+                .enumerate()
+                .map(|(index, style)| {
+                    style.as_str().map(str::to_string).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("config field `{key}.{name}[{index}]` must be a string"),
+                        )
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()
+                .map(ShellHighlightStyle::tags)
+                .map(Some)
+                .map(|style| (name.clone(), style)),
+            Value::Null => Ok((name.clone(), None)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("config field `{key}.{name}` must be a string, array of strings, or null"),
+            )),
+        })
+        .collect::<io::Result<BTreeMap<_, _>>>()
+        .map(Some)
 }
 
 fn read_optional_bool_field(object: &Map<String, Value>, key: &str) -> io::Result<Option<bool>> {

@@ -4,5 +4,6 @@
 /report
 /showcases
 /playground
+example.html
 *.DS_Store
 *.pyc

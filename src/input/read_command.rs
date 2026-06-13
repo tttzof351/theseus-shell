@@ -16,6 +16,10 @@ use super::{
     },
     is_alt_key, is_command_key, is_key_press, is_plain_text_key,
     raw_mode::RawModeGuard,
+    shell_highlight::{
+        ShellHighlightPalette, default_shell_highlight_palette,
+        highlight_shell_command_with_palette,
+    },
     text_buffer::TextBuffer,
     text_length,
 };
@@ -29,6 +33,7 @@ pub struct CommandInputConfig<'a> {
     pub continuation_prompt: &'a str,
     pub history: &'a [String],
     pub should_continue: fn(&str) -> bool,
+    pub shell_highlight: Option<&'a ShellHighlightPalette>,
 }
 
 struct CommandEditor<'a> {
@@ -272,10 +277,29 @@ impl<'a> CommandEditor<'a> {
     }
 
     fn render_lines(&self) -> Vec<EditorLine<'_>> {
+        let highlighted_shell_lines = if self.line_text(0).starts_with('/') {
+            Vec::new()
+        } else {
+            let default_palette;
+            let palette = match self.config.shell_highlight {
+                Some(palette) => palette,
+                None => {
+                    default_palette = default_shell_highlight_palette();
+                    &default_palette
+                }
+            };
+            highlight_shell_command_with_palette(&self.current_text(), palette)
+        };
+
         (0..self.buffer.lines_len())
             .map(|index| {
                 let line = self.line_text(index);
-                let rendered_line = if index == 0 {
+                let rendered_line = if !highlighted_shell_lines.is_empty() {
+                    highlighted_shell_lines
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| line.clone())
+                } else if index == 0 {
                     highlighted_input(&line)
                 } else {
                     line.clone()
@@ -526,6 +550,7 @@ fn highlighted_input(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::{ShellHighlightStyle, strip_ansi_codes};
 
     fn never_continue(_: &str) -> bool {
         false
@@ -545,6 +570,7 @@ mod tests {
             continuation_prompt: "> ",
             history,
             should_continue: never_continue,
+            shell_highlight: None,
         }
     }
 
@@ -640,6 +666,62 @@ mod tests {
         assert_eq!(layout.rows, 3);
         assert_eq!(layout.cursor_row, 2);
         assert_eq!(layout.cursor_col, 4);
+    }
+
+    #[test]
+    fn render_lines_highlights_shell_continuation_lines() {
+        let history = Vec::new();
+        let mut editor = CommandEditor::new(config(&history));
+        editor.insert_text("if true; then\n  echo \"$USER\" # comment\nfi");
+
+        let lines = editor.render_lines();
+
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].text.contains("\x1b["));
+        assert!(lines[1].text.contains("\x1b["));
+        assert!(lines[2].text.contains("\x1b["));
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| strip_ansi_codes(&line.text))
+                .collect::<Vec<_>>(),
+            vec!["if true; then", "  echo \"$USER\" # comment", "fi"]
+        );
+    }
+
+    #[test]
+    fn render_lines_keeps_slash_command_highlighting_separate() {
+        let history = Vec::new();
+        let mut editor = CommandEditor::new(config(&history));
+        editor.insert_text("/ask echo \"$USER\"");
+
+        let lines = editor.render_lines();
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].text,
+            format!("{} echo \"$USER\"", colorize_tag("bright-cyan", "/ask"))
+        );
+    }
+
+    #[test]
+    fn render_lines_uses_custom_shell_highlight_palette() {
+        let history = Vec::new();
+        let mut palette = default_shell_highlight_palette();
+        palette.insert(
+            "command".to_string(),
+            Some(ShellHighlightStyle::single("yellow")),
+        );
+        let mut editor = CommandEditor::new(CommandInputConfig {
+            shell_highlight: Some(&palette),
+            ..config(&history)
+        });
+        editor.insert_text("echo plain");
+
+        let lines = editor.render_lines();
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "\x1b[33mecho\x1b[0m plain");
     }
 
     #[test]

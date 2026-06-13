@@ -54,6 +54,22 @@ pub fn colorize_tag(tag: &str, text: &str) -> String {
     format!("{code}{text}\x1b[0m")
 }
 
+pub fn colorize_tags(tags: &[String], text: &str) -> String {
+    let codes = tags
+        .iter()
+        .filter_map(|tag| ansi_code(tag))
+        .collect::<Vec<_>>();
+    if codes.is_empty() {
+        return text.to_string();
+    }
+
+    format!("{}{}\x1b[0m", codes.join(""), text)
+}
+
+pub fn is_known_color_tag(tag: &str) -> bool {
+    ansi_code(&tag.to_lowercase()).is_some()
+}
+
 pub fn strip_tags(text: &str) -> String {
     let mut result = String::new();
     let mut in_tag = false;

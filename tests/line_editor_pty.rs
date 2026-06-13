@@ -8,6 +8,7 @@ use std::{
 };
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use theseus::input::strip_ansi_codes;
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -740,7 +741,7 @@ fn shell_input_cursor_moves_after_inserted_character() -> io::Result<()> {
 
     let offset = shell.transcript_len();
     shell.write("a")?;
-    shell.wait_for_after(offset, "> a")?;
+    shell.wait_until_after(offset, |tail| strip_ansi_codes(tail).contains("> a"))?;
 
     let screen = VtScreen::parse(size, &shell.transcript_string());
     let text = screen.text();
@@ -954,7 +955,7 @@ fn ctrl_c_during_continuation_returns_to_clean_prompt() -> io::Result<()> {
     let mut shell = PtyShell::start()?;
 
     shell.write("echo \\\rpartial")?;
-    shell.wait_for("> partial")?;
+    shell.wait_until_after(0, |tail| strip_ansi_codes(tail).contains("> partial"))?;
 
     shell.write("\u{3}")?;
     shell.wait_for("Interrupted. Type /exit to exit the shell.")?;
@@ -979,21 +980,23 @@ fn ctrl_l_during_continuation_rerenders_full_multiline_command() -> io::Result<(
     let mut shell = PtyShell::start()?;
 
     shell.write("echo \\\r CTRL_L_OK")?;
-    shell.wait_for(">  CTRL_L_OK")?;
+    shell.wait_until_after(0, |tail| strip_ansi_codes(tail).contains(">  CTRL_L_OK"))?;
 
     let offset = shell.transcript_len();
     shell.write("\u{c}")?;
     let transcript = shell.wait_until_after(offset, |tail| {
-        tail.contains("echo \\") && tail.contains(">  CTRL_L_OK")
+        let visible = strip_ansi_codes(tail);
+        visible.contains("echo \\") && visible.contains(">  CTRL_L_OK")
     })?;
+    let visible_transcript = strip_ansi_codes(&transcript[offset..]);
 
     assert!(
-        transcript[offset..].contains("echo \\"),
+        visible_transcript.contains("echo \\"),
         "first line was not re-rendered after Ctrl+L:\n{}",
         &transcript[offset..]
     );
     assert!(
-        transcript[offset..].contains(">  CTRL_L_OK"),
+        visible_transcript.contains(">  CTRL_L_OK"),
         "continuation line was not re-rendered after Ctrl+L:\n{}",
         &transcript[offset..]
     );

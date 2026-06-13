@@ -131,11 +131,17 @@ impl TheseusShell {
         }
 
         loop {
+            let shell_highlight = self
+                .config
+                .agent_config
+                .as_ref()
+                .map(|config| &config.shell_settings.shell_highlight);
             let input = match read_command_input(CommandInputConfig {
                 prompt: &self.config.prompt,
                 continuation_prompt: SHELL_CONTINUATION_PROMPT,
                 history: &self.input_history,
                 should_continue: should_read_shell_continuation,
+                shell_highlight,
             }) {
                 Ok(Some(input)) => input,
                 Ok(None) => {

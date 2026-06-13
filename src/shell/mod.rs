@@ -2,7 +2,7 @@ mod command_routing;
 mod core;
 mod handlers;
 mod history;
-mod input_syntax;
+pub(crate) mod input_syntax;
 mod markdown_preprocessor;
 mod prompt;
 pub(crate) mod pty;

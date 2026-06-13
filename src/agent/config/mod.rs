@@ -2,6 +2,8 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde_json::{Map, Value, json};
 
+use crate::input::{ShellHighlightPalette, default_shell_highlight_palette};
+
 mod document;
 mod interactive;
 mod jsonc;
@@ -14,6 +16,7 @@ pub use store::default_config_path;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
     pub agent_settings: AgentSettings,
+    pub shell_settings: ShellSettings,
     pub llm_request_settings: LlmRequestSettings,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
 }
@@ -40,6 +43,11 @@ pub struct ImageInputSettings {
     pub enable: bool,
     pub max_width: usize,
     pub max_height: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellSettings {
+    pub shell_highlight: ShellHighlightPalette,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +119,7 @@ impl AgentConfig {
                 system_prompt: default_system_prompt(),
                 compact_prompt: default_compact_prompt(),
             },
+            shell_settings: ShellSettings::default(),
             llm_request_settings: LlmRequestSettings {
                 base_url: models::DEFAULT_BASE_URL.to_string(),
                 retries: models::DEFAULT_LLM_REQUEST_RETRIES,
@@ -120,6 +129,14 @@ impl AgentConfig {
                 header,
             },
             mcp_servers: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for ShellSettings {
+    fn default() -> Self {
+        Self {
+            shell_highlight: default_shell_highlight_palette(),
         }
     }
 }
@@ -175,9 +192,11 @@ mod tests {
 
     use serde_json::json;
 
+    use crate::input::ShellHighlightStyle;
+
     use super::{
         AgentConfig, AgentSettings, ImageInputSettings, LlmRequestSettings, McpServerConfig,
-        McpTransport, default_compact_prompt, default_system_prompt, models,
+        McpTransport, ShellSettings, default_compact_prompt, default_system_prompt, models,
     };
 
     #[test]
@@ -283,6 +302,11 @@ mod tests {
             init.config.agent_settings.compact_prompt,
             default_compact_prompt()
         );
+        assert_eq!(init.config.shell_settings, ShellSettings::default());
+        assert_eq!(
+            init.config.shell_settings.shell_highlight.get("command"),
+            Some(&None)
+        );
         assert_eq!(
             init.config.llm_request_settings.retries,
             models::DEFAULT_LLM_REQUEST_RETRIES
@@ -308,6 +332,7 @@ mod tests {
             &[
                 "\"llm_request_settings\"",
                 "\"agent_settings\"",
+                "\"shell_settings\"",
                 "\"mcp_servers\"",
             ],
         );
@@ -385,6 +410,13 @@ mod tests {
               "line one",
               "line two"
             ]
+            },
+          "shell_settings": {
+            "shell_highlight": {
+              "command": "yellow",
+              "keyword": ["bold", "green"],
+              "comment": null
+            }
           },
           "mcp_servers": {
             "filesystem": {
@@ -417,6 +449,21 @@ mod tests {
         assert_eq!(
             config.llm_request_settings.header.get("Authorization"),
             Some(&"Bearer secret".to_string())
+        );
+        assert_eq!(
+            config.shell_settings.shell_highlight.get("command"),
+            Some(&Some(ShellHighlightStyle::single("yellow")))
+        );
+        assert_eq!(
+            config.shell_settings.shell_highlight.get("keyword"),
+            Some(&Some(ShellHighlightStyle::tags(vec![
+                "bold".to_string(),
+                "green".to_string()
+            ])))
+        );
+        assert_eq!(
+            config.shell_settings.shell_highlight.get("comment"),
+            Some(&None)
         );
         assert_eq!(config.agent_settings.max_turns, 12);
         assert_eq!(config.agent_settings.max_tool_output_bytes, 4096);
@@ -686,6 +733,156 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_shell_highlight_key() {
+        let text = r#"
+        {
+          "llm_request_settings": {
+            "base_url": "https://example.test/chat",
+            "retries": 4,
+            "request_timeout_seconds": 240,
+            "connect_timeout_seconds": 45,
+            "body": { "model": "test/model" },
+            "header": { "Authorization": "Bearer secret" }
+          },
+          "agent_settings": {
+            "max_turns": 12,
+            "max_tool_output_bytes": 4096,
+            "max_context_tokens": 8192,
+            "max_resume_traj": 100,
+            "build_in_tools": ["read_file"],
+            "system_prompt": ["prompt"]
+          },
+          "shell_settings": {
+            "shell_highlight": {
+              "commnad": "yellow"
+            }
+          },
+          "mcp_servers": {}
+        }
+        "#;
+
+        let err = AgentConfig::from_jsonc(text).unwrap_err();
+
+        assert!(err.to_string().contains("unknown key `commnad`"));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn rejects_unknown_shell_highlight_color() {
+        let text = r#"
+        {
+          "llm_request_settings": {
+            "base_url": "https://example.test/chat",
+            "retries": 4,
+            "request_timeout_seconds": 240,
+            "connect_timeout_seconds": 45,
+            "body": { "model": "test/model" },
+            "header": { "Authorization": "Bearer secret" }
+          },
+          "agent_settings": {
+            "max_turns": 12,
+            "max_tool_output_bytes": 4096,
+            "max_context_tokens": 8192,
+            "max_resume_traj": 100,
+            "build_in_tools": ["read_file"],
+            "system_prompt": ["prompt"]
+          },
+          "shell_settings": {
+            "shell_highlight": {
+              "keyword": "ultraviolet"
+            }
+          },
+          "mcp_servers": {}
+        }
+        "#;
+
+        let err = AgentConfig::from_jsonc(text).unwrap_err();
+
+        assert!(err.to_string().contains("unknown color tag `ultraviolet`"));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn normalizes_shell_highlight_color_tags() {
+        let text = r#"
+        {
+          "llm_request_settings": {
+            "base_url": "https://example.test/chat",
+            "retries": 4,
+            "request_timeout_seconds": 240,
+            "connect_timeout_seconds": 45,
+            "body": { "model": "test/model" },
+            "header": { "Authorization": "Bearer secret" }
+          },
+          "agent_settings": {
+            "max_turns": 12,
+            "max_tool_output_bytes": 4096,
+            "max_context_tokens": 8192,
+            "max_resume_traj": 100,
+            "build_in_tools": ["read_file"],
+            "system_prompt": ["prompt"]
+          },
+          "shell_settings": {
+            "shell_highlight": {
+              "command": ["Bold", "Green"],
+              "keyword": "Bright-Magenta"
+            }
+          },
+          "mcp_servers": {}
+        }
+        "#;
+
+        let config = AgentConfig::from_jsonc(text).unwrap();
+
+        assert_eq!(
+            config.shell_settings.shell_highlight.get("command"),
+            Some(&Some(ShellHighlightStyle::tags(vec![
+                "bold".to_string(),
+                "green".to_string()
+            ])))
+        );
+        assert_eq!(
+            config.shell_settings.shell_highlight.get("keyword"),
+            Some(&Some(ShellHighlightStyle::single("bright-magenta")))
+        );
+    }
+
+    #[test]
+    fn rejects_non_string_shell_highlight_array_item() {
+        let text = r#"
+        {
+          "llm_request_settings": {
+            "base_url": "https://example.test/chat",
+            "retries": 4,
+            "request_timeout_seconds": 240,
+            "connect_timeout_seconds": 45,
+            "body": { "model": "test/model" },
+            "header": { "Authorization": "Bearer secret" }
+          },
+          "agent_settings": {
+            "max_turns": 12,
+            "max_tool_output_bytes": 4096,
+            "max_context_tokens": 8192,
+            "max_resume_traj": 100,
+            "build_in_tools": ["read_file"],
+            "system_prompt": ["prompt"]
+          },
+          "shell_settings": {
+            "shell_highlight": {
+              "keyword": ["bold", 1]
+            }
+          },
+          "mcp_servers": {}
+        }
+        "#;
+
+        let err = AgentConfig::from_jsonc(text).unwrap_err();
+
+        assert!(err.to_string().contains("shell_highlight.keyword[1]"));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn rejects_huge_compact_token_overdraft() {
         let text = r#"
         {
@@ -812,6 +1009,7 @@ mod tests {
                 system_prompt: vec!["custom".to_string(), "prompt".to_string()],
                 compact_prompt: vec!["compact".to_string(), "prompt".to_string()],
             },
+            shell_settings: ShellSettings::default(),
             llm_request_settings: LlmRequestSettings {
                 base_url: "https://example.test/chat".to_string(),
                 retries: 5,
