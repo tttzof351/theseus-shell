@@ -24,6 +24,11 @@ pub(super) fn default_ask_history_path() -> io::Result<std::path::PathBuf> {
 }
 
 #[cfg(not(test))]
+pub(super) fn default_shell_history_path() -> io::Result<std::path::PathBuf> {
+    default_history_path("history_shell.json")
+}
+
+#[cfg(not(test))]
 fn default_history_path(file_name: &str) -> io::Result<std::path::PathBuf> {
     home_dir()
         .map(|home| home.join(".theseus").join("persist").join(file_name))

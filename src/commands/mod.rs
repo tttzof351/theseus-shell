@@ -11,6 +11,7 @@ pub enum SlashCommand {
     Mcp,
     Reset,
     Resume,
+    Shell,
     Status,
 }
 
@@ -24,21 +25,15 @@ pub struct SlashCommandSpec {
 
 pub const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
-        command: SlashCommand::Help,
-        name: "/help",
-        description: "show available commands",
-        allows_trailing_input: false,
-    },
-    SlashCommandSpec {
-        command: SlashCommand::Exit,
-        name: "/exit",
-        description: "exit from shell",
-        allows_trailing_input: false,
-    },
-    SlashCommandSpec {
         command: SlashCommand::Ask,
         name: "/ask",
         description: "activate agent mode",
+        allows_trailing_input: true,
+    },
+    SlashCommandSpec {
+        command: SlashCommand::Shell,
+        name: "/shell",
+        description: "compose a multiline shell command",
         allows_trailing_input: true,
     },
     SlashCommandSpec {
@@ -75,6 +70,18 @@ pub const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         command: SlashCommand::Mcp,
         name: "/mcp",
         description: "show MCP servers",
+        allows_trailing_input: false,
+    },
+    SlashCommandSpec {
+        command: SlashCommand::Help,
+        name: "/help",
+        description: "show available commands",
+        allows_trailing_input: false,
+    },
+    SlashCommandSpec {
+        command: SlashCommand::Exit,
+        name: "/exit",
+        description: "exit from shell",
         allows_trailing_input: false,
     },
     // SlashCommandSpec {
@@ -119,14 +126,19 @@ mod tests {
         assert_eq!(parse_slash_command("/mcp"), Some(SlashCommand::Mcp));
         assert_eq!(parse_slash_command("/resume"), Some(SlashCommand::Resume));
         assert_eq!(parse_slash_command("/help"), Some(SlashCommand::Help));
+        assert_eq!(parse_slash_command("/shell"), Some(SlashCommand::Shell));
         assert_eq!(parse_slash_command("/history"), None);
     }
 
     #[test]
-    fn allows_trailing_input_only_for_ask() {
+    fn allows_trailing_input_for_ask_and_shell() {
         assert_eq!(
             parse_slash_command("/ask what can you do?"),
             Some(SlashCommand::Ask)
+        );
+        assert_eq!(
+            parse_slash_command("/shell echo ok"),
+            Some(SlashCommand::Shell)
         );
         assert_eq!(parse_slash_command("/exit now"), None);
         assert_eq!(parse_slash_command("/config now"), None);

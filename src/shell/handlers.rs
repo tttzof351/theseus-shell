@@ -13,7 +13,10 @@ use crate::{
     common::info::render_info,
     common::output::CommandOutput,
     feature_flags,
-    input::{MultiLineConfig, colorize_nested, read_multi_line_input},
+    input::{
+        MultiLineCompletionMode, MultiLineConfig, MultiLineRenderMode, colorize_nested,
+        read_multi_line_input,
+    },
     logging::AppLogger,
 };
 
@@ -114,6 +117,21 @@ impl TheseusShell {
 
         self.store_ask_history(prompt);
         Ok(self.agent_output(prompt))
+    }
+
+    pub(super) fn handle_shell_editor_command(
+        &mut self,
+        command: &str,
+        history_input: &mut Option<String>,
+    ) -> io::Result<CommandOutput> {
+        let shell_command = command.strip_prefix("/shell").unwrap_or_default().trim();
+
+        if shell_command.is_empty() {
+            return self.read_shell_input(history_input);
+        }
+
+        *history_input = Some(shell_command.to_string());
+        self.shell_command_output(shell_command)
     }
 
     pub(super) fn handle_help_command(&self) -> CommandOutput {
@@ -298,9 +316,10 @@ impl TheseusShell {
                 exit_word: Some("/end".to_string()),
                 history: &history,
                 on_change: Some(Box::new(move |text| {
-                    update_ask_history_draft(ask_history, draft_slot, text);
+                    update_string_history_draft(ask_history, draft_slot, text);
                     save_ask_history(&ask_history_path, ask_history);
                 })),
+                ..MultiLineConfig::default()
             }) {
                 Ok(text) => text,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {
@@ -310,9 +329,62 @@ impl TheseusShell {
             }
         };
 
-        update_ask_history_draft(&mut self.ask_history, draft_slot, &text);
+        update_string_history_draft(&mut self.ask_history, draft_slot, &text);
         self.save_ask_history();
         Ok(self.agent_output(&text))
+    }
+
+    fn read_shell_input(
+        &mut self,
+        history_input: &mut Option<String>,
+    ) -> io::Result<CommandOutput> {
+        println!(
+            "{}",
+            colorize_nested(
+                "<bright-black>Enter multiline shell command. Type <bold>/end</bold> on a new line to run.</bright-black>"
+            )
+        );
+
+        let history = self.shell_history.clone();
+        let draft_slot = self.shell_history.len();
+        let shell_history_path = self.config.shell_history_path.clone();
+        let shell_highlight = self
+            .config
+            .agent_config
+            .as_ref()
+            .map(|config| &config.shell_settings.shell_highlight);
+        let text = {
+            let shell_history = &mut self.shell_history;
+            match read_multi_line_input(MultiLineConfig {
+                prefix: "> ".to_string(),
+                exit_word: Some("/end".to_string()),
+                history: &history,
+                on_change: Some(Box::new(move |text| {
+                    update_string_history_draft(shell_history, draft_slot, text);
+                    save_shell_history(&shell_history_path, shell_history);
+                })),
+                render_mode: MultiLineRenderMode::Shell { shell_highlight },
+                completion_mode: MultiLineCompletionMode::Shell,
+            }) {
+                Ok(text) => text,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                    *history_input = None;
+                    return Ok(CommandOutput::success("\nShell cancelled.\n"));
+                }
+                Err(err) => return Err(err),
+            }
+        };
+
+        update_string_history_draft(&mut self.shell_history, draft_slot, &text);
+        self.save_shell_history();
+        let command = text.trim();
+        if command.is_empty() {
+            *history_input = None;
+            return Ok(CommandOutput::success(""));
+        }
+
+        *history_input = Some(command.to_string());
+        self.shell_command_output(command)
     }
 
     fn store_ask_history(&mut self, prompt: &str) {
@@ -322,6 +394,18 @@ impl TheseusShell {
 
     fn save_ask_history(&self) {
         save_ask_history(&self.config.ask_history_path, &self.ask_history);
+    }
+
+    fn save_shell_history(&self) {
+        save_shell_history(&self.config.shell_history_path, &self.shell_history);
+    }
+
+    fn shell_command_output(&mut self, command: &str) -> io::Result<CommandOutput> {
+        if !feature_flags::PERSISTENT_SHELL_SESSION && super::core::is_cd_command(command) {
+            Ok(self.change_directory(command))
+        } else {
+            self.run_external_command(command)
+        }
     }
 
     pub(super) fn agent_output(&mut self, prompt: &str) -> CommandOutput {
@@ -347,7 +431,7 @@ impl TheseusShell {
     }
 }
 
-fn update_ask_history_draft(history: &mut Vec<String>, slot: usize, prompt: &str) {
+fn update_string_history_draft(history: &mut Vec<String>, slot: usize, prompt: &str) {
     if prompt.trim().is_empty() {
         history.truncate(slot);
         return;
@@ -362,12 +446,20 @@ fn update_ask_history_draft(history: &mut Vec<String>, slot: usize, prompt: &str
 }
 
 fn save_ask_history(path: &Option<std::path::PathBuf>, history: &[String]) {
+    save_string_history_to_path(path, history, "ask");
+}
+
+fn save_shell_history(path: &Option<std::path::PathBuf>, history: &[String]) {
+    save_string_history_to_path(path, history, "shell");
+}
+
+fn save_string_history_to_path(path: &Option<std::path::PathBuf>, history: &[String], name: &str) {
     let Some(path) = path else {
         return;
     };
 
     if let Err(err) = save_string_history(path, history) {
-        eprintln!("warning: failed to save ask history: {err}");
+        eprintln!("warning: failed to save {name} history: {err}");
     }
 }
 

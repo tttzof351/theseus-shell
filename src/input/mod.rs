@@ -23,7 +23,9 @@ pub(crate) use key::{is_alt_key, is_command_key, is_control_key, is_key_press, i
 pub(crate) use raw_mode::RawModeGuard;
 pub use read_command::{CommandInputConfig, read_command_input};
 pub use read_line::{read_line_with_history, read_masked_line};
-pub use read_multiline::{MultiLineConfig, read_multi_line_input};
+pub use read_multiline::{
+    MultiLineCompletionMode, MultiLineConfig, MultiLineRenderMode, read_multi_line_input,
+};
 pub(crate) use shell_highlight::highlight_shell_command_with_palette;
 pub use shell_highlight::{
     ShellHighlightPalette, ShellHighlightStyle, default_shell_highlight_palette,

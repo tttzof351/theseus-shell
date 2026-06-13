@@ -1,18 +1,23 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 
 use crossterm::{
+    cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-    terminal,
+    execute, terminal,
 };
 
 use super::{
-    completion::{CompletionState, path_completion_state, token_before_cursor},
+    completion::{CompletionState, completion_state, path_completion_state, token_before_cursor},
     editor_render::{
         EditorLine, RenderLayout, cursor_visible_col, cursor_wraps_at_boundary,
         render_editor_lines, render_layout_for_lines_with_cursor_wrap,
     },
     is_alt_key, is_command_key, is_key_press, is_plain_text_key,
     raw_mode::RawModeGuard,
+    shell_highlight::{
+        ShellHighlightPalette, default_shell_highlight_palette,
+        highlight_shell_command_with_palette,
+    },
     text_buffer::TextBuffer,
 };
 
@@ -26,6 +31,24 @@ pub struct MultiLineConfig<'a> {
     pub exit_word: Option<String>,
     pub history: &'a [String],
     pub on_change: Option<ChangeCallback<'a>>,
+    pub render_mode: MultiLineRenderMode<'a>,
+    pub completion_mode: MultiLineCompletionMode,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub enum MultiLineRenderMode<'a> {
+    #[default]
+    Plain,
+    Shell {
+        shell_highlight: Option<&'a ShellHighlightPalette>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MultiLineCompletionMode {
+    #[default]
+    PathOnly,
+    Shell,
 }
 
 impl Default for MultiLineConfig<'_> {
@@ -35,6 +58,8 @@ impl Default for MultiLineConfig<'_> {
             exit_word: None,
             history: &[],
             on_change: None,
+            render_mode: MultiLineRenderMode::Plain,
+            completion_mode: MultiLineCompletionMode::PathOnly,
         }
     }
 }
@@ -43,6 +68,7 @@ struct MultiLineEditor<'a> {
     config: MultiLineConfig<'a>,
     buffer: TextBuffer,
     history_index: Option<usize>,
+    history_browsing: bool,
     draft: String,
     completion: Option<CompletionState>,
     on_change: Option<ChangeCallback<'a>>,
@@ -84,9 +110,12 @@ impl<'a> MultiLineEditor<'a> {
                 exit_word: config.exit_word,
                 history: config.history,
                 on_change: None,
+                render_mode: config.render_mode,
+                completion_mode: config.completion_mode,
             },
             buffer: TextBuffer::new(),
             history_index: None,
+            history_browsing: false,
             draft: String::new(),
             completion: None,
             rendered_rows: 1,
@@ -105,10 +134,7 @@ impl<'a> MultiLineEditor<'a> {
                         return Ok(text);
                     }
                 }
-                Event::Paste(text) => {
-                    self.insert_text(&text);
-                    self.render()?;
-                }
+                Event::Paste(text) => self.handle_paste(&text)?,
                 _ => {}
             }
         }
@@ -117,15 +143,23 @@ impl<'a> MultiLineEditor<'a> {
     fn handle_key(&mut self, key: KeyEvent) -> io::Result<Option<String>> {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.show_cursor()?;
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted"));
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.show_cursor()?;
                 self.finish_line()?;
                 return Ok(Some(self.buffer.text()));
             }
             KeyCode::Enter => {
                 self.clear_completion();
+                if self.history_browsing {
+                    self.accept_history_browsing();
+                    self.render()?;
+                    return Ok(None);
+                }
                 if self.is_exit_line() {
+                    self.show_cursor()?;
                     self.finish_line()?;
                     let text = self.buffer.text_before_last_line();
                     return Ok(Some(text));
@@ -187,15 +221,19 @@ impl<'a> MultiLineEditor<'a> {
             }
             KeyCode::Up => {
                 self.clear_completion();
-                if !self.buffer.move_up() {
+                if self.history_browsing || self.buffer.is_empty() {
                     self.history_previous();
+                } else {
+                    self.buffer.move_up();
                 }
                 self.render()?;
             }
             KeyCode::Down => {
                 self.clear_completion();
-                if !self.buffer.move_down() {
+                if self.history_browsing || self.buffer.is_empty() {
                     self.history_next();
+                } else {
+                    self.buffer.move_down();
                 }
                 self.render()?;
             }
@@ -223,10 +261,24 @@ impl<'a> MultiLineEditor<'a> {
         Ok(None)
     }
 
+    fn handle_paste(&mut self, text: &str) -> io::Result<()> {
+        self.process_paste(text);
+        self.render()
+    }
+
+    fn process_paste(&mut self, text: &str) {
+        self.insert_text(text);
+    }
+
     fn render(&mut self) -> io::Result<()> {
         let layout = self.render_layout();
         let mut stdout = io::stdout();
         let lines = self.render_lines();
+        if self.history_browsing {
+            execute!(stdout, Hide)?;
+        } else {
+            execute!(stdout, Show)?;
+        }
         render_editor_lines(
             &mut stdout,
             &lines,
@@ -259,10 +311,38 @@ impl<'a> MultiLineEditor<'a> {
     }
 
     fn render_lines(&self) -> Vec<EditorLine<'_>> {
+        let highlighted_shell_lines = match self.config.render_mode {
+            MultiLineRenderMode::Plain => Vec::new(),
+            MultiLineRenderMode::Shell { shell_highlight } => {
+                let default_palette;
+                let palette = match shell_highlight {
+                    Some(palette) => palette,
+                    None => {
+                        default_palette = default_shell_highlight_palette();
+                        &default_palette
+                    }
+                };
+                highlight_shell_command_with_palette(&self.buffer.text(), palette)
+            }
+        };
+
         self.buffer
             .lines()
             .iter()
-            .map(|line| EditorLine::new(&self.config.prefix, line.iter().collect::<String>()))
+            .enumerate()
+            .map(|(index, line)| {
+                let raw_text = line.iter().collect::<String>();
+                let text = highlighted_shell_lines
+                    .get(index)
+                    .cloned()
+                    .unwrap_or(raw_text);
+                let text = if self.history_browsing {
+                    crate::input::colorize_tag("italic", &text)
+                } else {
+                    text
+                };
+                EditorLine::new(&self.config.prefix, text)
+            })
             .collect()
     }
 
@@ -278,8 +358,13 @@ impl<'a> MultiLineEditor<'a> {
 
     fn finish_line(&self) -> io::Result<()> {
         let mut stdout = io::stdout();
+        execute!(stdout, Show)?;
         write!(stdout, "\r\n")?;
         stdout.flush()
+    }
+
+    fn show_cursor(&self) -> io::Result<()> {
+        execute!(io::stdout(), Show)
     }
 
     fn is_exit_line(&self) -> bool {
@@ -328,7 +413,11 @@ impl<'a> MultiLineEditor<'a> {
     }
 
     fn build_completion_state(&self) -> Option<CompletionState> {
-        path_completion_state(&self.current_line(), self.buffer.col())
+        if self.config.completion_mode == MultiLineCompletionMode::Shell && self.buffer.row() == 0 {
+            completion_state(&self.current_line(), self.buffer.col())
+        } else {
+            path_completion_state(&self.current_line(), self.buffer.col())
+        }
     }
 
     fn advance_completion(&mut self) -> bool {
@@ -404,24 +493,28 @@ impl<'a> MultiLineEditor<'a> {
     }
 
     fn history_previous(&mut self) {
-        if self.buffer.row() != 0 || self.config.history.is_empty() {
+        if self.config.history.is_empty() {
             return;
+        }
+        if !self.history_browsing {
+            if !self.buffer.is_empty() {
+                return;
+            }
+            self.history_browsing = true;
+            self.draft = self.buffer.text();
         }
 
         let next_index = match self.history_index {
             Some(0) => 0,
             Some(index) => index - 1,
-            None => {
-                self.draft = self.buffer.text();
-                self.config.history.len() - 1
-            }
+            None => self.config.history.len() - 1,
         };
 
         self.set_history_index(next_index);
     }
 
     fn history_next(&mut self) {
-        if self.buffer.row() + 1 != self.buffer.lines_len() {
+        if !self.history_browsing {
             return;
         }
 
@@ -433,6 +526,7 @@ impl<'a> MultiLineEditor<'a> {
             self.set_history_index(index + 1);
         } else {
             self.history_index = None;
+            self.history_browsing = false;
             let draft = self.draft.clone();
             self.buffer.replace_with_text(&draft);
             self.notify_change();
@@ -445,8 +539,13 @@ impl<'a> MultiLineEditor<'a> {
         self.notify_change();
     }
 
+    fn accept_history_browsing(&mut self) {
+        self.stop_history_navigation();
+    }
+
     fn stop_history_navigation(&mut self) {
         self.history_index = None;
+        self.history_browsing = false;
         self.draft.clear();
     }
 
@@ -456,6 +555,15 @@ impl<'a> MultiLineEditor<'a> {
         };
 
         on_change(&self.buffer.text());
+    }
+}
+
+impl Drop for MultiLineEditor<'_> {
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        if self.history_browsing {
+            let _ = self.show_cursor();
+        }
     }
 }
 
@@ -494,6 +602,62 @@ mod tests {
         assert_eq!(layout.rows, 3);
         assert_eq!(layout.cursor_row, 1);
         assert_eq!(layout.cursor_col, 6);
+    }
+
+    #[test]
+    fn shell_render_mode_highlights_multiline_shell_input() {
+        let mut editor = MultiLineEditor::new(MultiLineConfig {
+            prefix: "> ".to_string(),
+            render_mode: MultiLineRenderMode::Shell {
+                shell_highlight: None,
+            },
+            ..MultiLineConfig::default()
+        });
+        editor.buffer = TextBuffer::from_text("echo \"$USER\"\n| cat");
+
+        let lines = editor.render_lines();
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().any(|line| line.text.contains("\x1b[")));
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| crate::input::strip_ansi_codes(&line.text))
+                .collect::<Vec<_>>(),
+            vec!["echo \"$USER\"", "| cat"]
+        );
+    }
+
+    #[test]
+    fn shell_completion_mode_completes_commands_on_first_row() {
+        let mut editor = MultiLineEditor::new(MultiLineConfig {
+            completion_mode: MultiLineCompletionMode::Shell,
+            ..MultiLineConfig::default()
+        });
+        editor.buffer = TextBuffer::from_text("/he");
+
+        let state = editor.build_completion_state().unwrap();
+
+        assert!(state.token.is_command);
+        assert!(
+            state
+                .completions
+                .iter()
+                .any(|completion| completion.replacement == "/help")
+        );
+    }
+
+    #[test]
+    fn shell_completion_mode_uses_path_completion_after_first_row() {
+        let mut editor = MultiLineEditor::new(MultiLineConfig {
+            completion_mode: MultiLineCompletionMode::Shell,
+            ..MultiLineConfig::default()
+        });
+        editor.buffer = TextBuffer::from_text("echo\n/he");
+
+        let state = editor.build_completion_state();
+
+        assert!(state.is_none());
     }
 
     #[test]
@@ -616,6 +780,7 @@ mod tests {
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
+            ..MultiLineConfig::default()
         });
 
         editor.history_previous();
@@ -636,6 +801,7 @@ mod tests {
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
+            ..MultiLineConfig::default()
         });
         editor.insert_text("draft line one\ndraft line two");
 
@@ -648,13 +814,14 @@ mod tests {
     }
 
     #[test]
-    fn history_navigation_starts_only_at_first_line_and_down_only_at_last_line() {
+    fn history_navigation_starts_only_from_empty_prompt() {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: "> ".to_string(),
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
+            ..MultiLineConfig::default()
         });
         editor.insert_text("draft line one\ndraft line two");
 
@@ -663,10 +830,166 @@ mod tests {
 
         editor.buffer.set_position(0, 0);
         editor.history_previous();
+        assert_eq!(editor.buffer.text(), "draft line one\ndraft line two");
+        assert!(editor.history_index.is_none());
+
+        editor.buffer = TextBuffer::new();
+        editor.history_previous();
         assert_eq!(editor.buffer.text(), "stored prompt");
+        assert_eq!(editor.history_index, Some(0));
+    }
+
+    #[test]
+    fn history_browsing_starts_from_empty_prompt_and_uses_up_down_for_history_only() {
+        let history = vec![
+            "single prompt".to_string(),
+            "multiline prompt one\nmultiline prompt two".to_string(),
+        ];
+        let mut editor = MultiLineEditor::new(MultiLineConfig {
+            prefix: "> ".to_string(),
+            exit_word: Some("/end".to_string()),
+            history: &history,
+            on_change: None,
+            ..MultiLineConfig::default()
+        });
+
+        editor.history_previous();
+        assert_eq!(
+            editor.buffer.text(),
+            "multiline prompt one\nmultiline prompt two"
+        );
+        assert_eq!(editor.buffer.row(), 1);
+
+        editor.history_previous();
+        assert_eq!(editor.buffer.text(), "single prompt");
+        assert_eq!(editor.buffer.row(), 0);
+    }
+
+    #[test]
+    fn history_browsing_requires_enter_before_multiline_cursor_navigation() {
+        let history = vec!["line one\nline two".to_string()];
+        let mut editor = MultiLineEditor::new(MultiLineConfig {
+            prefix: "> ".to_string(),
+            exit_word: Some("/end".to_string()),
+            history: &history,
+            on_change: None,
+            ..MultiLineConfig::default()
+        });
+
+        editor.history_previous();
+        assert_eq!(editor.buffer.row(), 1);
+
+        assert!(editor.buffer.move_up());
+        editor.history_previous();
+
+        assert_eq!(editor.buffer.text(), "line one\nline two");
+        assert_eq!(editor.buffer.row(), 1);
+    }
+
+    #[test]
+    fn enter_accepts_history_browsing_before_up_moves_cursor() {
+        let history = vec!["line one\nline two".to_string()];
+        let mut editor = MultiLineEditor::new(MultiLineConfig {
+            prefix: "> ".to_string(),
+            exit_word: Some("/end".to_string()),
+            history: &history,
+            on_change: None,
+            ..MultiLineConfig::default()
+        });
+
+        editor.history_previous();
+        assert!(editor.history_browsing);
+
+        editor.accept_history_browsing();
+        assert!(!editor.history_browsing);
+        assert_eq!(editor.buffer.text(), "line one\nline two");
+
+        assert!(editor.buffer.move_up());
+        assert_eq!(editor.buffer.text(), "line one\nline two");
+        assert_eq!(editor.buffer.row(), 0);
+        assert!(editor.history_index.is_none());
+    }
+
+    #[test]
+    fn non_empty_prompt_uses_up_down_for_cursor_navigation_not_history() {
+        let history = vec!["stored prompt".to_string()];
+        let mut editor = MultiLineEditor::new(MultiLineConfig {
+            prefix: "> ".to_string(),
+            exit_word: Some("/end".to_string()),
+            history: &history,
+            on_change: None,
+            ..MultiLineConfig::default()
+        });
+        editor.insert_text("draft one\ndraft two");
+
+        editor.history_previous();
+        assert_eq!(editor.buffer.text(), "draft one\ndraft two");
+    }
+
+    #[test]
+    fn history_browsing_render_lines_are_italic_until_editing_is_accepted() {
+        let history = vec!["stored prompt".to_string()];
+        let mut editor = MultiLineEditor::new(MultiLineConfig {
+            prefix: "> ".to_string(),
+            exit_word: Some("/end".to_string()),
+            history: &history,
+            on_change: None,
+            ..MultiLineConfig::default()
+        });
+
+        editor.history_previous();
+        let lines = editor.render_lines();
+        assert_eq!(lines[0].text, "\x1b[3mstored prompt\x1b[0m");
+
+        editor.stop_history_navigation();
+        let lines = editor.render_lines();
+        assert_eq!(lines[0].text, "stored prompt");
+    }
+
+    #[test]
+    fn history_down_to_draft_leaves_history_browsing() {
+        let history = vec!["stored prompt".to_string()];
+        let mut editor = MultiLineEditor::new(MultiLineConfig {
+            prefix: "> ".to_string(),
+            exit_word: Some("/end".to_string()),
+            history: &history,
+            on_change: None,
+            ..MultiLineConfig::default()
+        });
+
+        editor.history_previous();
+        assert!(editor.history_browsing);
 
         editor.history_next();
-        assert_eq!(editor.buffer.text(), "draft line one\ndraft line two");
+
+        assert_eq!(editor.buffer.text(), "");
+        assert!(!editor.history_browsing);
+        assert!(editor.history_index.is_none());
+        let lines = editor.render_lines();
+        assert_eq!(lines[0].text, "");
+    }
+
+    #[test]
+    fn paste_accepts_history_browsing_and_inserts_text() {
+        let history = vec!["stored prompt".to_string()];
+        let mut editor = MultiLineEditor::new(MultiLineConfig {
+            prefix: "> ".to_string(),
+            exit_word: Some("/end".to_string()),
+            history: &history,
+            on_change: None,
+            ..MultiLineConfig::default()
+        });
+
+        editor.history_previous();
+        assert!(editor.history_browsing);
+
+        editor.process_paste(" pasted");
+
+        assert_eq!(editor.buffer.text(), "stored prompt pasted");
+        assert!(!editor.history_browsing);
+        assert!(editor.history_index.is_none());
+        let lines = editor.render_lines();
+        assert_eq!(lines[0].text, "stored prompt pasted");
     }
 
     #[test]
@@ -681,6 +1004,7 @@ mod tests {
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
+            ..MultiLineConfig::default()
         });
 
         editor.history_previous();
@@ -716,6 +1040,7 @@ mod tests {
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
+            ..MultiLineConfig::default()
         });
 
         editor.history_previous();
@@ -735,6 +1060,7 @@ mod tests {
                 exit_word: Some("/end".to_string()),
                 history: &[],
                 on_change: Some(Box::new(|text| changes.push(text.to_string()))),
+                ..MultiLineConfig::default()
             });
 
             editor.insert_text("C");
@@ -757,13 +1083,13 @@ mod tests {
                 exit_word: Some("/end".to_string()),
                 history: &history,
                 on_change: Some(Box::new(|text| changes.push(text.to_string()))),
+                ..MultiLineConfig::default()
             });
 
-            editor.insert_text("draft");
             editor.history_previous();
             editor.history_next();
         }
 
-        assert_eq!(changes, vec!["draft", "stored", "draft"]);
+        assert_eq!(changes, vec!["stored", ""]);
     }
 }

@@ -1,7 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 
 use crossterm::{
-    cursor::{MoveDown, MoveTo},
+    cursor::{Hide, MoveDown, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{self, Clear, ClearType},
@@ -40,6 +40,7 @@ struct CommandEditor<'a> {
     config: CommandInputConfig<'a>,
     buffer: TextBuffer,
     history_index: Option<usize>,
+    history_browsing: bool,
     draft: String,
     completion: Option<CompletionState>,
     rendered_rows: u16,
@@ -71,6 +72,7 @@ impl<'a> CommandEditor<'a> {
             config,
             buffer: TextBuffer::new(),
             history_index: None,
+            history_browsing: false,
             draft: String::new(),
             completion: None,
             rendered_rows: 1,
@@ -103,6 +105,7 @@ impl<'a> CommandEditor<'a> {
     fn handle_key(&mut self, key: KeyEvent) -> io::Result<Option<Option<String>>> {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.show_cursor()?;
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted"));
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -115,6 +118,11 @@ impl<'a> CommandEditor<'a> {
             }
             KeyCode::Enter => {
                 self.clear_completion();
+                if self.history_browsing {
+                    self.accept_history_browsing();
+                    self.render()?;
+                    return Ok(None);
+                }
                 if self.enter_should_continue() {
                     self.split_line();
                     self.render()?;
@@ -175,12 +183,20 @@ impl<'a> CommandEditor<'a> {
             }
             KeyCode::Up => {
                 self.clear_completion();
-                self.history_previous();
+                if self.history_browsing || self.can_navigate_history() {
+                    self.history_previous();
+                } else {
+                    self.buffer.move_up();
+                }
                 self.render()?;
             }
             KeyCode::Down => {
                 self.clear_completion();
-                self.history_next();
+                if self.history_browsing || self.can_navigate_history() {
+                    self.history_next();
+                } else {
+                    self.buffer.move_down();
+                }
                 self.render()?;
             }
             KeyCode::Home => {
@@ -236,6 +252,11 @@ impl<'a> CommandEditor<'a> {
         let layout = self.render_layout();
         let mut stdout = io::stdout();
         let lines = self.render_lines();
+        if self.history_browsing {
+            execute!(stdout, Hide)?;
+        } else {
+            execute!(stdout, Show)?;
+        }
         render_editor_lines(
             &mut stdout,
             &lines,
@@ -304,6 +325,11 @@ impl<'a> CommandEditor<'a> {
                 } else {
                     line.clone()
                 };
+                let rendered_line = if self.history_browsing {
+                    colorize_tag("italic", &rendered_line)
+                } else {
+                    rendered_line
+                };
                 EditorLine::with_visible_len(
                     self.prompt_for_row(index),
                     rendered_line,
@@ -325,12 +351,17 @@ impl<'a> CommandEditor<'a> {
 
     fn finish_line(&self) -> io::Result<()> {
         let mut stdout = io::stdout();
+        execute!(stdout, Show)?;
         let rows_below_cursor = self.rendered_rows - 1 - self.rendered_cursor_row;
         if rows_below_cursor > 0 {
             execute!(stdout, MoveDown(rows_below_cursor))?;
         }
         write!(stdout, "\r\n")?;
         stdout.flush()
+    }
+
+    fn show_cursor(&self) -> io::Result<()> {
+        execute!(io::stdout(), Show)
     }
 
     fn prompt_for_row(&self, row: usize) -> &str {
@@ -411,24 +442,27 @@ impl<'a> CommandEditor<'a> {
     }
 
     fn history_previous(&mut self) {
-        if !self.can_navigate_history() || self.config.history.is_empty() {
+        if self.config.history.is_empty() {
             return;
+        }
+        if !self.history_browsing {
+            if !self.can_navigate_history() {
+                return;
+            }
+            self.draft = self.current_text();
         }
 
         let next_index = match self.history_index {
             Some(0) => 0,
             Some(index) => index - 1,
-            None => {
-                self.draft = self.current_text();
-                self.config.history.len() - 1
-            }
+            None => self.config.history.len() - 1,
         };
 
         self.set_history_index(next_index);
     }
 
     fn history_next(&mut self) {
-        if !self.can_navigate_history() {
+        if !self.history_browsing && !self.can_navigate_history() {
             return;
         }
 
@@ -440,6 +474,7 @@ impl<'a> CommandEditor<'a> {
             self.set_history_index(index + 1);
         } else {
             self.history_index = None;
+            self.history_browsing = false;
             let draft = self.draft.clone();
             self.replace_with_text(&draft);
         }
@@ -451,6 +486,7 @@ impl<'a> CommandEditor<'a> {
 
     fn set_history_index(&mut self, index: usize) {
         self.history_index = Some(index);
+        self.history_browsing = self.config.history[index].contains('\n');
         self.replace_with_text(&self.config.history[index]);
     }
 
@@ -460,7 +496,12 @@ impl<'a> CommandEditor<'a> {
 
     fn stop_history_navigation(&mut self) {
         self.history_index = None;
+        self.history_browsing = false;
         self.draft.clear();
+    }
+
+    fn accept_history_browsing(&mut self) {
+        self.stop_history_navigation();
     }
 
     fn clear_completion(&mut self) {
@@ -530,6 +571,15 @@ impl<'a> CommandEditor<'a> {
 
     fn replace_before_cursor(&mut self, start: usize, replacement: &str) {
         self.buffer.replace_before_cursor(start, replacement);
+    }
+}
+
+impl Drop for CommandEditor<'_> {
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        if self.history_browsing {
+            let _ = self.show_cursor();
+        }
     }
 }
 
@@ -734,6 +784,7 @@ mod tests {
         assert_eq!(editor.current_text(), "second");
         assert_eq!(editor.buffer.row(), 0);
         assert_eq!(editor.buffer.col(), "second".chars().count());
+        assert!(!editor.history_browsing);
     }
 
     #[test]
@@ -752,14 +803,65 @@ mod tests {
         assert_eq!(editor.current_text(), "echo \\\n \"test\"");
         assert_eq!(editor.buffer.lines_len(), 2);
 
+        editor.buffer.move_up();
         editor.history_previous();
         assert_eq!(editor.current_text(), "first");
+        assert_eq!(editor.buffer.row(), 0);
 
         editor.history_next();
         assert_eq!(editor.current_text(), "echo \\\n \"test\"");
+        assert_eq!(editor.buffer.row(), 1);
 
         editor.history_next();
         assert_eq!(editor.current_text(), "third");
+    }
+
+    #[test]
+    fn history_browsing_requires_enter_before_multiline_cursor_navigation() {
+        let history = vec!["echo \\\n \"test\"".to_string()];
+        let mut editor = CommandEditor::new(config(&history));
+
+        editor.history_previous();
+        assert_eq!(editor.buffer.row(), 1);
+
+        assert!(editor.buffer.move_up());
+        editor.history_previous();
+
+        assert_eq!(editor.current_text(), "echo \\\n \"test\"");
+        assert_eq!(editor.buffer.row(), 1);
+    }
+
+    #[test]
+    fn enter_accepts_history_browsing_before_up_moves_cursor() {
+        let history = vec!["echo \\\n \"test\"".to_string()];
+        let mut editor = CommandEditor::new(config(&history));
+
+        editor.history_previous();
+        assert!(editor.history_browsing);
+
+        editor.accept_history_browsing();
+        assert!(!editor.history_browsing);
+        assert_eq!(editor.current_text(), "echo \\\n \"test\"");
+
+        assert!(editor.buffer.move_up());
+        assert_eq!(editor.buffer.row(), 0);
+        assert!(editor.history_index.is_none());
+    }
+
+    #[test]
+    fn history_browsing_render_lines_are_italic_until_editing_is_accepted() {
+        let history = vec!["echo \\\n \"test\"".to_string()];
+        let mut editor = CommandEditor::new(config(&history));
+
+        editor.history_previous();
+        let lines = editor.render_lines();
+        assert!(lines[0].text.contains("\x1b[3m"));
+        assert!(lines[1].text.contains("\x1b[3m"));
+
+        editor.accept_history_browsing();
+        let lines = editor.render_lines();
+        assert!(!lines[0].text.contains("\x1b[3m"));
+        assert!(!lines[1].text.contains("\x1b[3m"));
     }
 
     #[test]

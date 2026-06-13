@@ -23,7 +23,9 @@ use crate::input::{CommandInputConfig, read_command_input};
 use crate::logging::AppLogger;
 
 #[cfg(not(test))]
-use super::history::{default_ask_history_path, default_command_history_path};
+use super::history::{
+    default_ask_history_path, default_command_history_path, default_shell_history_path,
+};
 
 const MAX_AGENT_SHELL_CONTEXT_OUTPUT_BYTES: usize = 32 * 1024;
 const INTERRUPTED_EXIT_HINT: &str = "Interrupted. Type /exit to exit the shell.";
@@ -42,6 +44,7 @@ pub struct ShellConfig {
     pub logger: Option<AppLogger>,
     pub command_history_path: Option<PathBuf>,
     pub ask_history_path: Option<PathBuf>,
+    pub shell_history_path: Option<PathBuf>,
 }
 
 impl Default for ShellConfig {
@@ -57,6 +60,10 @@ impl Default for ShellConfig {
         let ask_history_path = default_ask_history_path().ok();
         #[cfg(test)]
         let ask_history_path = None;
+        #[cfg(not(test))]
+        let shell_history_path = default_shell_history_path().ok();
+        #[cfg(test)]
+        let shell_history_path = None;
 
         Self {
             executable: default_shell(),
@@ -70,6 +77,7 @@ impl Default for ShellConfig {
             logger: None,
             command_history_path,
             ask_history_path,
+            shell_history_path,
         }
     }
 }
@@ -81,6 +89,7 @@ pub struct TheseusShell {
     history: Vec<CommandRecord>,
     input_history: Vec<String>,
     pub(super) ask_history: Vec<String>,
+    pub(super) shell_history: Vec<String>,
 }
 
 impl TheseusShell {
@@ -105,6 +114,11 @@ impl TheseusShell {
             .as_ref()
             .and_then(|path| load_string_history(path).ok())
             .unwrap_or_default();
+        let shell_history = config
+            .shell_history_path
+            .as_ref()
+            .and_then(|path| load_string_history(path).ok())
+            .unwrap_or_default();
 
         Self {
             config,
@@ -113,6 +127,7 @@ impl TheseusShell {
             history: Vec::new(),
             input_history,
             ask_history,
+            shell_history,
         }
     }
 
@@ -184,6 +199,7 @@ impl TheseusShell {
     }
 
     pub fn handle_command(&mut self, input: &str) -> io::Result<CommandOutput> {
+        let mut history_input = Some(input.to_string());
         self.log_event(
             "info",
             "command_start",
@@ -202,6 +218,9 @@ impl TheseusShell {
             Some(SlashCommand::Resume) => self.handle_resume_command()?,
             Some(SlashCommand::Config) => self.handle_config_command()?,
             Some(SlashCommand::Ask) => self.handle_ask_command(trimmed)?,
+            Some(SlashCommand::Shell) => {
+                self.handle_shell_editor_command(trimmed, &mut history_input)?
+            }
             Some(SlashCommand::Help) => self.handle_help_command(),
             None => match trimmed {
                 command if is_exit_command(command) => CommandOutput::success(""),
@@ -221,11 +240,13 @@ impl TheseusShell {
             },
         };
 
-        self.history.push(CommandRecord {
-            input: input.to_string(),
-            output: output.clone(),
-        });
-        self.store_input_history(input);
+        if let Some(history_input) = history_input {
+            self.history.push(CommandRecord {
+                input: history_input.clone(),
+                output: output.clone(),
+            });
+            self.store_input_history(&history_input);
+        }
 
         self.log_event(
             if output.status_code == Some(0) {
@@ -326,7 +347,7 @@ pub fn run_shell(config: ShellConfig) -> io::Result<i32> {
     TheseusShell::new(config).run()
 }
 
-fn is_cd_command(command: &str) -> bool {
+pub(super) fn is_cd_command(command: &str) -> bool {
     matches!(command.split_whitespace().next(), Some("cd"))
         && !contains_shell_control_syntax(command)
 }
@@ -562,6 +583,25 @@ mod tests {
     }
 
     #[test]
+    fn loads_persisted_shell_history() {
+        let path = env::temp_dir().join(format!(
+            "theseus-shell-history-load-{}-{}.json",
+            std::process::id(),
+            unique_test_suffix()
+        ));
+        std::fs::write(&path, "[\"old shell\"]\n").unwrap();
+
+        let shell = TheseusShell::new(ShellConfig {
+            shell_history_path: Some(path.clone()),
+            ..ShellConfig::default()
+        });
+
+        assert_eq!(shell.shell_history, vec!["old shell"]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn ask_command_persists_single_line_prompt() {
         let path = env::temp_dir().join(format!(
             "theseus-ask-history-save-{}-{}.json",
@@ -600,6 +640,26 @@ mod tests {
         let text = output.transcript_lossy();
 
         assert!(text.contains("LLM Authorization header is empty"));
+    }
+
+    #[test]
+    fn shell_command_inline_executes_without_shell_prefix_in_history() {
+        let mut shell = TheseusShell::new(ShellConfig {
+            executable: PathBuf::from("/bin/sh"),
+            ..ShellConfig::default()
+        });
+
+        let output = shell
+            .handle_command("/shell printf SHELL_INLINE_OK")
+            .unwrap();
+
+        assert_eq!(output.status_code, Some(0));
+        assert_eq!(
+            output.transcript_lossy().replace("\r\n", "\n"),
+            "SHELL_INLINE_OK"
+        );
+        assert_eq!(shell.history()[0].input, "printf SHELL_INLINE_OK");
+        assert!(shell.shell_history.is_empty());
     }
 
     #[test]

@@ -442,6 +442,46 @@ fn history_down_after_latest_restores_current_draft() -> io::Result<()> {
 }
 
 #[test]
+fn command_history_mode_walks_past_multiline_entry_without_cursor_repositioning() -> io::Result<()>
+{
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    shell.write("echo HISTORY_MULTILINE_OLDER\r")?;
+    shell.wait_for("HISTORY_MULTILINE_OLDER")?;
+    shell.wait_for_after(shell.transcript_len(), "theseus-shell")?;
+
+    shell.write("/shell\r")?;
+    shell.wait_for("Enter multiline shell command")?;
+    let submit_offset = shell.transcript_len();
+    shell.write("printf '%s\\n' \\\r  HISTORY_MULTILINE_NEWER\r/end\r")?;
+    shell.wait_for_after(submit_offset, "HISTORY_MULTILINE_NEWER")?;
+    shell.wait_for_after(submit_offset, "theseus-shell")?;
+
+    let offset = shell.transcript_len();
+    shell.write(KEY_UP)?;
+    shell.wait_until_after(offset, |tail| tail.contains("HISTORY_MULTILINE_NEWER"))?;
+    shell.write(KEY_UP)?;
+    shell.write("\r")?;
+    let transcript = shell.wait_until_after(offset, |tail| {
+        count_matches(tail, "HISTORY_MULTILINE_OLDER") >= 2
+    })?;
+
+    assert!(
+        transcript[offset..].contains("\x1b[3m"),
+        "multiline command history entry was not shown in browsing style:\n{}",
+        &transcript[offset..]
+    );
+    assert!(
+        count_matches(&transcript[offset..], "HISTORY_MULTILINE_OLDER") >= 2,
+        "second Up did not move past multiline history entry to the older command:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.exit()
+}
+
+#[test]
 fn ask_multiline_history_up_recalls_previous_prompt() -> io::Result<()> {
     let _lock = pty_test_lock();
     let mut shell = PtyShell::start()?;
@@ -464,6 +504,52 @@ fn ask_multiline_history_up_recalls_previous_prompt() -> io::Result<()> {
         transcript[offset..].contains("ASK_HISTORY_LINE_ONE")
             && transcript[offset..].contains("ASK_HISTORY_LINE_TWO"),
         "Up did not recall the previous multiline /ask prompt:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Ask cancelled")?;
+    shell.exit()
+}
+
+#[test]
+fn ask_multiline_history_mode_walks_entries_without_cursor_repositioning() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    shell.write("/ask\r")?;
+    shell.wait_for("Enter multiline input")?;
+    let first_submit_offset = shell.transcript_len();
+    shell.write("ASK_HISTORY_OLD_ONE\rASK_HISTORY_OLD_TWO\r/end\r")?;
+    shell.wait_for_after(first_submit_offset, "theseus-shell")?;
+
+    shell.write("/ask\r")?;
+    shell.wait_for("Enter multiline input")?;
+    let second_submit_offset = shell.transcript_len();
+    shell.write("ASK_HISTORY_NEW_ONE\rASK_HISTORY_NEW_TWO\r/end\r")?;
+    shell.wait_for_after(second_submit_offset, "theseus-shell")?;
+
+    let offset = shell.transcript_len();
+    shell.write("/ask\r")?;
+    shell.wait_for_after(offset, "Enter multiline input")?;
+    shell.write(KEY_UP)?;
+    shell.wait_until_after(offset, |tail| {
+        tail.contains("ASK_HISTORY_NEW_ONE") && tail.contains("ASK_HISTORY_NEW_TWO")
+    })?;
+    shell.write(KEY_UP)?;
+    let transcript = shell.wait_until_after(offset, |tail| {
+        tail.contains("ASK_HISTORY_OLD_ONE") && tail.contains("ASK_HISTORY_OLD_TWO")
+    })?;
+
+    assert!(
+        transcript[offset..].contains("\x1b[3m"),
+        "history browsing did not render recalled text as italic:\n{}",
+        &transcript[offset..]
+    );
+    assert!(
+        transcript[offset..].contains("ASK_HISTORY_OLD_ONE")
+            && transcript[offset..].contains("ASK_HISTORY_OLD_TWO"),
+        "second Up did not move to the older multiline /ask prompt:\n{}",
         &transcript[offset..]
     );
 
@@ -514,6 +600,127 @@ fn ask_multiline_history_preserves_cancelled_draft() -> io::Result<()> {
 
     shell.write("\u{3}")?;
     shell.wait_for_after(offset, "Ask cancelled")?;
+    shell.exit()
+}
+
+#[test]
+fn shell_multiline_mode_executes_command_after_end() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    let offset = shell.transcript_len();
+    shell.write("/shell\r")?;
+    shell.wait_for_after(offset, "Enter multiline shell command")?;
+    shell.write("printf '%s\\n' \\\r  SHELL_MODE_OK\r/end\r")?;
+    let transcript = shell.wait_until_after(offset, |tail| tail.contains("SHELL_MODE_OK"))?;
+
+    assert!(
+        transcript[offset..].contains("SHELL_MODE_OK"),
+        "/shell multiline command did not execute after /end:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.exit()
+}
+
+#[test]
+fn shell_multiline_history_mode_recalls_previous_command() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    shell.write("/shell\r")?;
+    shell.wait_for("Enter multiline shell command")?;
+    let submit_offset = shell.transcript_len();
+    shell.write("printf '%s\\n' \\\r  SHELL_HISTORY_OK\r/end\r")?;
+    shell.wait_for_after(submit_offset, "SHELL_HISTORY_OK")?;
+    shell.wait_for_after(submit_offset, "theseus-shell")?;
+
+    let offset = shell.transcript_len();
+    shell.write("/shell\r")?;
+    shell.wait_for_after(offset, "Enter multiline shell command")?;
+    shell.write(KEY_UP)?;
+    let transcript = shell.wait_until_after(offset, |tail| tail.contains("SHELL_HISTORY_OK"))?;
+
+    assert!(
+        transcript[offset..].contains("\x1b[3m"),
+        "/shell history browsing did not render recalled command as italic:\n{}",
+        &transcript[offset..]
+    );
+    assert!(
+        transcript[offset..].contains("SHELL_HISTORY_OK"),
+        "Up did not recall the previous multiline /shell command:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Shell cancelled")?;
+    shell.exit()
+}
+
+#[test]
+fn shell_multiline_history_preserves_cancelled_draft() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    shell.write("/shell\r")?;
+    shell.wait_for("Enter multiline shell command")?;
+    shell.write("SHELL_CANCELLED_DRAFT_ONE\rSHELL_CANCELLED_DRAFT_TWO")?;
+    shell.wait_for("SHELL_CANCELLED_DRAFT_TWO")?;
+    let cancel_offset = shell.transcript_len();
+    shell.write("\u{3}")?;
+    shell.wait_for_after(cancel_offset, "Shell cancelled")?;
+    shell.wait_for_after(cancel_offset, "theseus-shell")?;
+    let saved = fs::read_to_string(
+        shell
+            .home
+            .join(".theseus")
+            .join("persist")
+            .join("history_shell.json"),
+    )?;
+    assert!(
+        saved.contains("SHELL_CANCELLED_DRAFT_ONE") && saved.contains("SHELL_CANCELLED_DRAFT_TWO"),
+        "cancelled /shell draft was not persisted:\n{saved}"
+    );
+
+    let offset = shell.transcript_len();
+    shell.write("/shell\r")?;
+    shell.wait_for_after(offset, "Enter multiline shell command")?;
+    shell.write(KEY_UP)?;
+    let transcript = shell.wait_until_after(offset, |tail| {
+        tail.contains("SHELL_CANCELLED_DRAFT_ONE") && tail.contains("SHELL_CANCELLED_DRAFT_TWO")
+    })?;
+
+    assert!(
+        transcript[offset..].contains("SHELL_CANCELLED_DRAFT_ONE")
+            && transcript[offset..].contains("SHELL_CANCELLED_DRAFT_TWO"),
+        "Up did not recall the cancelled multiline /shell draft:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Shell cancelled")?;
+    shell.exit()
+}
+
+#[test]
+fn shell_multiline_mode_completes_commands_on_first_row() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    let offset = shell.transcript_len();
+    shell.write("/shell\r")?;
+    shell.wait_for_after(offset, "Enter multiline shell command")?;
+    shell.write("/he\t")?;
+    let transcript = shell.wait_until_after(offset, |tail| tail.contains("/help"))?;
+
+    assert!(
+        transcript[offset..].contains("/help"),
+        "/shell did not complete commands on the first row:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Shell cancelled")?;
     shell.exit()
 }
 
