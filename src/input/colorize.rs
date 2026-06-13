@@ -92,13 +92,12 @@ pub fn strip_ansi_codes(text: &str) -> String {
 }
 
 pub fn text_length(text: &str, has_tags: bool) -> usize {
-    let visible_text = if has_tags {
-        strip_tags(text)
+    if has_tags {
+        let visible_text = strip_tags(text);
+        UnicodeWidthStr::width(strip_ansi_codes(&visible_text).as_str())
     } else {
-        text.to_string()
-    };
-
-    UnicodeWidthStr::width(strip_ansi_codes(&visible_text).as_str())
+        UnicodeWidthStr::width(strip_ansi_codes(text).as_str())
+    }
 }
 
 struct Tag {

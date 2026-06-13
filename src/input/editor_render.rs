@@ -5,6 +5,7 @@ use crossterm::{
     execute,
     terminal::{Clear, ClearType},
 };
+use unicode_width::UnicodeWidthChar;
 
 use super::{strip_ansi_codes, text_length};
 
@@ -59,17 +60,23 @@ pub(crate) fn render_layout_for_lines_with_cursor_wrap(
         .get(cursor_line)
         .map(|line| line.prompt)
         .unwrap_or_default();
-    let cursor_text = lines
-        .get(cursor_line)
-        .map(|line| visible_prefix_by_width(line.text.as_str(), cursor_col))
-        .unwrap_or_default();
     let cursor_len = text_length(cursor_prompt, false) + cursor_col;
     let cursor_wraps_at_boundary =
         cursor_wraps_at_boundary && cursor_len > 0 && cursor_len.is_multiple_of(columns);
     let (cursor_wrap_row, cursor_wrap_col) = if cursor_wraps_at_boundary {
         wrapped_cursor(cursor_len, columns, true)
     } else {
-        wrapped_line_position(cursor_prompt, &cursor_text, columns)
+        lines
+            .get(cursor_line)
+            .map(|line| {
+                wrapped_line_position_until_text_width(
+                    cursor_prompt,
+                    &line.text,
+                    cursor_col,
+                    columns,
+                )
+            })
+            .unwrap_or((0, 0))
     };
 
     RenderLayout {
@@ -140,33 +147,65 @@ pub(crate) fn wrapped_rows(visible_len: usize, columns: usize) -> usize {
     }
 }
 
-fn visible_prefix_by_width(text: &str, max_width: usize) -> String {
-    let mut prefix = String::new();
-    let mut width = 0usize;
+pub(crate) fn cursor_visible_col(line: &str, cursor_char_idx: usize) -> usize {
+    let byte_idx = line
+        .char_indices()
+        .nth(cursor_char_idx)
+        .map(|(index, _)| index)
+        .unwrap_or(line.len());
+    text_length(&line[..byte_idx], false)
+}
 
-    let text = strip_ansi_codes(text);
-    for ch in text.chars() {
-        let ch_width = text_length(&ch.to_string(), false);
-        if width + ch_width > max_width {
-            break;
-        }
-        prefix.push(ch);
-        width += ch_width;
+pub(crate) fn cursor_wraps_at_boundary(line: &str, cursor_char_idx: usize) -> bool {
+    if cursor_char_idx == 0 {
+        return false;
     }
+    line.chars()
+        .nth(cursor_char_idx - 1)
+        .is_some_and(|ch| char_width(ch) > 1)
+}
 
-    prefix
+fn char_width(ch: char) -> usize {
+    ch.width().unwrap_or(0)
+}
+
+fn wrapped_line_position_until_text_width(
+    prompt: &str,
+    text: &str,
+    max_text_width: usize,
+    columns: usize,
+) -> (usize, usize) {
+    let mut width = 0usize;
+    let text = strip_ansi_codes(text);
+    wrapped_position_for_chars(
+        strip_ansi_codes(prompt)
+            .chars()
+            .chain(text.chars().take_while(|ch| {
+                let ch_width = char_width(*ch);
+                if width + ch_width > max_text_width {
+                    return false;
+                }
+                width += ch_width;
+                true
+            })),
+        columns,
+    )
 }
 
 fn wrapped_line_position(prompt: &str, text: &str, columns: usize) -> (usize, usize) {
+    let prompt = strip_ansi_codes(prompt);
+    let text = strip_ansi_codes(text);
+    wrapped_position_for_chars(prompt.chars().chain(text.chars()), columns)
+}
+
+fn wrapped_position_for_chars(chars: impl Iterator<Item = char>, columns: usize) -> (usize, usize) {
     let columns = columns.max(1);
     let mut row = 0usize;
     let mut col = 0usize;
     let mut wrap_next = false;
-    let prompt = strip_ansi_codes(prompt);
-    let text = strip_ansi_codes(text);
 
-    for ch in prompt.chars().chain(text.chars()) {
-        let width = text_length(&ch.to_string(), false);
+    for ch in chars {
+        let width = char_width(ch);
         if width == 0 {
             continue;
         }

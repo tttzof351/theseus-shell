@@ -8,12 +8,12 @@ use crossterm::{
 use super::{
     completion::{CompletionState, path_completion_state, token_before_cursor},
     editor_render::{
-        EditorLine, RenderLayout, render_editor_lines, render_layout_for_lines_with_cursor_wrap,
+        EditorLine, RenderLayout, cursor_visible_col, cursor_wraps_at_boundary,
+        render_editor_lines, render_layout_for_lines_with_cursor_wrap,
     },
     is_alt_key, is_command_key, is_key_press, is_plain_text_key,
     raw_mode::RawModeGuard,
     text_buffer::TextBuffer,
-    text_length,
 };
 
 #[cfg(test)]
@@ -268,18 +268,12 @@ impl<'a> MultiLineEditor<'a> {
 
     fn cursor_visible_col(&self) -> usize {
         let line = self.current_line();
-        text_length(
-            &line.chars().take(self.buffer.col()).collect::<String>(),
-            false,
-        )
+        cursor_visible_col(&line, self.buffer.col())
     }
 
     fn cursor_wraps_at_boundary(&self) -> bool {
         let line = self.current_line();
-        line.chars()
-            .take(self.buffer.col())
-            .last()
-            .is_some_and(|ch| text_length(&ch.to_string(), false) > 1)
+        cursor_wraps_at_boundary(&line, self.buffer.col())
     }
 
     fn finish_line(&self) -> io::Result<()> {
