@@ -197,152 +197,45 @@ fn count_matches(haystack: &str, needle: &str) -> usize {
     haystack.match_indices(needle).count()
 }
 
-#[derive(Debug)]
 struct VtScreen {
-    rows: usize,
-    cols: usize,
+    parser: vt100::Parser,
+    cols: u16,
     row: usize,
     col: usize,
-    wrap_next: bool,
-    cells: Vec<Vec<char>>,
 }
 
 impl VtScreen {
-    fn new(size: PtySize) -> Self {
-        let rows = size.rows as usize;
-        let cols = size.cols as usize;
-        Self {
-            rows,
-            cols,
-            row: 0,
-            col: 0,
-            wrap_next: false,
-            cells: vec![vec![' '; cols]; rows],
-        }
-    }
-
     fn parse(size: PtySize, transcript: &str) -> Self {
-        let mut screen = Self::new(size);
-        let mut chars = transcript.chars().peekable();
-
-        while let Some(ch) = chars.next() {
-            match ch {
-                '\x1b' if chars.peek() == Some(&'[') => {
-                    chars.next();
-                    let mut csi = String::new();
-                    for next in chars.by_ref() {
-                        csi.push(next);
-                        if ('@'..='~').contains(&next) {
-                            break;
-                        }
-                    }
-                    screen.apply_csi(&csi);
-                }
-                '\r' => {
-                    screen.col = 0;
-                    screen.wrap_next = false;
-                }
-                '\n' => {
-                    screen.wrap_next = false;
-                    screen.line_feed();
-                }
-                '\x08' => {
-                    screen.col = screen.col.saturating_sub(1);
-                    screen.wrap_next = false;
-                }
-                ch if ch.is_control() => {}
-                ch => screen.put(ch),
-            }
-        }
-
-        screen
-    }
-
-    fn apply_csi(&mut self, csi: &str) {
-        let Some(command) = csi.chars().last() else {
-            return;
-        };
-        let params = &csi[..csi.len().saturating_sub(command.len_utf8())];
-        let first_param = || {
-            params
-                .split(';')
-                .find_map(|param| param.parse::<usize>().ok())
-                .unwrap_or(1)
-        };
-
-        match command {
-            'A' => self.row = self.row.saturating_sub(first_param()),
-            'B' => self.row = (self.row + first_param()).min(self.rows - 1),
-            'C' => self.col = (self.col + first_param()).min(self.cols - 1),
-            'G' => self.col = first_param().saturating_sub(1).min(self.cols - 1),
-            'H' | 'f' => {
-                let mut parts = params.split(';');
-                let row = parts
-                    .next()
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .unwrap_or(1);
-                let col = parts
-                    .next()
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .unwrap_or(1);
-                self.row = row.saturating_sub(1).min(self.rows - 1);
-                self.col = col.saturating_sub(1).min(self.cols - 1);
-            }
-            'K' => self.clear_line(params),
-            'm' | '?' | 'h' | 'l' => {}
-            _ => {}
-        }
-        if !matches!(command, 'm' | '?' | 'h' | 'l') {
-            self.wrap_next = false;
-        }
-    }
-
-    fn clear_line(&mut self, params: &str) {
-        match params.parse::<usize>().unwrap_or(0) {
-            1 => {
-                for col in 0..=self.col {
-                    self.cells[self.row][col] = ' ';
-                }
-            }
-            2 => self.cells[self.row].fill(' '),
-            _ => {
-                for col in self.col..self.cols {
-                    self.cells[self.row][col] = ' ';
-                }
-            }
-        }
-    }
-
-    fn put(&mut self, ch: char) {
-        if self.wrap_next {
-            self.col = 0;
-            self.line_feed();
-            self.wrap_next = false;
-        }
-        self.cells[self.row][self.col] = ch;
-        if self.col + 1 >= self.cols {
-            self.wrap_next = true;
-        } else {
-            self.col += 1;
-        }
-    }
-
-    fn line_feed(&mut self) {
-        if self.row + 1 >= self.rows {
-            self.cells.remove(0);
-            self.cells.push(vec![' '; self.cols]);
-        } else {
-            self.row += 1;
+        let mut parser = vt100::Parser::new(size.rows, size.cols, 0);
+        parser.process(transcript.as_bytes());
+        let (row, col) = parser.screen().cursor_position();
+        Self {
+            parser,
+            cols: size.cols,
+            row: row.into(),
+            col: col.into(),
         }
     }
 
     fn text(&self) -> String {
-        self.cells
-            .iter()
-            .map(|row| row.iter().collect::<String>().trim_end().to_string())
+        self.parser
+            .screen()
+            .rows(0, self.cols)
+            .map(|row| row.trim_end().to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }
+
+    fn cursor_cell_is_wide_continuation(&self) -> bool {
+        self.parser
+            .screen()
+            .cell(self.row as u16, self.col as u16)
+            .is_some_and(vt100::Cell::is_wide_continuation)
+    }
+}
+
+fn test_text_width(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
 }
 
 fn pty_test_lock() -> MutexGuard<'static, ()> {
@@ -712,6 +605,186 @@ fn shell_input_cursor_moves_after_inserted_character() -> io::Result<()> {
         (screen.row, screen.col),
         (line_index, expected_col),
         "cursor should be after the inserted character:\n{text}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for("Interrupted. Type /exit to exit the shell.")?;
+    shell.exit()
+}
+
+#[test]
+fn shell_input_cursor_moves_after_wide_character() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let size = PtySize {
+        rows: 24,
+        cols: 100,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let mut shell = PtyShell::start_with_size(size)?;
+
+    let offset = shell.transcript_len();
+    shell.write("界")?;
+    shell.wait_for_after(offset, "界")?;
+
+    let screen = VtScreen::parse(size, &shell.transcript_string());
+    let text = screen.text();
+    let line_index = text
+        .lines()
+        .position(|line| line.contains("> 界"))
+        .ok_or_else(|| io::Error::other(format!("prompt line was not rendered:\n{text}")))?;
+    let prompt_line = text
+        .lines()
+        .nth(line_index)
+        .ok_or_else(|| io::Error::other(format!("prompt line disappeared:\n{text}")))?;
+    let marker_index = prompt_line
+        .find("> 界")
+        .ok_or_else(|| io::Error::other(format!("prompt line did not contain input:\n{text}")))?;
+    let expected_col = test_text_width(&prompt_line[..marker_index]) + test_text_width("> 界");
+
+    assert_eq!(
+        (screen.row, screen.col),
+        (line_index, expected_col),
+        "cursor should be after the wide inserted character:\n{text}"
+    );
+    assert!(
+        !screen.cursor_cell_is_wide_continuation(),
+        "cursor should not be on the trailing cell of a wide character:\n{text}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for("Interrupted. Type /exit to exit the shell.")?;
+    shell.exit()
+}
+
+#[test]
+fn wrapped_emoji_shell_input_cursor_stays_after_last_emoji() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let size = narrow_pty_size();
+    let mut shell = PtyShell::start_with_size(size)?;
+
+    let emoji_input = "🤿".repeat(20);
+    let offset = shell.transcript_len();
+    shell.write(&emoji_input)?;
+    let rendered_suffix = "🤿".repeat(12);
+    shell.wait_until_after(offset, |tail| tail.contains(&rendered_suffix))?;
+
+    let screen = VtScreen::parse(size, &shell.transcript_string());
+    let text = screen.text();
+    let prompt_line_index = text
+        .lines()
+        .position(|line| line.contains("> 🤿"))
+        .ok_or_else(|| io::Error::other(format!("prompt line was not rendered:\n{text}")))?;
+    let prompt_line = text
+        .lines()
+        .nth(prompt_line_index)
+        .ok_or_else(|| io::Error::other(format!("prompt line disappeared:\n{text}")))?;
+    let input_start = prompt_line
+        .find("🤿")
+        .ok_or_else(|| io::Error::other(format!("prompt line did not contain emoji:\n{text}")))?;
+    let prompt_width = test_text_width(&prompt_line[..input_start]);
+    let total_width = prompt_width + test_text_width(&emoji_input);
+    let expected_row = prompt_line_index + (total_width / size.cols as usize);
+    let expected_col = total_width % size.cols as usize;
+
+    assert_eq!(
+        (screen.row, screen.col),
+        (expected_row, expected_col),
+        "cursor should be after the final wrapped emoji:\n{text}"
+    );
+    assert!(
+        !screen.cursor_cell_is_wide_continuation(),
+        "cursor should not be on the trailing cell of a wide emoji:\n{text}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for("Interrupted. Type /exit to exit the shell.")?;
+    shell.exit()
+}
+
+#[test]
+fn wrapped_emoji_shell_input_cursor_moves_to_next_row_after_terminal_edge() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let size = narrow_pty_size();
+    let mut shell = PtyShell::start_with_size(size)?;
+
+    let initial_screen = VtScreen::parse(size, &shell.transcript_string());
+    let initial_text = initial_screen.text();
+    let prompt_line = initial_text
+        .lines()
+        .find(|line| line.contains("theseus-shell>"))
+        .ok_or_else(|| {
+            io::Error::other(format!("prompt line was not rendered:\n{initial_text}"))
+        })?;
+    let prompt_width = test_text_width(prompt_line) + 1;
+    let remaining_cols = size.cols as usize - prompt_width;
+    assert_eq!(
+        remaining_cols % test_text_width("🤿"),
+        0,
+        "test setup should leave an even number of columns for wide emoji:\n{initial_text}"
+    );
+    let emoji_input = "🤿".repeat(remaining_cols / test_text_width("🤿"));
+    let offset = shell.transcript_len();
+    shell.write(&emoji_input)?;
+    shell.wait_for_after(offset, &emoji_input)?;
+
+    let screen = VtScreen::parse(size, &shell.transcript_string());
+    let text = screen.text();
+    let prompt_line_index = text
+        .lines()
+        .position(|line| line.contains("> 🤿"))
+        .ok_or_else(|| io::Error::other(format!("prompt line was not rendered:\n{text}")))?;
+    let prompt_line = text
+        .lines()
+        .nth(prompt_line_index)
+        .ok_or_else(|| io::Error::other(format!("prompt line disappeared:\n{text}")))?;
+    let input_start = prompt_line
+        .find("🤿")
+        .ok_or_else(|| io::Error::other(format!("prompt line did not contain emoji:\n{text}")))?;
+    let prompt_width = test_text_width(&prompt_line[..input_start]);
+    let total_width = prompt_width + test_text_width(&emoji_input);
+    assert_eq!(
+        total_width, size.cols as usize,
+        "test setup should end exactly at the terminal edge:\n{text}"
+    );
+
+    assert_eq!(
+        (screen.row, screen.col),
+        (prompt_line_index + 1, 0),
+        "cursor should move after the final emoji at the terminal edge:\n{text}"
+    );
+    assert!(
+        !screen.cursor_cell_is_wide_continuation(),
+        "cursor should not be on the trailing cell of the final emoji:\n{text}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for("Interrupted. Type /exit to exit the shell.")?;
+    shell.exit()
+}
+
+#[test]
+fn wrapped_wide_shell_input_does_not_erase_previous_output_row() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let size = compact_pty_size();
+    let mut shell = PtyShell::start_with_size(size)?;
+
+    let initial_screen = VtScreen::parse(size, &shell.transcript_string()).text();
+    assert!(
+        initial_screen.contains("╰"),
+        "test setup did not render the welcome box bottom border:\n{initial_screen}"
+    );
+
+    let offset = shell.transcript_len();
+    let long_input = format!("/ask {}", "界".repeat(30));
+    shell.write(&long_input)?;
+    let wrapped_prefix = "界".repeat(20);
+    shell.wait_until_after(offset, |tail| tail.contains(&wrapped_prefix))?;
+
+    let screen = VtScreen::parse(size, &shell.transcript_string()).text();
+    assert!(
+        screen.contains("╰"),
+        "wrapped wide input erased the welcome box bottom border:\n{screen}"
     );
 
     shell.write("\u{3}")?;

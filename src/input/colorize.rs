@@ -1,3 +1,5 @@
+use unicode_width::UnicodeWidthStr;
+
 pub fn colorize_nested(text: &str) -> String {
     let mut stack: Vec<String> = Vec::new();
     let mut codes: Vec<&'static str> = Vec::new();
@@ -96,7 +98,7 @@ pub fn text_length(text: &str, has_tags: bool) -> usize {
         text.to_string()
     };
 
-    strip_ansi_codes(&visible_text).chars().count()
+    UnicodeWidthStr::width(strip_ansi_codes(&visible_text).as_str())
 }
 
 struct Tag {
@@ -174,6 +176,13 @@ mod tests {
     #[test]
     fn strips_tags_for_length() {
         assert_eq!(text_length("<bold>hello</bold>", true), 5);
+    }
+
+    #[test]
+    fn text_length_uses_terminal_column_width() {
+        assert_eq!(text_length("a界b", false), 4);
+        assert_eq!(text_length("a🙂b", false), 4);
+        assert_eq!(text_length("\x1b[32m界\x1b[0m", false), 2);
     }
 
     #[test]

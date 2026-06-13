@@ -10,10 +10,13 @@ use crossterm::{
 use super::{
     colorize_tag,
     completion::{CompletionState, completion_state, path_completion_state, token_before_cursor},
-    editor_render::{EditorLine, RenderLayout, render_editor_lines, render_layout_for_lines},
+    editor_render::{
+        EditorLine, RenderLayout, render_editor_lines, render_layout_for_lines_with_cursor_wrap,
+    },
     is_alt_key, is_command_key, is_key_press, is_plain_text_key,
     raw_mode::RawModeGuard,
     text_buffer::TextBuffer,
+    text_length,
 };
 use crate::commands::slash_commands;
 
@@ -231,11 +234,12 @@ impl<'a> CommandEditor<'a> {
     }
 
     fn render_layout_for_columns(&self, columns: usize) -> RenderLayout {
-        render_layout_for_lines(
+        render_layout_for_lines_with_cursor_wrap(
             &self.render_lines(),
             self.buffer.row(),
-            self.buffer.col(),
+            self.cursor_visible_col(),
             columns,
+            self.cursor_wraps_at_boundary(),
         )
     }
 
@@ -251,10 +255,26 @@ impl<'a> CommandEditor<'a> {
                 EditorLine::with_visible_len(
                     self.prompt_for_row(index),
                     rendered_line,
-                    line.chars().count(),
+                    text_length(&line, false),
                 )
             })
             .collect()
+    }
+
+    fn cursor_visible_col(&self) -> usize {
+        let line = self.current_line();
+        text_length(
+            &line.chars().take(self.buffer.col()).collect::<String>(),
+            false,
+        )
+    }
+
+    fn cursor_wraps_at_boundary(&self) -> bool {
+        let line = self.current_line();
+        line.chars()
+            .take(self.buffer.col())
+            .last()
+            .is_some_and(|ch| text_length(&ch.to_string(), false) > 1)
     }
 
     fn finish_line(&self) -> io::Result<()> {

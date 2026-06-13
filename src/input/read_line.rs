@@ -11,7 +11,8 @@ use super::{
     colorize_tag,
     completion::{CompletionState, completion_state, token_before_cursor},
     editor_render::{
-        EditorLine, RenderLayout, render_editor_lines, render_layout_for_lines, wrapped_rows,
+        EditorLine, RenderLayout, render_editor_lines, render_layout_for_lines_with_cursor_wrap,
+        wrapped_rows,
     },
     is_alt_key, is_command_key, is_key_press, is_plain_text_key,
     line_buffer::LineBuffer,
@@ -372,7 +373,13 @@ impl<'a> LineEditor<'a> {
             .ok()
             .map(|(columns, _)| columns.max(1) as usize)
             .unwrap_or(80);
-        render_layout_for_lines(&self.render_lines(), 0, self.line.cursor(), columns)
+        render_layout_for_lines_with_cursor_wrap(
+            &self.render_lines(),
+            0,
+            self.cursor_visible_col(),
+            columns,
+            self.cursor_wraps_at_boundary(),
+        )
     }
 
     fn render_lines(&self) -> Vec<EditorLine<'_>> {
@@ -380,8 +387,24 @@ impl<'a> LineEditor<'a> {
         vec![EditorLine::with_visible_len(
             self.prompt,
             highlighted_input(&line),
-            line.chars().count(),
+            text_length(&line, false),
         )]
+    }
+
+    fn cursor_visible_col(&self) -> usize {
+        let line = self.current_line();
+        text_length(
+            &line.chars().take(self.line.cursor()).collect::<String>(),
+            false,
+        )
+    }
+
+    fn cursor_wraps_at_boundary(&self) -> bool {
+        let line = self.current_line();
+        line.chars()
+            .take(self.line.cursor())
+            .last()
+            .is_some_and(|ch| text_length(&ch.to_string(), false) > 1)
     }
 
     fn finish_line(&self) -> io::Result<()> {
@@ -563,6 +586,7 @@ fn masked_render_layout_for_columns(
         rows: rows as u16,
         cursor_row: (total_len / columns) as u16,
         cursor_col: (total_len % columns) as u16,
+        cursor_wraps_at_boundary: false,
     }
 }
 

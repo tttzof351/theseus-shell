@@ -22,3 +22,7 @@ syntect = "5.3.0"
 termimad = "0.34"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "time"] }
+unicode-width = "0.2.2"
+
+[dev-dependencies]
+vt100 = "0.16.2"
