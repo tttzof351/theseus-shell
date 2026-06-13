@@ -458,10 +458,10 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_rows_includes_terminal_wrap_row() {
+    fn wrapped_rows_uses_pending_terminal_wrap() {
         assert_eq!(wrapped_rows(0, 10), 1);
         assert_eq!(wrapped_rows(9, 10), 1);
-        assert_eq!(wrapped_rows(10, 10), 2);
+        assert_eq!(wrapped_rows(10, 10), 1);
         assert_eq!(wrapped_rows(21, 10), 3);
     }
 
@@ -477,8 +477,8 @@ mod tests {
 
         let layout = editor.render_layout_for_columns(10);
 
-        assert_eq!(layout.rows, 4);
-        assert_eq!(layout.cursor_row, 2);
+        assert_eq!(layout.rows, 3);
+        assert_eq!(layout.cursor_row, 1);
         assert_eq!(layout.cursor_col, 6);
     }
 

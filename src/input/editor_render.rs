@@ -65,11 +65,12 @@ pub(crate) fn render_layout_for_lines(
         .map(|line| line.prompt)
         .unwrap_or_default();
     let cursor_len = text_length(cursor_prompt, false) + cursor_col;
+    let (cursor_wrap_row, cursor_wrap_col) = wrapped_cursor(cursor_len, columns);
 
     RenderLayout {
         rows: total_rows.max(1) as u16,
-        cursor_row: (rows_before_cursor + cursor_len / columns) as u16,
-        cursor_col: (cursor_len % columns) as u16,
+        cursor_row: (rows_before_cursor + cursor_wrap_row) as u16,
+        cursor_col: cursor_wrap_col as u16,
     }
 }
 
@@ -80,6 +81,13 @@ pub(crate) fn render_editor_lines(
     rendered_rows: u16,
     rendered_cursor_row: u16,
 ) -> io::Result<()> {
+    let added_rows = layout.rows.saturating_sub(rendered_rows);
+    for _ in 0..added_rows {
+        write!(stdout, "\r\n")?;
+    }
+    let rendered_rows = rendered_rows.saturating_add(added_rows);
+    let rendered_cursor_row = rendered_cursor_row.saturating_add(added_rows);
+
     if rendered_cursor_row > 0 {
         execute!(stdout, MoveUp(rendered_cursor_row))?;
     }
@@ -115,7 +123,21 @@ pub(crate) fn render_editor_lines(
 }
 
 pub(crate) fn wrapped_rows(visible_len: usize, columns: usize) -> usize {
-    visible_len / columns.max(1) + 1
+    let columns = columns.max(1);
+    if visible_len == 0 {
+        1
+    } else {
+        (visible_len - 1) / columns + 1
+    }
+}
+
+fn wrapped_cursor(visible_len: usize, columns: usize) -> (usize, usize) {
+    let columns = columns.max(1);
+    if visible_len > 0 && visible_len.is_multiple_of(columns) {
+        ((visible_len - 1) / columns, (visible_len - 1) % columns)
+    } else {
+        (visible_len / columns, visible_len % columns)
+    }
 }
 
 #[cfg(test)]
@@ -123,10 +145,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wrapped_rows_includes_terminal_wrap_row() {
+    fn wrapped_rows_uses_pending_terminal_wrap() {
         assert_eq!(wrapped_rows(0, 10), 1);
         assert_eq!(wrapped_rows(9, 10), 1);
-        assert_eq!(wrapped_rows(10, 10), 2);
+        assert_eq!(wrapped_rows(10, 10), 1);
         assert_eq!(wrapped_rows(21, 10), 3);
     }
 

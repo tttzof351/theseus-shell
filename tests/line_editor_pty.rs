@@ -197,6 +197,154 @@ fn count_matches(haystack: &str, needle: &str) -> usize {
     haystack.match_indices(needle).count()
 }
 
+#[derive(Debug)]
+struct VtScreen {
+    rows: usize,
+    cols: usize,
+    row: usize,
+    col: usize,
+    wrap_next: bool,
+    cells: Vec<Vec<char>>,
+}
+
+impl VtScreen {
+    fn new(size: PtySize) -> Self {
+        let rows = size.rows as usize;
+        let cols = size.cols as usize;
+        Self {
+            rows,
+            cols,
+            row: 0,
+            col: 0,
+            wrap_next: false,
+            cells: vec![vec![' '; cols]; rows],
+        }
+    }
+
+    fn parse(size: PtySize, transcript: &str) -> Self {
+        let mut screen = Self::new(size);
+        let mut chars = transcript.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\x1b' if chars.peek() == Some(&'[') => {
+                    chars.next();
+                    let mut csi = String::new();
+                    for next in chars.by_ref() {
+                        csi.push(next);
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                    screen.apply_csi(&csi);
+                }
+                '\r' => {
+                    screen.col = 0;
+                    screen.wrap_next = false;
+                }
+                '\n' => {
+                    screen.wrap_next = false;
+                    screen.line_feed();
+                }
+                '\x08' => {
+                    screen.col = screen.col.saturating_sub(1);
+                    screen.wrap_next = false;
+                }
+                ch if ch.is_control() => {}
+                ch => screen.put(ch),
+            }
+        }
+
+        screen
+    }
+
+    fn apply_csi(&mut self, csi: &str) {
+        let Some(command) = csi.chars().last() else {
+            return;
+        };
+        let params = &csi[..csi.len().saturating_sub(command.len_utf8())];
+        let first_param = || {
+            params
+                .split(';')
+                .find_map(|param| param.parse::<usize>().ok())
+                .unwrap_or(1)
+        };
+
+        match command {
+            'A' => self.row = self.row.saturating_sub(first_param()),
+            'B' => self.row = (self.row + first_param()).min(self.rows - 1),
+            'C' => self.col = (self.col + first_param()).min(self.cols - 1),
+            'G' => self.col = first_param().saturating_sub(1).min(self.cols - 1),
+            'H' | 'f' => {
+                let mut parts = params.split(';');
+                let row = parts
+                    .next()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(1);
+                let col = parts
+                    .next()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(1);
+                self.row = row.saturating_sub(1).min(self.rows - 1);
+                self.col = col.saturating_sub(1).min(self.cols - 1);
+            }
+            'K' => self.clear_line(params),
+            'm' | '?' | 'h' | 'l' => {}
+            _ => {}
+        }
+        if !matches!(command, 'm' | '?' | 'h' | 'l') {
+            self.wrap_next = false;
+        }
+    }
+
+    fn clear_line(&mut self, params: &str) {
+        match params.parse::<usize>().unwrap_or(0) {
+            1 => {
+                for col in 0..=self.col {
+                    self.cells[self.row][col] = ' ';
+                }
+            }
+            2 => self.cells[self.row].fill(' '),
+            _ => {
+                for col in self.col..self.cols {
+                    self.cells[self.row][col] = ' ';
+                }
+            }
+        }
+    }
+
+    fn put(&mut self, ch: char) {
+        if self.wrap_next {
+            self.col = 0;
+            self.line_feed();
+            self.wrap_next = false;
+        }
+        self.cells[self.row][self.col] = ch;
+        if self.col + 1 >= self.cols {
+            self.wrap_next = true;
+        } else {
+            self.col += 1;
+        }
+    }
+
+    fn line_feed(&mut self) {
+        if self.row + 1 >= self.rows {
+            self.cells.remove(0);
+            self.cells.push(vec![' '; self.cols]);
+        } else {
+            self.row += 1;
+        }
+    }
+
+    fn text(&self) -> String {
+        self.cells
+            .iter()
+            .map(|row| row.iter().collect::<String>().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 fn pty_test_lock() -> MutexGuard<'static, ()> {
     PTY_TEST_LOCK.lock().unwrap()
 }
@@ -205,6 +353,15 @@ fn narrow_pty_size() -> PtySize {
     PtySize {
         rows: 24,
         cols: 34,
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+fn compact_pty_size() -> PtySize {
+    PtySize {
+        rows: 16,
+        cols: 60,
         pixel_width: 0,
         pixel_height: 0,
     }
@@ -489,6 +646,76 @@ fn wrapped_first_line_keeps_continuation_prompt_on_next_logical_line() -> io::Re
             && count_matches(tail, "WRAPPED_CONTINUATION_OK") >= 2
     })?;
 
+    shell.exit()
+}
+
+#[test]
+fn wrapped_shell_input_does_not_erase_previous_output_row() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let size = compact_pty_size();
+    let mut shell = PtyShell::start_with_size(size)?;
+
+    let initial_screen = VtScreen::parse(size, &shell.transcript_string()).text();
+    assert!(
+        initial_screen.contains("╰"),
+        "test setup did not render the welcome box bottom border:\n{initial_screen}"
+    );
+
+    let offset = shell.transcript_len();
+    let long_input = format!("/ask {}", "x".repeat(160));
+    shell.write(&long_input)?;
+    let wrapped_prefix = "x".repeat(130);
+    shell.wait_until_after(offset, |tail| tail.contains(&wrapped_prefix))?;
+
+    let screen = VtScreen::parse(size, &shell.transcript_string()).text();
+    assert!(
+        screen.contains("╰"),
+        "wrapped input erased the welcome box bottom border:\n{screen}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for("Interrupted. Type /exit to exit the shell.")?;
+    shell.exit()
+}
+
+#[test]
+fn shell_input_cursor_moves_after_inserted_character() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let size = PtySize {
+        rows: 24,
+        cols: 100,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let mut shell = PtyShell::start_with_size(size)?;
+
+    let offset = shell.transcript_len();
+    shell.write("a")?;
+    shell.wait_for_after(offset, "> a")?;
+
+    let screen = VtScreen::parse(size, &shell.transcript_string());
+    let text = screen.text();
+    let line_index = text
+        .lines()
+        .position(|line| line.contains("> a"))
+        .ok_or_else(|| io::Error::other(format!("prompt line was not rendered:\n{text}")))?;
+    let prompt_line = text
+        .lines()
+        .nth(line_index)
+        .ok_or_else(|| io::Error::other(format!("prompt line disappeared:\n{text}")))?;
+    let expected_col = prompt_line
+        .find("> a")
+        .map(|index| index + "> a".chars().count())
+        .ok_or_else(|| io::Error::other(format!("prompt line did not contain input:\n{text}")))?;
+
+    assert_eq!(
+        (screen.row, screen.col),
+        (line_index, expected_col),
+        "cursor should be after the inserted character:\n{text}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for("Interrupted. Type /exit to exit the shell.")?;
     shell.exit()
 }
 

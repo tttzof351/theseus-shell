@@ -712,10 +712,10 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_rows_includes_terminal_wrap_row() {
+    fn wrapped_rows_uses_pending_terminal_wrap() {
         assert_eq!(wrapped_rows(0, 10), 1);
         assert_eq!(wrapped_rows(9, 10), 1);
-        assert_eq!(wrapped_rows(10, 10), 2);
+        assert_eq!(wrapped_rows(10, 10), 1);
         assert_eq!(wrapped_rows(21, 10), 3);
     }
 
