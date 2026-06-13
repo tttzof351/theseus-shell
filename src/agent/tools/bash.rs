@@ -19,7 +19,10 @@ use crate::{
         text::{TruncatePosition, truncate_utf8_to_bytes},
         tmp_files::create_tmp_log_file,
     },
+    input::highlight_shell_command_with_palette,
 };
+
+const SHELL_CONTINUATION_PROMPT: &str = "> ";
 
 pub(super) struct BashTool;
 
@@ -50,7 +53,7 @@ impl AgentTool for BashTool {
 
     fn execute(&self, arguments: &Value, context: &AgentRunContext) -> io::Result<ToolOutput> {
         let command = string_arg(arguments, "command")?;
-        println!("{}{}", context.shell_prompt, command);
+        print!("{}", format_bash_command_preview(command, context));
         io::stdout().flush()?;
 
         let output = run_agent_shell_command(command, context)?;
@@ -67,6 +70,21 @@ impl AgentTool for BashTool {
             truncated
         )))
     }
+}
+
+fn format_bash_command_preview(command: &str, context: &AgentRunContext) -> String {
+    let highlighted = highlight_shell_command_with_palette(command, &context.shell_highlight);
+    let mut result = String::new();
+    for (index, line) in highlighted.iter().enumerate() {
+        if index == 0 {
+            result.push_str(&context.shell_prompt);
+        } else {
+            result.push_str(SHELL_CONTINUATION_PROMPT);
+        }
+        result.push_str(line);
+        result.push('\n');
+    }
+    result
 }
 
 fn bash_description(availability: SearchToolAvailability) -> String {
@@ -315,6 +333,27 @@ mod tests {
             "abcdefghijABCDEFGHIJ"
         );
         let _ = fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn bash_command_preview_uses_shell_highlighting() {
+        let mut context = AgentRunContext {
+            shell_prompt: "euclid theseus-shell> ".to_string(),
+            ..Default::default()
+        };
+        context.shell_highlight.insert(
+            "operator".to_string(),
+            Some(crate::input::ShellHighlightStyle::single("yellow")),
+        );
+
+        let preview =
+            format_bash_command_preview("find . -type f 2>/dev/null | grep -v total", &context);
+
+        assert_eq!(
+            crate::input::strip_ansi_codes(&preview),
+            "euclid theseus-shell> find . -type f 2>/dev/null | grep -v total\n"
+        );
+        assert!(preview.contains("\x1b[33m|\x1b[0m"));
     }
 
     fn test_context() -> AgentRunContext {

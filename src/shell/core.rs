@@ -276,6 +276,12 @@ impl TheseusShell {
             AgentRunContext {
                 shell: self.config.executable.clone(),
                 shell_prompt: self.config.prompt.clone(),
+                shell_highlight: self
+                    .config
+                    .agent_config
+                    .as_ref()
+                    .map(|config| config.shell_settings.shell_highlight.clone())
+                    .unwrap_or_default(),
                 env_vars: self.config.env_vars.clone(),
                 working_dir: self.config.working_dir.clone(),
                 last_shell_command,

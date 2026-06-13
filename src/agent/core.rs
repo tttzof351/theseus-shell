@@ -9,7 +9,10 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::logging::AppLogger;
+use crate::{
+    input::{ShellHighlightPalette, default_shell_highlight_palette},
+    logging::AppLogger,
+};
 
 use super::{
     AgentConfig, config::ImageInputSettings, mcp::McpManager, messages::ChatMessage,
@@ -47,6 +50,7 @@ pub struct Agent {
 pub struct AgentRunContext {
     pub shell: PathBuf,
     pub shell_prompt: String,
+    pub shell_highlight: ShellHighlightPalette,
     pub env_vars: Vec<(String, String)>,
     pub working_dir: Option<PathBuf>,
     pub last_shell_command: Option<ShellCommandContext>,
@@ -218,6 +222,7 @@ impl Default for AgentRunContext {
         Self {
             shell: default_shell(),
             shell_prompt: String::new(),
+            shell_highlight: default_shell_highlight_palette(),
             env_vars: Vec::new(),
             working_dir: None,
             last_shell_command: None,
