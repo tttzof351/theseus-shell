@@ -115,9 +115,15 @@ impl TextBuffer {
     }
 
     pub(crate) fn insert_text(&mut self, text: &str) {
-        for ch in text.chars() {
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
             match ch {
-                '\r' => {}
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    self.split_line();
+                }
                 '\n' => self.split_line(),
                 ch => self.insert_char(ch),
             }
@@ -264,6 +270,17 @@ mod tests {
         assert_eq!(buffer.text(), "echo \\\n \"test\"");
         assert_eq!(buffer.row(), 1);
         assert_eq!(buffer.col(), " \"test\"".chars().count());
+    }
+
+    #[test]
+    fn inserts_text_and_normalizes_carriage_return_newlines() {
+        let mut buffer = TextBuffer::new();
+
+        buffer.insert_text("one\rtwo\r\nthree\nfour");
+
+        assert_eq!(buffer.text(), "one\ntwo\nthree\nfour");
+        assert_eq!(buffer.row(), 3);
+        assert_eq!(buffer.col(), "four".chars().count());
     }
 
     #[test]

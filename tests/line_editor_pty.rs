@@ -461,6 +461,73 @@ fn bracketed_paste_renders_multiline_command_before_submit() -> io::Result<()> {
 }
 
 #[test]
+fn shell_editor_bracketed_paste_preserves_physical_newlines() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let size = PtySize {
+        rows: 30,
+        cols: 180,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let mut shell = PtyShell::start_with_size(size)?;
+
+    let command = concat!(
+        "USER_ID=42\r",
+        "curl -sS https://jsonplaceholder.typicode.com/posts \\\r",
+        "    -X POST \\\r",
+        "    -H \"Content-Type: application/json\" \\\r",
+        "    --data-binary @- <<JSON\r",
+        "{\r",
+        "  \"userId\": $USER_ID,\r",
+        "  \"title\":  \"hello from $USER_ID\",\r",
+        "  \"body\":   \"raw \\$NOT_EXPANDED but \\$USER_ID works\"\r",
+        "}\r",
+        "JSON",
+    );
+
+    shell.write("/shell\r")?;
+    shell.wait_for("Enter multiline shell command")?;
+
+    let offset = shell.transcript_len();
+    shell.write(BRACKETED_PASTE_START)?;
+    shell.write(command)?;
+    shell.write(BRACKETED_PASTE_END)?;
+    shell.wait_until_after(offset, |tail| {
+        let visible = strip_ansi_codes(tail);
+        visible.contains("JSON")
+            && (visible.contains("raw \\$NOT_EXPANDED but \\$USER_ID works")
+                || visible.contains("raw $NOT_EXPANDED but $USER_ID works"))
+    })?;
+
+    let screen = VtScreen::parse(size, &shell.transcript_string()).text();
+
+    assert!(
+        screen.contains(&multiline_prefix_text("USER_ID=42")),
+        "multiline /shell paste should render the first pasted line as its own editor row:\n{screen}"
+    );
+    assert!(
+        screen.contains(&multiline_prefix_text(
+            "curl -sS https://jsonplaceholder.typicode.com/posts \\"
+        )),
+        "multiline /shell paste should preserve the curl row after the first newline:\n{screen}"
+    );
+    assert!(
+        screen.contains(&multiline_prefix_text(
+            "    -H \"Content-Type: application/json\" \\"
+        )),
+        "multiline /shell paste should preserve indented continuation rows:\n{screen}"
+    );
+    assert!(
+        !screen.contains("USER_ID=42curl"),
+        "multiline /shell paste collapsed physical newlines into a single row:\n{screen}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Shell cancelled")?;
+    shell.exit()
+}
+
+#[test]
 fn bracketed_paste_output_without_trailing_newline_does_not_merge_with_prompt() -> io::Result<()> {
     let _lock = pty_test_lock();
     let mut shell = PtyShell::start()?;
