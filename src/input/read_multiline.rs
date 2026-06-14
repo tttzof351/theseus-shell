@@ -416,6 +416,13 @@ impl<'a> MultiLineEditor<'a> {
             .enumerate()
             .map(|(index, line)| {
                 let raw_text = line.iter().collect::<String>();
+                if self.history.is_browsing() {
+                    return EditorLine::new(
+                        &self.config.prefix,
+                        crate::input::colorize_tag("italic", &raw_text),
+                    );
+                }
+
                 let exit_word = self.config.exit_word.as_deref();
                 let is_exit_line = exit_word.is_some_and(|exit_word| raw_text.trim() == exit_word);
                 let text = if let Some(exit_word) = exit_word {
@@ -442,11 +449,6 @@ impl<'a> MultiLineEditor<'a> {
                         .get(index)
                         .cloned()
                         .unwrap_or(raw_text)
-                } else {
-                    text
-                };
-                let text = if self.history.is_browsing() {
-                    crate::input::colorize_tag("italic", &text)
                 } else {
                     text
                 };
@@ -1084,22 +1086,30 @@ mod tests {
 
     #[test]
     fn history_browsing_render_lines_are_italic_until_editing_is_accepted() {
-        let history = vec!["stored prompt".to_string()];
+        let history = vec!["echo \"$USER\"\n# comment".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
             history: &history,
             on_change: None,
+            render_mode: MultiLineRenderMode::Shell {
+                shell_highlight: None,
+            },
             ..MultiLineConfig::default()
         });
 
         editor.history_previous();
         let lines = editor.render_lines();
-        assert_eq!(lines[0].text, "\x1b[3mstored prompt\x1b[0m");
+        assert_eq!(lines[0].text, "\x1b[3mecho \"$USER\"\x1b[0m");
+        assert_eq!(lines[1].text, "\x1b[3m# comment\x1b[0m");
 
         editor.stop_history_navigation();
         let lines = editor.render_lines();
-        assert_eq!(lines[0].text, "stored prompt");
+        assert!(!lines[0].text.contains("\x1b[3m"));
+        assert!(
+            lines[0].text.contains("\x1b["),
+            "syntax highlighting should return after accepting browsing"
+        );
     }
 
     #[test]

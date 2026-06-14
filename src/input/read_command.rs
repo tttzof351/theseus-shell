@@ -490,7 +490,9 @@ impl<'a> CommandEditor<'a> {
         (0..self.buffer.lines_len())
             .map(|index| {
                 let line = self.line_text(index);
-                let rendered_line = if !highlighted_shell_lines.is_empty() {
+                let rendered_line = if self.history.is_browsing() {
+                    colorize_tag("italic", &line)
+                } else if !highlighted_shell_lines.is_empty() {
                     highlighted_shell_lines
                         .get(index)
                         .cloned()
@@ -499,11 +501,6 @@ impl<'a> CommandEditor<'a> {
                     highlighted_input(&line)
                 } else {
                     line.clone()
-                };
-                let rendered_line = if self.history.is_browsing() {
-                    colorize_tag("italic", &rendered_line)
-                } else {
-                    rendered_line
                 };
                 EditorLine::with_visible_len(
                     self.prompt_for_row(index),
@@ -1198,18 +1195,24 @@ mod tests {
 
     #[test]
     fn history_browsing_render_lines_are_italic_until_editing_is_accepted() {
-        let history = command_history(&["echo \\\n \"test\""]);
+        let history = command_history(&["echo \"$USER\" \\\n # comment"]);
         let mut editor = CommandEditor::new(config(&history));
 
         editor.history_previous();
         let lines = editor.render_lines();
         assert!(lines[0].text.contains("\x1b[3m"));
         assert!(lines[1].text.contains("\x1b[3m"));
+        assert_eq!(lines[0].text, "\x1b[3mecho \"$USER\" \\\x1b[0m");
+        assert_eq!(lines[1].text, "\x1b[3m # comment\x1b[0m");
 
         editor.accept_history_browsing();
         let lines = editor.render_lines();
         assert!(!lines[0].text.contains("\x1b[3m"));
         assert!(!lines[1].text.contains("\x1b[3m"));
+        assert!(
+            lines[0].text.contains("\x1b["),
+            "syntax highlighting should return after accepting browsing"
+        );
     }
 
     #[test]
