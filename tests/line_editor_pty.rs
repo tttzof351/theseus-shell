@@ -26,21 +26,41 @@ struct PtyShell {
 
 impl PtyShell {
     fn start() -> io::Result<Self> {
-        Self::start_with_size(PtySize {
-            rows: 24,
-            cols: 100,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
+        let home = temp_home()?;
+        Self::start_with_home_and_size(
+            home,
+            PtySize {
+                rows: 24,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+    }
+
+    fn start_with_home(home: PathBuf) -> io::Result<Self> {
+        Self::start_with_home_and_size(
+            home,
+            PtySize {
+                rows: 24,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
     }
 
     fn start_with_size(size: PtySize) -> io::Result<Self> {
+        let home = temp_home()?;
+        Self::start_with_home_and_size(home, size)
+    }
+
+    fn start_with_home_and_size(home: PathBuf, size: PtySize) -> io::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(size)
             .map_err(|err| io::Error::other(err.to_string()))?;
 
-        let home = temp_home()?;
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_theseus"));
         command.cwd(env!("CARGO_MANIFEST_DIR"));
         command.env("HOME", &home);
@@ -192,6 +212,12 @@ fn temp_home() -> io::Result<PathBuf> {
     ));
     fs::create_dir_all(&path)?;
     Ok(path)
+}
+
+fn command_history_path(home: &std::path::Path) -> PathBuf {
+    home.join(".theseus")
+        .join("persist")
+        .join("history_command.json")
 }
 
 fn count_matches(haystack: &str, needle: &str) -> usize {
@@ -658,27 +684,82 @@ fn shell_multiline_history_mode_recalls_previous_command() -> io::Result<()> {
 }
 
 #[test]
+fn shell_multiline_history_filters_non_shell_command_history_entries() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let home = temp_home()?;
+    let history_path = command_history_path(&home);
+    fs::create_dir_all(history_path.parent().unwrap())?;
+    fs::write(
+        &history_path,
+        r#"[
+  "printf SHELL_FILTER_OK",
+  "/ask explain this command",
+  "what is wrong with this code?"
+]
+"#,
+    )?;
+    let mut shell = PtyShell::start_with_home(home)?;
+
+    let offset = shell.transcript_len();
+    shell.write("/shell\r")?;
+    shell.wait_for_after(offset, "Enter multiline shell command")?;
+    shell.write(KEY_UP)?;
+    let transcript = shell.wait_until_after(offset, |tail| tail.contains("SHELL_FILTER_OK"))?;
+
+    assert!(
+        !transcript[offset..].contains("what is wrong with this code?"),
+        "/shell recalled an agent prompt from command history:\n{}",
+        &transcript[offset..]
+    );
+    assert!(
+        transcript[offset..].contains("SHELL_FILTER_OK"),
+        "/shell did not recall the shell command from command history:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Shell cancelled")?;
+    shell.exit()
+}
+
+#[test]
+fn shell_multiline_success_normalizes_draft_before_history_append() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    let offset = shell.transcript_len();
+    shell.write("/shell\r")?;
+    shell.wait_for_after(offset, "Enter multiline shell command")?;
+    shell.write("\rprintf SHELL_TRIM_DUP_OK\r/end\r")?;
+    shell.wait_for_after(offset, "SHELL_TRIM_DUP_OK")?;
+    shell.wait_for_after(offset, "theseus-shell")?;
+
+    let saved = fs::read_to_string(command_history_path(&shell.home))?;
+    assert_eq!(
+        count_matches(&saved, "SHELL_TRIM_DUP_OK"),
+        1,
+        "/shell submit stored both the raw draft and trimmed command:\n{saved}"
+    );
+
+    shell.exit()
+}
+
+#[test]
 fn shell_multiline_history_preserves_cancelled_draft() -> io::Result<()> {
     let _lock = pty_test_lock();
     let mut shell = PtyShell::start()?;
 
     shell.write("/shell\r")?;
     shell.wait_for("Enter multiline shell command")?;
-    shell.write("SHELL_CANCELLED_DRAFT_ONE\rSHELL_CANCELLED_DRAFT_TWO")?;
+    shell.write("printf '%s\\n' \\\r  SHELL_CANCELLED_DRAFT_TWO")?;
     shell.wait_for("SHELL_CANCELLED_DRAFT_TWO")?;
     let cancel_offset = shell.transcript_len();
     shell.write("\u{3}")?;
     shell.wait_for_after(cancel_offset, "Shell cancelled")?;
     shell.wait_for_after(cancel_offset, "theseus-shell")?;
-    let saved = fs::read_to_string(
-        shell
-            .home
-            .join(".theseus")
-            .join("persist")
-            .join("history_shell.json"),
-    )?;
+    let saved = fs::read_to_string(command_history_path(&shell.home))?;
     assert!(
-        saved.contains("SHELL_CANCELLED_DRAFT_ONE") && saved.contains("SHELL_CANCELLED_DRAFT_TWO"),
+        saved.contains("printf") && saved.contains("SHELL_CANCELLED_DRAFT_TWO"),
         "cancelled /shell draft was not persisted:\n{saved}"
     );
 
@@ -687,11 +768,11 @@ fn shell_multiline_history_preserves_cancelled_draft() -> io::Result<()> {
     shell.wait_for_after(offset, "Enter multiline shell command")?;
     shell.write(KEY_UP)?;
     let transcript = shell.wait_until_after(offset, |tail| {
-        tail.contains("SHELL_CANCELLED_DRAFT_ONE") && tail.contains("SHELL_CANCELLED_DRAFT_TWO")
+        tail.contains("printf") && tail.contains("SHELL_CANCELLED_DRAFT_TWO")
     })?;
 
     assert!(
-        transcript[offset..].contains("SHELL_CANCELLED_DRAFT_ONE")
+        transcript[offset..].contains("printf")
             && transcript[offset..].contains("SHELL_CANCELLED_DRAFT_TWO"),
         "Up did not recall the cancelled multiline /shell draft:\n{}",
         &transcript[offset..]

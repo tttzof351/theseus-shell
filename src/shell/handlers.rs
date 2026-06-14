@@ -345,23 +345,30 @@ impl TheseusShell {
             )
         );
 
-        let history = self.shell_history.clone();
-        let draft_slot = self.shell_history.len();
-        let shell_history_path = self.config.shell_history_path.clone();
+        // Keep the /shell history view focused on commands, even though it
+        // shares persistent storage with the regular command prompt.
+        let history: Vec<String> = self
+            .input_history
+            .iter()
+            .filter(|entry| self.is_shell_context_command(entry.trim()))
+            .cloned()
+            .collect();
+        let draft_slot = self.input_history.len();
+        let command_history_path = self.config.command_history_path.clone();
         let shell_highlight = self
             .config
             .agent_config
             .as_ref()
             .map(|config| &config.shell_settings.shell_highlight);
         let text = {
-            let shell_history = &mut self.shell_history;
+            let input_history = &mut self.input_history;
             match read_multi_line_input(MultiLineConfig {
                 prefix: "> ".to_string(),
                 exit_word: Some("/end".to_string()),
                 history: &history,
                 on_change: Some(Box::new(move |text| {
-                    update_string_history_draft(shell_history, draft_slot, text);
-                    save_shell_history(&shell_history_path, shell_history);
+                    update_string_history_draft(input_history, draft_slot, text);
+                    save_command_history(&command_history_path, input_history);
                 })),
                 render_mode: MultiLineRenderMode::Shell { shell_highlight },
                 completion_mode: MultiLineCompletionMode::Shell,
@@ -375,14 +382,19 @@ impl TheseusShell {
             }
         };
 
-        update_string_history_draft(&mut self.shell_history, draft_slot, &text);
-        self.save_shell_history();
         let command = text.trim();
         if command.is_empty() {
+            update_string_history_draft(&mut self.input_history, draft_slot, command);
+            self.save_input_history();
             *history_input = None;
             return Ok(CommandOutput::success(""));
         }
 
+        // The command is already the last entry of `input_history` thanks to
+        // the draft mechanism above; `store_input_history` will see the
+        // duplicate and skip the append.
+        update_string_history_draft(&mut self.input_history, draft_slot, command);
+        self.save_input_history();
         *history_input = Some(command.to_string());
         self.shell_command_output(command)
     }
@@ -396,8 +408,21 @@ impl TheseusShell {
         save_ask_history(&self.config.ask_history_path, &self.ask_history);
     }
 
-    fn save_shell_history(&self) {
-        save_shell_history(&self.config.shell_history_path, &self.shell_history);
+    pub(super) fn save_input_history(&self) {
+        let Some(path) = &self.config.command_history_path else {
+            return;
+        };
+
+        if let Err(err) = save_string_history(path, &self.input_history) {
+            self.log_event(
+                "error",
+                "command_history_save_failed",
+                serde_json::json!({
+                    "path": path,
+                    "error": err.to_string(),
+                }),
+            );
+        }
     }
 
     fn shell_command_output(&mut self, command: &str) -> io::Result<CommandOutput> {
@@ -449,8 +474,8 @@ fn save_ask_history(path: &Option<std::path::PathBuf>, history: &[String]) {
     save_string_history_to_path(path, history, "ask");
 }
 
-fn save_shell_history(path: &Option<std::path::PathBuf>, history: &[String]) {
-    save_string_history_to_path(path, history, "shell");
+fn save_command_history(path: &Option<std::path::PathBuf>, history: &[String]) {
+    save_string_history_to_path(path, history, "command");
 }
 
 fn save_string_history_to_path(path: &Option<std::path::PathBuf>, history: &[String], name: &str) {
