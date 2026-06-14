@@ -17,8 +17,8 @@ use crate::{
     common::output::CommandOutput,
     feature_flags,
     input::{
-        MultiLineCompletionMode, MultiLineConfig, MultiLineRenderMode, colorize_nested,
-        read_multi_line_input,
+        DEFAULT_MULTILINE_PREFIX, MultiLineCompletionMode, MultiLineConfig, MultiLineRenderMode,
+        colorize_nested, read_multi_line_input,
     },
     logging::AppLogger,
 };
@@ -334,7 +334,7 @@ impl TheseusShell {
         let text = {
             let input_history = &mut self.input_history;
             match read_multi_line_input(MultiLineConfig {
-                prefix: "> ".to_string(),
+                prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
                 exit_word: Some("/end".to_string()),
                 history: &history,
                 initial_text,
@@ -406,7 +406,7 @@ impl TheseusShell {
         let text = {
             let input_history = &mut self.input_history;
             match read_multi_line_input(MultiLineConfig {
-                prefix: "> ".to_string(),
+                prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
                 exit_word: Some("/end".to_string()),
                 history: &history,
                 initial_text,

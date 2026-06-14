@@ -20,7 +20,8 @@ use crate::common::{
     text::{TruncatePosition, truncate_utf8_to_bytes},
 };
 use crate::input::{
-    CommandHistoryItem, CommandInputConfig, CommandInputResult, read_command_input,
+    CommandHistoryItem, CommandInputConfig, CommandInputResult,
+    DEFAULT_COMMAND_CONTINUATION_PROMPT, read_command_input,
 };
 use crate::logging::AppLogger;
 
@@ -29,7 +30,6 @@ use super::history::default_command_history_v2_path;
 
 const MAX_AGENT_SHELL_CONTEXT_OUTPUT_BYTES: usize = 32 * 1024;
 const INTERRUPTED_EXIT_HINT: &str = "Interrupted. Type /exit to exit the shell.";
-const SHELL_CONTINUATION_PROMPT: &str = "> ";
 
 #[derive(Debug, Clone)]
 pub struct ShellConfig {
@@ -128,7 +128,7 @@ impl TheseusShell {
             let command_history = self.command_prompt_history();
             let input = match read_command_input(CommandInputConfig {
                 prompt: &self.config.prompt,
-                continuation_prompt: SHELL_CONTINUATION_PROMPT,
+                continuation_prompt: DEFAULT_COMMAND_CONTINUATION_PROMPT,
                 history: &command_history,
                 should_continue: should_read_shell_continuation,
                 shell_highlight,

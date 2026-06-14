@@ -263,7 +263,10 @@ mod tests {
     fn layout_counts_mixed_prompt_lengths() {
         let lines = vec![
             EditorLine::new("main> ", "abcd".to_string()),
-            EditorLine::new("> ", "ef".to_string()),
+            EditorLine::new(
+                crate::input::DEFAULT_COMMAND_CONTINUATION_PROMPT,
+                "ef".to_string(),
+            ),
         ];
 
         let layout = render_layout_for_lines_with_cursor_wrap(&lines, 1, 2, 8, false);
@@ -293,7 +296,10 @@ mod tests {
     fn layout_includes_boundary_cursor_row_after_previous_lines() {
         let lines = vec![
             EditorLine::new("main> ", "echo \\".to_string()),
-            EditorLine::new("> ", "🤿".repeat(16)),
+            EditorLine::new(
+                crate::input::DEFAULT_COMMAND_CONTINUATION_PROMPT,
+                "🤿".repeat(16),
+            ),
         ];
 
         let layout = render_layout_for_lines_with_cursor_wrap(&lines, 1, 32, 34, true);
@@ -306,7 +312,7 @@ mod tests {
     #[test]
     fn render_forces_newline_after_wide_character_at_terminal_boundary() {
         let lines = vec![EditorLine::with_visible_len(
-            "> ",
+            crate::input::DEFAULT_COMMAND_CONTINUATION_PROMPT,
             "🤿".to_string(),
             text_length("🤿", false),
         )];
@@ -316,8 +322,12 @@ mod tests {
         render_editor_lines(&mut output, &lines, layout, 1, 0).unwrap();
 
         let output = String::from_utf8(output).unwrap();
+        let expected = format!(
+            "{}🤿\r\n",
+            crate::input::DEFAULT_COMMAND_CONTINUATION_PROMPT
+        );
         assert!(
-            output.contains("> 🤿\r\n"),
+            output.contains(&expected),
             "renderer should force the terminal out of pending wrap after boundary wide char: {output:?}"
         );
     }

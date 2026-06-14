@@ -10,6 +10,7 @@ use crossterm::{
 use super::{
     colorize_tag,
     completion::{CompletionState, completion_state, path_completion_state, token_before_cursor},
+    constants::{DEFAULT_MULTILINE_PREFIX, MULTILINE_ASK_HINT, MULTILINE_SHELL_HINT},
     editor_render::{
         EditorLine, RenderLayout, cursor_visible_col, cursor_wraps_at_boundary,
         render_editor_lines, render_layout_for_lines_with_cursor_wrap,
@@ -27,9 +28,6 @@ use super::{
     text_length,
 };
 use crate::commands::slash_commands;
-
-const MULTILINE_ASK_HINT: &str = "Enter multiline input. Type /end on a new line to finish.";
-const MULTILINE_SHELL_HINT: &str = "Enter multiline shell command. Type /end on a new line to run.";
 
 #[cfg(test)]
 use super::completion::{Completion, CompletionToken};
@@ -459,7 +457,7 @@ impl<'a> CommandEditor<'a> {
             let line = self.line_text(index);
             let rendered_line = colorize_tag("italic", &line);
             lines.push(EditorLine::with_visible_len(
-                self.config.continuation_prompt,
+                DEFAULT_MULTILINE_PREFIX,
                 rendered_line,
                 text_length(&line, false),
             ));
@@ -790,7 +788,7 @@ mod tests {
     fn config<'a>(history: &'a [CommandHistoryItem]) -> CommandInputConfig<'a> {
         CommandInputConfig {
             prompt: "main> ",
-            continuation_prompt: "> ",
+            continuation_prompt: crate::input::DEFAULT_COMMAND_CONTINUATION_PROMPT,
             history,
             should_continue: never_continue,
             shell_highlight: None,
@@ -980,6 +978,20 @@ mod tests {
                 "line one\nline two".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn multiline_history_preview_uses_multiline_prefix_for_body_lines() {
+        let history = vec![CommandHistoryItem::multiline_ask("line one\nline two")];
+        let mut editor = CommandEditor::new(config(&history));
+
+        editor.history_previous();
+        let lines = editor.render_lines();
+
+        assert_eq!(lines[0].prompt, "main> ");
+        assert_eq!(lines[1].prompt, "");
+        assert_eq!(lines[2].prompt, DEFAULT_MULTILINE_PREFIX);
+        assert_eq!(lines[3].prompt, DEFAULT_MULTILINE_PREFIX);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 mod box_text;
 mod colorize;
 mod completion;
+mod constants;
 mod dedent;
 mod editor_render;
 mod highlight;
@@ -18,6 +19,10 @@ mod viewport;
 pub use box_text::{BoxOptions, wrap_in_box};
 pub use colorize::{colorize_nested, colorize_tag, colorize_tags, is_known_color_tag};
 pub use colorize::{strip_ansi_codes, strip_tags, text_length};
+pub use constants::{
+    DEFAULT_COMMAND_CONTINUATION_PROMPT, DEFAULT_MULTILINE_PREFIX,
+    DEFAULT_SHELL_PROMPT_CONTINUATION_PREFIX,
+};
 pub use dedent::{dedent, dedent_keep_indent};
 pub use highlight::{FormatterOpts, available_languages, available_styles, format_source_code};
 pub(crate) use key::{is_alt_key, is_command_key, is_control_key, is_key_press, is_plain_text_key};

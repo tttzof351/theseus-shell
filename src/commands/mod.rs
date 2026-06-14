@@ -27,13 +27,13 @@ pub const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         command: SlashCommand::Ask,
         name: "/ask",
-        description: "activate agent mode",
+        description: "multiline question",
         allows_trailing_input: true,
     },
     SlashCommandSpec {
         command: SlashCommand::Shell,
         name: "/shell",
-        description: "compose a multiline shell command",
+        description: "multiline shell command",
         allows_trailing_input: true,
     },
     SlashCommandSpec {

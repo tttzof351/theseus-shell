@@ -8,6 +8,7 @@ use crossterm::{
 
 use super::{
     completion::{CompletionState, completion_state, path_completion_state, token_before_cursor},
+    constants::DEFAULT_MULTILINE_PREFIX,
     editor_render::{
         EditorLine, RenderLayout, cursor_visible_col, cursor_wraps_at_boundary,
         render_editor_lines, render_layout_for_lines_with_cursor_wrap,
@@ -59,7 +60,7 @@ pub enum MultiLineCompletionMode {
 impl Default for MultiLineConfig<'_> {
     fn default() -> Self {
         Self {
-            prefix: "> ".to_string(),
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             exit_word: None,
             history: &[],
             initial_text: None,
@@ -615,7 +616,7 @@ mod tests {
     #[test]
     fn render_layout_counts_wrapped_lines() {
         let mut editor = MultiLineEditor::new(MultiLineConfig {
-            prefix: "> ".to_string(),
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             exit_word: None,
             ..MultiLineConfig::default()
         });
@@ -632,7 +633,7 @@ mod tests {
     #[test]
     fn shell_render_mode_highlights_multiline_shell_input() {
         let mut editor = MultiLineEditor::new(MultiLineConfig {
-            prefix: "> ".to_string(),
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             render_mode: MultiLineRenderMode::Shell {
                 shell_highlight: None,
             },
@@ -688,7 +689,7 @@ mod tests {
     #[test]
     fn exit_line_ignores_surrounding_whitespace() {
         let mut editor = MultiLineEditor::new(MultiLineConfig {
-            prefix: "> ".to_string(),
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             exit_word: Some("/end".to_string()),
             ..MultiLineConfig::default()
         });
@@ -801,7 +802,7 @@ mod tests {
             "large prompt line one\nlarge prompt line two".to_string(),
         ];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
-            prefix: "> ".to_string(),
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
@@ -822,7 +823,7 @@ mod tests {
     fn history_next_restores_multiline_draft_after_latest_entry() {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
-            prefix: "> ".to_string(),
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
@@ -842,7 +843,7 @@ mod tests {
     fn history_navigation_starts_only_from_empty_prompt() {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
-            prefix: "> ".to_string(),
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
@@ -871,7 +872,7 @@ mod tests {
             "multiline prompt one\nmultiline prompt two".to_string(),
         ];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
-            prefix: "> ".to_string(),
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
@@ -894,7 +895,7 @@ mod tests {
     fn history_browsing_requires_enter_before_multiline_cursor_navigation() {
         let history = vec!["line one\nline two".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
-            prefix: "> ".to_string(),
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
@@ -915,7 +916,7 @@ mod tests {
     fn enter_accepts_history_browsing_before_up_moves_cursor() {
         let history = vec!["line one\nline two".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
-            prefix: "> ".to_string(),
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
@@ -939,7 +940,7 @@ mod tests {
     fn non_empty_prompt_uses_up_down_for_cursor_navigation_not_history() {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
-            prefix: "> ".to_string(),
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
@@ -955,7 +956,7 @@ mod tests {
     fn history_browsing_render_lines_are_italic_until_editing_is_accepted() {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
-            prefix: "> ".to_string(),
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
@@ -998,7 +999,7 @@ mod tests {
     fn history_down_to_draft_leaves_history_browsing() {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
-            prefix: "> ".to_string(),
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
@@ -1021,7 +1022,7 @@ mod tests {
     fn paste_accepts_history_browsing_and_inserts_text() {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
-            prefix: "> ".to_string(),
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
@@ -1048,7 +1049,7 @@ mod tests {
             "latest prompt".to_string(),
         ];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
-            prefix: "> ".to_string(),
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
@@ -1084,7 +1085,7 @@ mod tests {
     fn editing_recalled_prompt_stops_history_navigation() {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
-            prefix: "> ".to_string(),
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
             exit_word: Some("/end".to_string()),
             history: &history,
             on_change: None,
@@ -1104,7 +1105,7 @@ mod tests {
         let mut changes = Vec::new();
         {
             let mut editor = MultiLineEditor::new(MultiLineConfig {
-                prefix: "> ".to_string(),
+                prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
                 exit_word: Some("/end".to_string()),
                 history: &[],
                 on_change: Some(Box::new(|text| changes.push(text.to_string()))),
@@ -1127,7 +1128,7 @@ mod tests {
         let mut changes = Vec::new();
         {
             let mut editor = MultiLineEditor::new(MultiLineConfig {
-                prefix: "> ".to_string(),
+                prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
                 exit_word: Some("/end".to_string()),
                 history: &history,
                 on_change: Some(Box::new(|text| changes.push(text.to_string()))),

@@ -8,7 +8,9 @@ use std::{
 };
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use theseus::input::strip_ansi_codes;
+use theseus::input::{
+    DEFAULT_COMMAND_CONTINUATION_PROMPT, DEFAULT_MULTILINE_PREFIX, strip_ansi_codes,
+};
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -224,6 +226,18 @@ fn count_matches(haystack: &str, needle: &str) -> usize {
     haystack.match_indices(needle).count()
 }
 
+fn command_continuation_row() -> String {
+    format!("\r\n{DEFAULT_COMMAND_CONTINUATION_PROMPT}")
+}
+
+fn command_continuation_text(text: &str) -> String {
+    format!("{DEFAULT_COMMAND_CONTINUATION_PROMPT}{text}")
+}
+
+fn multiline_prefix_text(text: &str) -> String {
+    format!("{DEFAULT_MULTILINE_PREFIX}{text}")
+}
+
 struct VtScreen {
     parser: vt100::Parser,
     cols: u16,
@@ -293,7 +307,8 @@ fn backslash_enter_shows_continuation_prompt_and_executes_joined_command() -> io
     let mut shell = PtyShell::start()?;
 
     shell.write("echo \\\r")?;
-    shell.wait_for("\r\n> ")?;
+    let continuation_row = command_continuation_row();
+    shell.wait_for(&continuation_row)?;
 
     let offset = shell.transcript_len();
     shell.write(" THESEUS_JOINED_OK\r")?;
@@ -301,7 +316,7 @@ fn backslash_enter_shows_continuation_prompt_and_executes_joined_command() -> io
         shell.wait_until_after(offset, |tail| count_matches(tail, "THESEUS_JOINED_OK") >= 2)?;
 
     assert!(
-        transcript.contains("\r\n> "),
+        transcript.contains(&continuation_row),
         "continuation prompt was not rendered on a new terminal row:\n{transcript}"
     );
     assert!(
@@ -321,9 +336,10 @@ fn pasted_multiline_command_executes_as_one_shell_command() -> io::Result<()> {
     shell.write("echo \\\r THESEUS_PASTE_OK\r")?;
     let transcript =
         shell.wait_until_after(offset, |tail| count_matches(tail, "THESEUS_PASTE_OK") >= 2)?;
+    let continuation_row = command_continuation_row();
 
     assert!(
-        transcript[offset..].contains("\r\n> "),
+        transcript[offset..].contains(&continuation_row),
         "pasted multiline command did not render continuation prompt:\n{}",
         &transcript[offset..]
     );
@@ -546,9 +562,10 @@ fn ask_inline_backslash_continuation_reads_multiline_prompt() -> io::Result<()> 
     let offset = shell.transcript_len();
     shell.write("/ask a ты меешь \\\rрассказывать \\\rанекдоты?\r")?;
     let transcript = shell.wait_until_after(offset, |tail| tail.contains("анекдоты?"))?;
+    let continuation_text = command_continuation_text("рассказывать");
 
     assert!(
-        transcript[offset..].contains("> рассказывать"),
+        transcript[offset..].contains(&continuation_text),
         "/ask backslash continuation did not show continuation prompt:\n{}",
         &transcript[offset..]
     );
@@ -655,7 +672,8 @@ fn command_history_multiline_ask_recall_finishes_prompt_line_before_editor() -> 
         "multiline /ask recall did not show the recalled /ask command before opening the editor:\n{screen}"
     );
     assert!(
-        screen.contains("> A ты умеешь") && screen.contains("> пиратов?"),
+        screen.contains(&multiline_prefix_text("A ты умеешь"))
+            && screen.contains(&multiline_prefix_text("пиратов?")),
         "multiline /ask editor did not render the recalled prompt:\n{screen}"
     );
     assert_eq!(
@@ -807,8 +825,8 @@ fn command_history_multiline_shell_recall_uses_shell_preview_and_editor() -> io:
         "multiline /shell command-history preview should show the shell editor hint:\n{preview_screen}"
     );
     assert!(
-        preview_screen.contains("> printf")
-            && preview_screen.contains(">   SHELL_COMMAND_HISTORY_PREVIEW"),
+        preview_screen.contains(&multiline_prefix_text("printf"))
+            && preview_screen.contains(&multiline_prefix_text("  SHELL_COMMAND_HISTORY_PREVIEW")),
         "multiline /shell command-history preview should render the command body with continuation prompts:\n{preview_screen}"
     );
 
@@ -1130,7 +1148,7 @@ fn ctrl_c_during_quote_continuation_returns_to_clean_prompt() -> io::Result<()> 
     let mut shell = PtyShell::start()?;
 
     shell.write("echo \\\r \"test\r")?;
-    shell.wait_for("\r\n> ")?;
+    shell.wait_for(&command_continuation_row())?;
 
     let prompt_offset = shell.transcript_len();
     shell.write("\u{3}")?;
@@ -1159,7 +1177,7 @@ fn single_quote_continuation_executes_after_closing_quote() -> io::Result<()> {
 
     shell.write("printf '%s\\n' 'THESEUS_SINGLE_QUOTE")?;
     shell.write("\r")?;
-    shell.wait_for("\r\n> ")?;
+    shell.wait_for(&command_continuation_row())?;
 
     let offset = shell.transcript_len();
     shell.write("CONTINUATION_OK'\r")?;
@@ -1184,7 +1202,7 @@ fn command_substitution_continuation_executes_after_closing_paren() -> io::Resul
 
     shell.write("echo \"$(")?;
     shell.write("\r")?;
-    shell.wait_for("\r\n> ")?;
+    shell.wait_for(&command_continuation_row())?;
 
     let offset = shell.transcript_len();
     shell.write("printf THESEUS_CMD_SUB_OK)\"\r")?;
@@ -1207,9 +1225,9 @@ fn if_block_continuation_executes_after_fi() -> io::Result<()> {
     let mut shell = PtyShell::start()?;
 
     shell.write("if true; then\r")?;
-    shell.wait_for("\r\n> ")?;
+    shell.wait_for(&command_continuation_row())?;
     shell.write("echo THESEUS_IF_BLOCK_OK\r")?;
-    shell.wait_for("\r\n> ")?;
+    shell.wait_for(&command_continuation_row())?;
 
     let offset = shell.transcript_len();
     shell.write("fi\r")?;
@@ -1258,7 +1276,8 @@ fn wrapped_first_line_keeps_continuation_prompt_on_next_logical_line() -> io::Re
 
     let offset = shell.transcript_len();
     shell.write("echo WRAP_MARKER_1234567890 \\\r")?;
-    let transcript = shell.wait_for_after(offset, "\r\n> ")?;
+    let continuation_row = command_continuation_row();
+    let transcript = shell.wait_for_after(offset, &continuation_row)?;
 
     assert!(
         transcript[offset..].contains("WRAP_MARKER_1234567890"),
@@ -1266,7 +1285,7 @@ fn wrapped_first_line_keeps_continuation_prompt_on_next_logical_line() -> io::Re
         &transcript[offset..]
     );
     assert!(
-        transcript[offset..].contains("\r\n> "),
+        transcript[offset..].contains(&continuation_row),
         "continuation prompt was not rendered after wrapped first line:\n{}",
         &transcript[offset..]
     );
@@ -1287,7 +1306,7 @@ fn long_emoji_continuation_input_does_not_panic() -> io::Result<()> {
     let mut shell = PtyShell::start_with_size(narrow_pty_size())?;
 
     shell.write("echo \\\r")?;
-    shell.wait_for("\r\n> ")?;
+    shell.wait_for(&command_continuation_row())?;
 
     let offset = shell.transcript_len();
     shell.write(&"🤿".repeat(80))?;
@@ -1562,7 +1581,10 @@ fn ctrl_c_during_continuation_returns_to_clean_prompt() -> io::Result<()> {
     let mut shell = PtyShell::start()?;
 
     shell.write("echo \\\rpartial")?;
-    shell.wait_until_after(0, |tail| strip_ansi_codes(tail).contains("> partial"))?;
+    let continuation_text = command_continuation_text("partial");
+    shell.wait_until_after(0, |tail| {
+        strip_ansi_codes(tail).contains(&continuation_text)
+    })?;
 
     shell.write("\u{3}")?;
     shell.wait_for("Interrupted. Type /exit to exit the shell.")?;
@@ -1587,13 +1609,16 @@ fn ctrl_l_during_continuation_rerenders_full_multiline_command() -> io::Result<(
     let mut shell = PtyShell::start()?;
 
     shell.write("echo \\\r CTRL_L_OK")?;
-    shell.wait_until_after(0, |tail| strip_ansi_codes(tail).contains(">  CTRL_L_OK"))?;
+    let continuation_text = command_continuation_text(" CTRL_L_OK");
+    shell.wait_until_after(0, |tail| {
+        strip_ansi_codes(tail).contains(&continuation_text)
+    })?;
 
     let offset = shell.transcript_len();
     shell.write("\u{c}")?;
     let transcript = shell.wait_until_after(offset, |tail| {
         let visible = strip_ansi_codes(tail);
-        visible.contains("echo \\") && visible.contains(">  CTRL_L_OK")
+        visible.contains("echo \\") && visible.contains(&continuation_text)
     })?;
     let visible_transcript = strip_ansi_codes(&transcript[offset..]);
 
@@ -1603,7 +1628,7 @@ fn ctrl_l_during_continuation_rerenders_full_multiline_command() -> io::Result<(
         &transcript[offset..]
     );
     assert!(
-        visible_transcript.contains(">  CTRL_L_OK"),
+        visible_transcript.contains(&continuation_text),
         "continuation line was not re-rendered after Ctrl+L:\n{}",
         &transcript[offset..]
     );

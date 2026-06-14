@@ -19,10 +19,8 @@ use crate::{
         text::{TruncatePosition, truncate_utf8_to_bytes},
         tmp_files::create_tmp_log_file,
     },
-    input::highlight_shell_command_with_palette,
+    input::{DEFAULT_SHELL_PROMPT_CONTINUATION_PREFIX, highlight_shell_command_with_palette},
 };
-
-const SHELL_CONTINUATION_PROMPT: &str = "> ";
 
 pub(super) struct BashTool;
 
@@ -79,7 +77,7 @@ fn format_bash_command_preview(command: &str, context: &AgentRunContext) -> Stri
         if index == 0 {
             result.push_str(&context.shell_prompt);
         } else {
-            result.push_str(SHELL_CONTINUATION_PROMPT);
+            result.push_str(DEFAULT_SHELL_PROMPT_CONTINUATION_PREFIX);
         }
         result.push_str(line);
         result.push('\n');
@@ -354,6 +352,23 @@ mod tests {
             "euclid theseus-shell> find . -type f 2>/dev/null | grep -v total\n"
         );
         assert!(preview.contains("\x1b[33m|\x1b[0m"));
+    }
+
+    #[test]
+    fn bash_command_preview_uses_shell_prompt_continuation_prefix_for_multiline_command() {
+        let context = AgentRunContext {
+            shell_prompt: "euclid theseus-shell> ".to_string(),
+            ..Default::default()
+        };
+
+        let preview = format_bash_command_preview("echo one\necho two", &context);
+
+        assert_eq!(
+            crate::input::strip_ansi_codes(&preview),
+            format!(
+                "euclid theseus-shell> echo one\n{DEFAULT_SHELL_PROMPT_CONTINUATION_PREFIX}echo two\n"
+            )
+        );
     }
 
     fn test_context() -> AgentRunContext {
