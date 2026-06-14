@@ -1,0 +1,107 @@
+{
+  // CodeLLDB debug configurations for the theseus-shell project.
+  // To debug: open a Rust file, set breakpoints, press F5 (or use the dropdown).
+  // See https://github.com/vadimcn/codelldb/blob/master/MANUAL.md for the full reference.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug: interactive shell (default)",
+      "cargo": {
+        "args": ["build", "--bin=theseus"],
+        "filter": { "name": "theseus", "kind": "bin" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "preLaunchTask": null
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug: headless agent (-p prompt)",
+      "cargo": {
+        "args": ["build", "--bin=theseus"],
+        "filter": { "name": "theseus", "kind": "bin" }
+      },
+      "args": ["-p", "${input:agentPrompt}"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug: --version",
+      "cargo": {
+        "args": ["build", "--bin=theseus"],
+        "filter": { "name": "theseus", "kind": "bin" }
+      },
+      "args": ["--version"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug: lib unit tests",
+      "cargo": {
+        "args": ["test", "--lib", "--no-run"],
+        "filter": { "name": "theseus", "kind": "lib" }
+      },
+      "args": ["--test-threads=1"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug: single unit test (by name)",
+      "cargo": {
+        "args": ["test", "--lib", "--no-run"],
+        "filter": { "name": "theseus", "kind": "lib" }
+      },
+      "args": ["${input:testName}", "--exact", "--nocapture"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug: integration test (tests/)",
+      "cargo": {
+        "args": ["test", "--test=line_editor_pty", "--no-run"],
+        "filter": { "name": "line_editor_pty", "kind": "integration" }
+      },
+      "args": ["--nocapture"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug: attach to running theseus (by PID)",
+      "pid": "${input:attachPid}"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "agentPrompt",
+      "type": "promptString",
+      "description": "Prompt to send to the agent in headless mode",
+      "default": "Say hello in one short sentence."
+    },
+    {
+      "id": "testName",
+      "type": "promptString",
+      "description": "Name of a single test to run (matches `fn name` or `mod::path::name`)",
+      "default": "parse_cli_handles_version_flag"
+    },
+    {
+      "id": "attachPid",
+      "type": "promptString",
+      "description": "PID of the theseus process to attach to (run `pgrep theseus` in a terminal)",
+      "default": ""
+    }
+  ]
+}
