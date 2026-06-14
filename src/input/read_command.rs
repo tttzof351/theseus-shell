@@ -10,7 +10,7 @@ use crossterm::{
 use super::{
     colorize_tag,
     completion::{CompletionState, completion_state, path_completion_state, token_before_cursor},
-    constants::{DEFAULT_MULTILINE_PREFIX, MULTILINE_ASK_HINT, MULTILINE_SHELL_HINT},
+    constants::{DEFAULT_MULTILINE_PREFIX, multiline_ask_hint, multiline_shell_hint},
     editor_render::{
         EditorLine, RenderLayout, cursor_visible_col, cursor_wraps_at_boundary,
         render_editor_lines, render_layout_for_lines_with_cursor_wrap,
@@ -97,7 +97,7 @@ struct CommandEditor<'a> {
 }
 
 struct MultilinePreview {
-    hint: &'static str,
+    hint: String,
 }
 
 pub fn read_command_input(
@@ -395,7 +395,7 @@ impl<'a> CommandEditor<'a> {
         if let Some(preview) = self.selected_multiline_preview()
             && self.buffer.lines_len() > 1
         {
-            return self.render_multiline_preview_lines(preview.hint);
+            return self.render_multiline_preview_lines(&preview.hint);
         }
 
         let highlighted_shell_lines = if self.line_text(0).starts_with('/') {
@@ -439,7 +439,7 @@ impl<'a> CommandEditor<'a> {
             .collect()
     }
 
-    fn render_multiline_preview_lines(&self, hint_text: &'static str) -> Vec<EditorLine<'_>> {
+    fn render_multiline_preview_lines(&self, hint_text: &str) -> Vec<EditorLine<'_>> {
         let mut lines = Vec::with_capacity(self.buffer.lines_len() + 1);
         let first_line = self.line_text(0);
         let first_line = highlighted_input(&first_line);
@@ -646,10 +646,10 @@ impl<'a> CommandEditor<'a> {
         match &self.config.history.get(index)?.submit {
             CommandHistorySubmit::Command(_) => None,
             CommandHistorySubmit::MultilineAsk(_) => Some(MultilinePreview {
-                hint: MULTILINE_ASK_HINT,
+                hint: multiline_ask_hint(),
             }),
             CommandHistorySubmit::MultilineShell(_) => Some(MultilinePreview {
-                hint: MULTILINE_SHELL_HINT,
+                hint: multiline_shell_hint(),
             }),
         }
     }

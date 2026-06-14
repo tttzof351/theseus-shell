@@ -17,8 +17,8 @@ use crate::{
     common::{output::CommandOutput, terminal_output},
     feature_flags,
     input::{
-        DEFAULT_MULTILINE_PREFIX, MultiLineCompletionMode, MultiLineConfig, MultiLineRenderMode,
-        colorize_nested, read_multi_line_input,
+        DEFAULT_MULTILINE_PREFIX, MULTILINE_SUBMIT_COMMAND, MultiLineCompletionMode,
+        MultiLineConfig, MultiLineRenderMode, colorize_nested, read_multi_line_input,
     },
     logging::AppLogger,
 };
@@ -327,9 +327,9 @@ impl TheseusShell {
             writeln!(
                 stdout,
                 "{}",
-                colorize_nested(
-                    "<bright-black>Enter multiline input. Type <bold>/end</bold> on a new line to finish.</bright-black>"
-                )
+                colorize_nested(&format!(
+                    "<bright-black>Enter multiline input. Type <bold>{MULTILINE_SUBMIT_COMMAND}</bold> on a new line to finish.</bright-black>"
+                ))
             )?;
             stdout.flush()
         })?;
@@ -341,7 +341,7 @@ impl TheseusShell {
             let input_history = &mut self.input_history;
             match read_multi_line_input(MultiLineConfig {
                 prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-                exit_word: Some("/end".to_string()),
+                exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
                 history: &history,
                 initial_text,
                 initial_browsing,
@@ -398,9 +398,9 @@ impl TheseusShell {
             writeln!(
                 stdout,
                 "{}",
-                colorize_nested(
-                    "<bright-black>Enter multiline shell command. Type <bold>/end</bold> on a new line to run.</bright-black>"
-                )
+                colorize_nested(&format!(
+                    "<bright-black>Enter multiline shell command. Type <bold>{MULTILINE_SUBMIT_COMMAND}</bold> on a new line to run.</bright-black>"
+                ))
             )?;
             stdout.flush()
         })?;
@@ -419,7 +419,7 @@ impl TheseusShell {
             let input_history = &mut self.input_history;
             match read_multi_line_input(MultiLineConfig {
                 prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-                exit_word: Some("/end".to_string()),
+                exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
                 history: &history,
                 initial_text,
                 initial_browsing: false,

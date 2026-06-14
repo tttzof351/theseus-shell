@@ -19,7 +19,7 @@ use super::{
     is_alt_key, is_command_key, is_key_press, is_plain_text_key,
     raw_mode::RawModeGuard,
     shell_highlight::{
-        ShellHighlightPalette, default_shell_highlight_palette,
+        ShellHighlightPalette, default_shell_highlight_palette, highlight_multiline_submit_command,
         highlight_shell_command_with_palette,
     },
     text_buffer::TextBuffer,
@@ -365,10 +365,35 @@ impl<'a> MultiLineEditor<'a> {
             .enumerate()
             .map(|(index, line)| {
                 let raw_text = line.iter().collect::<String>();
-                let text = highlighted_shell_lines
-                    .get(index)
-                    .cloned()
-                    .unwrap_or(raw_text);
+                let exit_word = self.config.exit_word.as_deref();
+                let is_exit_line = exit_word.is_some_and(|exit_word| raw_text.trim() == exit_word);
+                let text = if let Some(exit_word) = exit_word {
+                    let default_palette;
+                    let palette = match self.config.render_mode {
+                        MultiLineRenderMode::Shell { shell_highlight } => match shell_highlight {
+                            Some(palette) => palette,
+                            None => {
+                                default_palette = default_shell_highlight_palette();
+                                &default_palette
+                            }
+                        },
+                        MultiLineRenderMode::Plain => {
+                            default_palette = default_shell_highlight_palette();
+                            &default_palette
+                        }
+                    };
+                    highlight_multiline_submit_command(&raw_text, exit_word, palette)
+                } else {
+                    raw_text.clone()
+                };
+                let text = if !is_exit_line && text == raw_text {
+                    highlighted_shell_lines
+                        .get(index)
+                        .cloned()
+                        .unwrap_or(raw_text)
+                } else {
+                    text
+                };
                 let text = if self.history.is_browsing() {
                     crate::input::colorize_tag("italic", &text)
                 } else {
@@ -601,6 +626,8 @@ fn multiline_history_entry_mode(_: &str) -> HistoryEntryMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::MULTILINE_SUBMIT_COMMAND;
+    use crate::input::ShellHighlightStyle;
     use crate::input::editor_render::wrapped_rows;
 
     #[test]
@@ -695,12 +722,55 @@ mod tests {
     fn exit_line_ignores_surrounding_whitespace() {
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-            exit_word: Some("/end".to_string()),
+            exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
             ..MultiLineConfig::default()
         });
-        editor.buffer = TextBuffer::from_text("/end ");
+        let exit_line = format!("{MULTILINE_SUBMIT_COMMAND} ");
+        editor.buffer = TextBuffer::from_text(&exit_line);
 
         assert!(editor.is_exit_line());
+    }
+
+    #[test]
+    fn exit_line_uses_multiline_submit_highlight() {
+        let mut editor = MultiLineEditor::new(MultiLineConfig {
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
+            exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
+            ..MultiLineConfig::default()
+        });
+        editor.buffer = TextBuffer::from_text(MULTILINE_SUBMIT_COMMAND);
+
+        let lines = editor.render_lines();
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].text.contains("\x1b["));
+        assert_eq!(
+            crate::input::strip_ansi_codes(&lines[0].text),
+            MULTILINE_SUBMIT_COMMAND
+        );
+    }
+
+    #[test]
+    fn disabled_submit_highlight_does_not_fall_back_to_shell_command_highlight() {
+        let mut palette = default_shell_highlight_palette();
+        palette.insert(
+            "command".to_string(),
+            Some(ShellHighlightStyle::single("yellow")),
+        );
+        palette.insert("multiline_submit".to_string(), None);
+        let mut editor = MultiLineEditor::new(MultiLineConfig {
+            prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
+            exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
+            render_mode: MultiLineRenderMode::Shell {
+                shell_highlight: Some(&palette),
+            },
+            ..MultiLineConfig::default()
+        });
+        editor.buffer = TextBuffer::from_text(MULTILINE_SUBMIT_COMMAND);
+
+        let lines = editor.render_lines();
+
+        assert_eq!(lines[0].text, MULTILINE_SUBMIT_COMMAND);
     }
 
     #[test]
@@ -808,7 +878,7 @@ mod tests {
         ];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-            exit_word: Some("/end".to_string()),
+            exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
             history: &history,
             on_change: None,
             ..MultiLineConfig::default()
@@ -829,7 +899,7 @@ mod tests {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-            exit_word: Some("/end".to_string()),
+            exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
             history: &history,
             on_change: None,
             ..MultiLineConfig::default()
@@ -849,7 +919,7 @@ mod tests {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-            exit_word: Some("/end".to_string()),
+            exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
             history: &history,
             on_change: None,
             ..MultiLineConfig::default()
@@ -878,7 +948,7 @@ mod tests {
         ];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-            exit_word: Some("/end".to_string()),
+            exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
             history: &history,
             on_change: None,
             ..MultiLineConfig::default()
@@ -901,7 +971,7 @@ mod tests {
         let history = vec!["line one\nline two".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-            exit_word: Some("/end".to_string()),
+            exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
             history: &history,
             on_change: None,
             ..MultiLineConfig::default()
@@ -922,7 +992,7 @@ mod tests {
         let history = vec!["line one\nline two".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-            exit_word: Some("/end".to_string()),
+            exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
             history: &history,
             on_change: None,
             ..MultiLineConfig::default()
@@ -946,7 +1016,7 @@ mod tests {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-            exit_word: Some("/end".to_string()),
+            exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
             history: &history,
             on_change: None,
             ..MultiLineConfig::default()
@@ -962,7 +1032,7 @@ mod tests {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-            exit_word: Some("/end".to_string()),
+            exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
             history: &history,
             on_change: None,
             ..MultiLineConfig::default()
@@ -1005,7 +1075,7 @@ mod tests {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-            exit_word: Some("/end".to_string()),
+            exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
             history: &history,
             on_change: None,
             ..MultiLineConfig::default()
@@ -1028,7 +1098,7 @@ mod tests {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-            exit_word: Some("/end".to_string()),
+            exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
             history: &history,
             on_change: None,
             ..MultiLineConfig::default()
@@ -1055,7 +1125,7 @@ mod tests {
         ];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-            exit_word: Some("/end".to_string()),
+            exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
             history: &history,
             on_change: None,
             ..MultiLineConfig::default()
@@ -1091,7 +1161,7 @@ mod tests {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-            exit_word: Some("/end".to_string()),
+            exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
             history: &history,
             on_change: None,
             ..MultiLineConfig::default()
@@ -1111,7 +1181,7 @@ mod tests {
         {
             let mut editor = MultiLineEditor::new(MultiLineConfig {
                 prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-                exit_word: Some("/end".to_string()),
+                exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
                 history: &[],
                 on_change: Some(Box::new(|text| changes.push(text.to_string()))),
                 ..MultiLineConfig::default()
@@ -1134,7 +1204,7 @@ mod tests {
         {
             let mut editor = MultiLineEditor::new(MultiLineConfig {
                 prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
-                exit_word: Some("/end".to_string()),
+                exit_word: Some(MULTILINE_SUBMIT_COMMAND.to_string()),
                 history: &history,
                 on_change: Some(Box::new(|text| changes.push(text.to_string()))),
                 ..MultiLineConfig::default()

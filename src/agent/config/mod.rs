@@ -848,6 +848,49 @@ mod tests {
     }
 
     #[test]
+    fn accepts_multiline_submit_shell_highlight_key() {
+        let text = r#"
+        {
+          "llm_request_settings": {
+            "base_url": "https://example.test/chat",
+            "retries": 4,
+            "request_timeout_seconds": 240,
+            "connect_timeout_seconds": 45,
+            "body": { "model": "test/model" },
+            "header": { "Authorization": "Bearer secret" }
+          },
+          "agent_settings": {
+            "max_turns": 12,
+            "max_tool_output_bytes": 4096,
+            "max_context_tokens": 8192,
+            "max_resume_traj": 100,
+            "build_in_tools": ["read_file"],
+            "system_prompt": ["prompt"]
+          },
+          "shell_settings": {
+            "shell_highlight": {
+              "multiline_submit": ["Bold", "Bright-Cyan"]
+            }
+          },
+          "mcp_servers": {}
+        }
+        "#;
+
+        let config = AgentConfig::from_jsonc(text).unwrap();
+
+        assert_eq!(
+            config
+                .shell_settings
+                .shell_highlight
+                .get("multiline_submit"),
+            Some(&Some(ShellHighlightStyle::tags(vec![
+                "bold".to_string(),
+                "bright-cyan".to_string()
+            ])))
+        );
+    }
+
+    #[test]
     fn rejects_non_string_shell_highlight_array_item() {
         let text = r#"
         {

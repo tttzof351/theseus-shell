@@ -9,7 +9,8 @@ use std::{
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use theseus::input::{
-    DEFAULT_COMMAND_CONTINUATION_PROMPT, DEFAULT_MULTILINE_PREFIX, strip_ansi_codes,
+    DEFAULT_COMMAND_CONTINUATION_PROMPT, DEFAULT_MULTILINE_PREFIX, MULTILINE_SUBMIT_COMMAND,
+    strip_ansi_codes,
 };
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -558,7 +559,9 @@ fn command_history_mode_walks_past_multiline_entry_without_cursor_repositioning(
     shell.write("/shell\r")?;
     shell.wait_for("Enter multiline shell command")?;
     let submit_offset = shell.transcript_len();
-    shell.write("printf '%s\\n' \\\r  HISTORY_MULTILINE_NEWER\r/end\r")?;
+    shell.write(&format!(
+        "printf '%s\\n' \\\r  HISTORY_MULTILINE_NEWER\r{MULTILINE_SUBMIT_COMMAND}\r"
+    ))?;
     shell.wait_for_after(submit_offset, "HISTORY_MULTILINE_NEWER")?;
     shell.wait_for_after(submit_offset, "theseus-shell")?;
 
@@ -593,7 +596,9 @@ fn ask_multiline_history_up_recalls_previous_prompt() -> io::Result<()> {
     shell.write("/ask\r")?;
     shell.wait_for("Enter multiline input")?;
     let submit_offset = shell.transcript_len();
-    shell.write("ASK_HISTORY_LINE_ONE\rASK_HISTORY_LINE_TWO\r/end\r")?;
+    shell.write(&format!(
+        "ASK_HISTORY_LINE_ONE\rASK_HISTORY_LINE_TWO\r{MULTILINE_SUBMIT_COMMAND}\r"
+    ))?;
     shell.wait_for_after(submit_offset, "theseus-shell")?;
 
     let offset = shell.transcript_len();
@@ -650,13 +655,17 @@ fn ask_multiline_history_mode_walks_entries_without_cursor_repositioning() -> io
     shell.write("/ask\r")?;
     shell.wait_for("Enter multiline input")?;
     let first_submit_offset = shell.transcript_len();
-    shell.write("ASK_HISTORY_OLD_ONE\rASK_HISTORY_OLD_TWO\r/end\r")?;
+    shell.write(&format!(
+        "ASK_HISTORY_OLD_ONE\rASK_HISTORY_OLD_TWO\r{MULTILINE_SUBMIT_COMMAND}\r"
+    ))?;
     shell.wait_for_after(first_submit_offset, "theseus-shell")?;
 
     shell.write("/ask\r")?;
     shell.wait_for("Enter multiline input")?;
     let second_submit_offset = shell.transcript_len();
-    shell.write("ASK_HISTORY_NEW_ONE\rASK_HISTORY_NEW_TWO\r/end\r")?;
+    shell.write(&format!(
+        "ASK_HISTORY_NEW_ONE\rASK_HISTORY_NEW_TWO\r{MULTILINE_SUBMIT_COMMAND}\r"
+    ))?;
     shell.wait_for_after(second_submit_offset, "theseus-shell")?;
 
     let offset = shell.transcript_len();
@@ -812,7 +821,9 @@ fn command_history_down_returns_from_multiline_ask_preview_to_newer_command() ->
     )
     .text();
     assert!(
-        preview_screen.contains("Enter multiline input. Type /end on a new line to finish."),
+        preview_screen.contains(&format!(
+            "Enter multiline input. Type {MULTILINE_SUBMIT_COMMAND} on a new line to finish."
+        )),
         "multiline /ask command-history preview should show the multiline editor hint:\n{preview_screen}"
     );
     shell.write(KEY_DOWN)?;
@@ -883,7 +894,9 @@ fn command_history_multiline_shell_recall_uses_shell_preview_and_editor() -> io:
         "multiline /shell command-history preview should show /shell:\n{preview_screen}"
     );
     assert!(
-        preview_screen.contains("Enter multiline shell command. Type /end on a new line to run."),
+        preview_screen.contains(&format!(
+            "Enter multiline shell command. Type {MULTILINE_SUBMIT_COMMAND} on a new line to run."
+        )),
         "multiline /shell command-history preview should show the shell editor hint:\n{preview_screen}"
     );
     assert!(
@@ -1021,12 +1034,14 @@ fn shell_multiline_mode_executes_command_after_end() -> io::Result<()> {
     let offset = shell.transcript_len();
     shell.write("/shell\r")?;
     shell.wait_for_after(offset, "Enter multiline shell command")?;
-    shell.write("printf '%s\\n' \\\r  SHELL_MODE_OK\r/end\r")?;
+    shell.write(&format!(
+        "printf '%s\\n' \\\r  SHELL_MODE_OK\r{MULTILINE_SUBMIT_COMMAND}\r"
+    ))?;
     let transcript = shell.wait_until_after(offset, |tail| tail.contains("SHELL_MODE_OK"))?;
 
     assert!(
         transcript[offset..].contains("SHELL_MODE_OK"),
-        "/shell multiline command did not execute after /end:\n{}",
+        "/shell multiline command did not execute after {MULTILINE_SUBMIT_COMMAND}:\n{}",
         &transcript[offset..]
     );
 
@@ -1041,7 +1056,9 @@ fn shell_multiline_history_mode_recalls_previous_command() -> io::Result<()> {
     shell.write("/shell\r")?;
     shell.wait_for("Enter multiline shell command")?;
     let submit_offset = shell.transcript_len();
-    shell.write("printf '%s\\n' \\\r  SHELL_HISTORY_OK\r/end\r")?;
+    shell.write(&format!(
+        "printf '%s\\n' \\\r  SHELL_HISTORY_OK\r{MULTILINE_SUBMIT_COMMAND}\r"
+    ))?;
     shell.wait_for_after(submit_offset, "SHELL_HISTORY_OK")?;
     shell.wait_for_after(submit_offset, "theseus-shell")?;
 
@@ -1126,7 +1143,9 @@ fn shell_multiline_success_normalizes_draft_before_history_append() -> io::Resul
     let offset = shell.transcript_len();
     shell.write("/shell\r")?;
     shell.wait_for_after(offset, "Enter multiline shell command")?;
-    shell.write("\rprintf SHELL_TRIM_DUP_OK\r/end\r")?;
+    shell.write(&format!(
+        "\rprintf SHELL_TRIM_DUP_OK\r{MULTILINE_SUBMIT_COMMAND}\r"
+    ))?;
     shell.wait_for_after(offset, "SHELL_TRIM_DUP_OK")?;
     shell.wait_for_after(offset, "theseus-shell")?;
 
