@@ -1,7 +1,7 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 
 use crossterm::{
-    cursor::{Hide, Show},
+    cursor::Show,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute, terminal,
 };
@@ -357,17 +357,13 @@ impl<'a> MultiLineEditor<'a> {
         let layout = self.render_layout();
         let lines = self.render_lines();
         terminal_output::with_stdout(|stdout| {
-            if self.history.is_browsing() {
-                execute!(stdout, Hide)?;
-            } else {
-                execute!(stdout, Show)?;
-            }
             render_editor_lines(
                 stdout,
                 &lines,
                 layout,
                 self.rendered_rows,
                 self.rendered_cursor_row,
+                !self.history.is_browsing(),
             )
         })?;
 

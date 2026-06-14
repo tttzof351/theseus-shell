@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 
 use crossterm::{
-    cursor::{MoveDown, MoveRight, MoveToColumn, MoveUp},
+    cursor::{Hide, MoveDown, MoveRight, MoveToColumn, MoveUp, Show},
     execute,
     terminal::{Clear, ClearType},
 };
@@ -95,48 +95,56 @@ pub(crate) fn render_editor_lines(
     layout: RenderLayout,
     rendered_rows: u16,
     rendered_cursor_row: u16,
+    cursor_visible: bool,
 ) -> io::Result<()> {
+    let mut frame = Vec::new();
     let added_rows = layout.rows.saturating_sub(rendered_rows);
     for _ in 0..added_rows {
-        write!(stdout, "\r\n")?;
+        write!(frame, "\r\n")?;
     }
     let rendered_rows = rendered_rows.saturating_add(added_rows);
     let rendered_cursor_row = rendered_cursor_row.saturating_add(added_rows);
 
+    execute!(frame, Hide)?;
+
     if rendered_cursor_row > 0 {
-        execute!(stdout, MoveUp(rendered_cursor_row))?;
+        execute!(frame, MoveUp(rendered_cursor_row))?;
     }
 
     for row in 0..rendered_rows {
-        execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+        execute!(frame, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
         if row + 1 < rendered_rows {
-            execute!(stdout, MoveDown(1))?;
+            execute!(frame, MoveDown(1))?;
         }
     }
 
     if rendered_rows > 1 {
-        execute!(stdout, MoveUp(rendered_rows - 1))?;
+        execute!(frame, MoveUp(rendered_rows - 1))?;
     }
 
     for (index, line) in lines.iter().enumerate() {
-        write!(stdout, "{}{}", line.prompt, line.text)?;
+        write!(frame, "{}{}", line.prompt, line.text)?;
         if index + 1 < lines.len() {
-            write!(stdout, "\r\n")?;
+            write!(frame, "\r\n")?;
         }
     }
 
     let rows_up = layout.rows - 1 - layout.cursor_row;
     if rows_up > 0 {
-        execute!(stdout, MoveUp(rows_up))?;
+        execute!(frame, MoveUp(rows_up))?;
     }
     if rows_up == 0 && layout.cursor_wraps_at_boundary {
-        write!(stdout, "\r\n")?;
+        write!(frame, "\r\n")?;
     }
 
-    execute!(stdout, MoveToColumn(0))?;
+    execute!(frame, MoveToColumn(0))?;
     if layout.cursor_col > 0 {
-        execute!(stdout, MoveRight(layout.cursor_col))?;
+        execute!(frame, MoveRight(layout.cursor_col))?;
     }
+    if cursor_visible {
+        execute!(frame, Show)?;
+    }
+    stdout.write_all(&frame)?;
     stdout.flush()
 }
 
@@ -250,6 +258,25 @@ fn wrapped_cursor(visible_len: usize, columns: usize, wrap_at_boundary: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn wrapped_rows_uses_pending_terminal_wrap() {
@@ -319,7 +346,7 @@ mod tests {
         let layout = render_layout_for_lines_with_cursor_wrap(&lines, 0, 2, 4, true);
         let mut output = Vec::new();
 
-        render_editor_lines(&mut output, &lines, layout, 1, 0).unwrap();
+        render_editor_lines(&mut output, &lines, layout, 1, 0, true).unwrap();
 
         let output = String::from_utf8(output).unwrap();
         let expected = format!(
@@ -330,5 +357,57 @@ mod tests {
             output.contains(&expected),
             "renderer should force the terminal out of pending wrap after boundary wide char: {output:?}"
         );
+    }
+
+    #[test]
+    fn render_writes_single_cursor_hidden_frame() {
+        let lines = vec![
+            EditorLine::new("> ", "old".to_string()),
+            EditorLine::new("> ", "new".to_string()),
+        ];
+        let layout = RenderLayout {
+            rows: 2,
+            cursor_row: 1,
+            cursor_col: 5,
+            cursor_wraps_at_boundary: false,
+        };
+        let mut output = CountingWriter::default();
+
+        render_editor_lines(&mut output, &lines, layout, 2, 1, true).unwrap();
+
+        assert_eq!(
+            output.writes, 1,
+            "renderer should emit the repaint frame with a single write"
+        );
+        let output = String::from_utf8(output.bytes).unwrap();
+        let hide = output.find("\x1b[?25l").expect("cursor hide is emitted");
+        let clear = output.find("\x1b[2K").expect("line clear is emitted");
+        let show = output.find("\x1b[?25h").expect("cursor show is emitted");
+        assert!(
+            hide < clear,
+            "cursor should be hidden before clearing lines"
+        );
+        assert!(
+            clear < show,
+            "cursor should be shown only after the frame is redrawn"
+        );
+    }
+
+    #[test]
+    fn render_can_leave_cursor_hidden_after_frame() {
+        let lines = vec![EditorLine::new("> ", "history".to_string())];
+        let layout = RenderLayout {
+            rows: 1,
+            cursor_row: 0,
+            cursor_col: 9,
+            cursor_wraps_at_boundary: false,
+        };
+        let mut output = CountingWriter::default();
+
+        render_editor_lines(&mut output, &lines, layout, 1, 0, false).unwrap();
+
+        let output = String::from_utf8(output.bytes).unwrap();
+        assert!(output.contains("\x1b[?25l"));
+        assert!(!output.contains("\x1b[?25h"));
     }
 }

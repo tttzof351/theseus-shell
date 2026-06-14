@@ -359,6 +359,7 @@ impl<'a> LineEditor<'a> {
                 layout,
                 self.rendered_rows,
                 self.rendered_cursor_row,
+                true,
             )
         })?;
 
