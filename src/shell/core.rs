@@ -338,7 +338,7 @@ impl TheseusShell {
                 (InputHistoryKind::Shell, InputHistoryMode::MultiLineShell) => {
                     CommandHistoryItem::multiline_shell(entry.text.clone())
                 }
-                (InputHistoryKind::Agent, _) => {
+                (InputHistoryKind::Agent, InputHistoryMode::SingleLineAsk) => {
                     CommandHistoryItem::command(format!("/ask {}", entry.text))
                 }
                 _ => CommandHistoryItem::command(entry.text.clone()),
@@ -661,7 +661,7 @@ mod tests {
             vec![InputHistoryEntry::new(
                 "say hello \\\nfrom continuation",
                 InputHistoryKind::Agent,
-                InputHistoryMode::SingleLine,
+                InputHistoryMode::SingleLineAsk,
             )]
         );
         assert_eq!(
@@ -725,9 +725,39 @@ mod tests {
 
         assert!(saved.contains("\"text\": \"say hello\""));
         assert!(saved.contains("\"kind\": \"agent\""));
-        assert!(saved.contains("\"mode\": \"single_line\""));
+        assert!(saved.contains("\"mode\": \"single_line_ask\""));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn command_prompt_history_preserves_explicit_ask_prefix_only_for_explicit_ask() {
+        let mut shell = TheseusShell::new(ShellConfig::default());
+        shell.input_history = vec![
+            InputHistoryEntry::new(
+                "а что ты умеешь делать с bash?",
+                InputHistoryKind::Agent,
+                InputHistoryMode::SingleLine,
+            ),
+            InputHistoryEntry::new(
+                "а что ты умеешь делать с bash?",
+                InputHistoryKind::Agent,
+                InputHistoryMode::SingleLineAsk,
+            ),
+        ];
+
+        let history = shell.command_prompt_history();
+
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "а что ты умеешь делать с bash?",
+                "/ask а что ты умеешь делать с bash?"
+            ]
+        );
     }
 
     #[test]

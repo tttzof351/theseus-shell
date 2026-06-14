@@ -484,6 +484,68 @@ fn history_down_after_latest_restores_current_draft() -> io::Result<()> {
 }
 
 #[test]
+fn command_history_preserves_explicit_ask_prefix_for_single_line_agent_entries() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let home = temp_home()?;
+    let history_path = command_history_path(&home);
+    fs::create_dir_all(history_path.parent().unwrap())?;
+    fs::write(
+        &history_path,
+        r#"[
+  {
+    "text": "а что ты умеешь делать с bash?",
+    "kind": "agent",
+    "mode": "single_line"
+  },
+  {
+    "text": "а что ты умеешь делать с bash?",
+    "kind": "agent",
+    "mode": "single_line_ask"
+  }
+]
+"#,
+    )?;
+    let size = PtySize {
+        rows: 24,
+        cols: 100,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let mut shell = PtyShell::start_with_home_and_size(home, size)?;
+
+    let offset = shell.transcript_len();
+    shell.write(KEY_UP)?;
+    shell.wait_until_after(offset, |tail| {
+        strip_ansi_codes(tail).contains("/ask а что ты умеешь делать")
+    })?;
+    let explicit_ask_screen = VtScreen::parse(size, &shell.transcript_string()).text();
+    assert!(
+        explicit_ask_screen.contains("theseus-shell> /ask а что ты умеешь делать с bash?"),
+        "explicit /ask history entry should be recalled with /ask prefix:\n{explicit_ask_screen}"
+    );
+
+    let second_offset = shell.transcript_len();
+    shell.write(KEY_UP)?;
+    shell.wait_until_after(second_offset, |tail| {
+        let visible = strip_ansi_codes(tail);
+        visible.contains("theseus-shell") && visible.contains("а что ты умеешь делать с bash?")
+    })?;
+    let routed_agent_screen = VtScreen::parse(size, &shell.transcript_string()).text();
+    assert!(
+        routed_agent_screen.contains("theseus-shell> а что ты умеешь делать с bash?"),
+        "auto-routed agent history entry should be recalled without /ask prefix:\n{routed_agent_screen}"
+    );
+    assert!(
+        !routed_agent_screen.contains("theseus-shell> /ask а что ты умеешь делать с bash?"),
+        "auto-routed agent history entry should not gain /ask prefix:\n{routed_agent_screen}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Interrupted. Type /exit to exit the shell.")?;
+    shell.exit()
+}
+
+#[test]
 fn command_history_mode_walks_past_multiline_entry_without_cursor_repositioning() -> io::Result<()>
 {
     let _lock = pty_test_lock();

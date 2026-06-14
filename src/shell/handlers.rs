@@ -125,7 +125,7 @@ impl TheseusShell {
         *history_entry = Some(InputHistoryEntry::new(
             prompt,
             InputHistoryKind::Agent,
-            InputHistoryMode::SingleLine,
+            InputHistoryMode::SingleLineAsk,
         ));
         Ok(self.agent_output(prompt))
     }

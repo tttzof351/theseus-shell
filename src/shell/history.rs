@@ -46,6 +46,7 @@ pub(super) enum InputHistoryKind {
 #[serde(rename_all = "snake_case")]
 pub(super) enum InputHistoryMode {
     SingleLine,
+    SingleLineAsk,
     MultiLineAsk,
     MultiLineShell,
 }
