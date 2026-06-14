@@ -539,6 +539,31 @@ fn ask_multiline_history_up_recalls_previous_prompt() -> io::Result<()> {
 }
 
 #[test]
+fn ask_inline_backslash_continuation_reads_multiline_prompt() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    let offset = shell.transcript_len();
+    shell.write("/ask a ты меешь \\\rрассказывать \\\rанекдоты?\r")?;
+    let transcript = shell.wait_until_after(offset, |tail| tail.contains("анекдоты?"))?;
+
+    assert!(
+        transcript[offset..].contains("> рассказывать"),
+        "/ask backslash continuation did not show continuation prompt:\n{}",
+        &transcript[offset..]
+    );
+    assert!(
+        transcript[offset..].contains("a ты меешь")
+            && transcript[offset..].contains("рассказывать")
+            && transcript[offset..].contains("анекдоты?"),
+        "/ask backslash continuation did not preserve multiline prompt:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.exit()
+}
+
+#[test]
 fn ask_multiline_history_mode_walks_entries_without_cursor_repositioning() -> io::Result<()> {
     let _lock = pty_test_lock();
     let mut shell = PtyShell::start()?;

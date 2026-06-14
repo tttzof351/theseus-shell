@@ -51,7 +51,15 @@ pub(crate) enum IncompleteReason {
 
 pub(crate) fn should_read_shell_continuation(input: &str) -> bool {
     let trimmed = input.trim();
-    if trimmed.is_empty() || is_special_command(trimmed) || is_exit_command(trimmed) {
+    if trimmed.is_empty() || is_exit_command(trimmed) {
+        return false;
+    }
+
+    if matches!(parse_slash_command(trimmed), Some(SlashCommand::Ask)) {
+        return incomplete_reason(input) == Some(IncompleteReason::TrailingBackslash);
+    }
+
+    if is_special_command(trimmed) {
         return false;
     }
 
@@ -1175,8 +1183,8 @@ mod tests {
     }
 
     #[test]
-    fn ignores_non_shell_inputs_for_shell_continuation() {
-        assert!(!should_read_shell_continuation(r#"/ask \"#));
+    fn reads_ask_backslash_continuation_but_ignores_other_special_commands() {
+        assert!(should_read_shell_continuation(r#"/ask \"#));
         assert!(!should_read_shell_continuation(r#"/exit \"#));
         assert!(!should_read_shell_continuation(""));
     }

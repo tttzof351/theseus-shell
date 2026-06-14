@@ -532,6 +532,29 @@ mod tests {
     }
 
     #[test]
+    fn ask_command_accepts_backslash_continuation_prompt() {
+        let mut shell = TheseusShell::new(ShellConfig {
+            executable: PathBuf::from("false"),
+            ..ShellConfig::default()
+        });
+
+        let output = shell
+            .handle_command("/ask say hello \\\nfrom continuation")
+            .unwrap();
+
+        assert_eq!(output.status_code, Some(0));
+        assert_eq!(
+            output.transcript_lossy(),
+            "say hello \\\nfrom continuation\n"
+        );
+        assert_eq!(shell.ask_history, vec!["say hello \\\nfrom continuation"]);
+        assert_eq!(
+            shell.history()[0].input,
+            "/ask say hello \\\nfrom continuation"
+        );
+    }
+
+    #[test]
     fn loads_persisted_ask_history() {
         let path = env::temp_dir().join(format!(
             "theseus-ask-history-load-{}-{}.json",
