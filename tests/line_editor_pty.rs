@@ -431,6 +431,36 @@ fn bracketed_paste_assignment_before_heredoc_executes_as_one_command() -> io::Re
 }
 
 #[test]
+fn bracketed_paste_renders_multiline_command_before_submit() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    let command = concat!(
+        "USER_ID=42\n",
+        "cat <<JSON\n",
+        "{\n",
+        "  \"userId\": $USER_ID\n",
+        "}\n",
+        "JSON\n",
+    );
+
+    let offset = shell.transcript_len();
+    shell.write(BRACKETED_PASTE_START)?;
+    shell.write(command)?;
+    shell.write(BRACKETED_PASTE_END)?;
+    let transcript = shell.wait_until_after(offset, |tail| tail.contains("\"userId\": 42"))?;
+    let tail = &transcript[offset..];
+    let visible_tail = strip_ansi_codes(tail);
+
+    assert!(
+        visible_tail.contains("USER_ID=42") && visible_tail.contains("cat <<JSON"),
+        "bracketed pasted multiline command should be rendered before execution output:\n{visible_tail}"
+    );
+
+    shell.exit()
+}
+
+#[test]
 fn bracketed_paste_output_without_trailing_newline_does_not_merge_with_prompt() -> io::Result<()> {
     let _lock = pty_test_lock();
     let mut shell = PtyShell::start()?;
@@ -507,6 +537,47 @@ fn command_output_without_trailing_newline_does_not_merge_with_next_prompt() -> 
     assert!(
         !screen.contains("NO_NEWLINE_PROMPT_OKeuclid"),
         "prompt was rendered on the same row as command output without trailing newline:\n{screen}"
+    );
+
+    shell.exit()
+}
+
+#[test]
+fn clear_command_does_not_add_blank_line_before_next_prompt() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    let offset = shell.transcript_len();
+    shell.write("clear\r")?;
+    shell.wait_until_after(offset, |tail| {
+        (tail.contains("\x1b[2J") || tail.contains("\x1b[H"))
+            && VtScreen::parse(
+                PtySize {
+                    rows: 24,
+                    cols: 100,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                tail,
+            )
+            .text()
+            .contains("theseus-shell>")
+    })?;
+    let screen = VtScreen::parse(
+        PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        &shell.transcript_string(),
+    )
+    .text();
+    let first_line = screen.lines().next().unwrap_or_default();
+
+    assert!(
+        first_line.starts_with("euclid theseus-shell>"),
+        "clear should render the next prompt at the top of the cleared screen without a leading blank line:\n{screen}"
     );
 
     shell.exit()

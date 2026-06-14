@@ -407,6 +407,7 @@ impl<'a> CommandEditor<'a> {
 
         if ended_with_newline && !self.enter_should_continue() {
             let command = self.current_text();
+            self.render()?;
             self.finish_line()?;
             return Ok(Some(Some(CommandInputResult::Command(command))));
         }

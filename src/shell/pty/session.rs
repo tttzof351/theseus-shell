@@ -257,10 +257,8 @@ impl PersistentShellSession {
             pending.extend_from_slice(&chunk);
             if let Some(mut completed) = parse_completed_command(&pending, &self.nonce) {
                 strip_echoed_payload(&mut completed.transcript, payload);
-                let needs_prompt_separator = (!completed.transcript.is_empty()
-                    || !transcript.is_empty())
-                    && trailing_line_break_len(&completed.transcript) == 0
-                    && trailing_line_break_len(&transcript) == 0;
+                let needs_prompt_separator =
+                    output_ends_with_unfinished_visible_line(&transcript, &completed.transcript);
                 terminal_output::with_stdout(|stdout| {
                     stdout.write_all(&completed.transcript)?;
                     if needs_prompt_separator {
@@ -457,6 +455,82 @@ fn trailing_line_break_len(bytes: &[u8]) -> usize {
         1
     } else {
         0
+    }
+}
+
+fn output_ends_with_unfinished_visible_line(streamed: &[u8], final_chunk: &[u8]) -> bool {
+    let mut state = VisibleLineState::default();
+    state.consume(streamed);
+    state.consume(final_chunk);
+    state.has_unfinished_visible_text
+}
+
+#[derive(Default)]
+struct VisibleLineState {
+    has_unfinished_visible_text: bool,
+    escape: EscapeState,
+}
+
+#[derive(Default)]
+enum EscapeState {
+    #[default]
+    None,
+    Esc,
+    Csi,
+    Osc,
+    OscEsc,
+}
+
+impl VisibleLineState {
+    fn consume(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.consume_byte(byte);
+        }
+    }
+
+    fn consume_byte(&mut self, byte: u8) {
+        match self.escape {
+            EscapeState::None => self.consume_plain_byte(byte),
+            EscapeState::Esc => self.consume_esc_byte(byte),
+            EscapeState::Csi => {
+                if (0x40..=0x7e).contains(&byte) {
+                    self.escape = EscapeState::None;
+                }
+            }
+            EscapeState::Osc => {
+                if byte == 0x07 {
+                    self.escape = EscapeState::None;
+                } else if byte == 0x1b {
+                    self.escape = EscapeState::OscEsc;
+                }
+            }
+            EscapeState::OscEsc => {
+                self.escape = if byte == b'\\' {
+                    EscapeState::None
+                } else {
+                    EscapeState::Osc
+                };
+            }
+        }
+    }
+
+    fn consume_plain_byte(&mut self, byte: u8) {
+        match byte {
+            b'\n' | b'\r' => self.has_unfinished_visible_text = false,
+            0x1b => self.escape = EscapeState::Esc,
+            0x08 => self.has_unfinished_visible_text = false,
+            0x00..=0x1f | 0x7f => {}
+            _ => self.has_unfinished_visible_text = true,
+        }
+    }
+
+    fn consume_esc_byte(&mut self, byte: u8) {
+        self.escape = match byte {
+            b'[' => EscapeState::Csi,
+            b']' => EscapeState::Osc,
+            0x40..=0x5f => EscapeState::None,
+            _ => EscapeState::None,
+        };
     }
 }
 
@@ -674,6 +748,35 @@ mod tests {
     #[test]
     fn waits_for_complete_status_terminator() {
         assert!(parse_completed_command(b"hello\n__THESEUS_DONE_nonce_0", "nonce").is_none());
+    }
+
+    #[test]
+    fn separator_needed_after_visible_output_without_newline() {
+        assert!(output_ends_with_unfinished_visible_line(b"", b"hello"));
+        assert!(output_ends_with_unfinished_visible_line(b"hel", b"lo"));
+    }
+
+    #[test]
+    fn separator_not_needed_after_trailing_newline_or_carriage_return() {
+        assert!(!output_ends_with_unfinished_visible_line(b"", b"hello\n"));
+        assert!(!output_ends_with_unfinished_visible_line(b"", b"hello\r\n"));
+        assert!(!output_ends_with_unfinished_visible_line(b"", b"hello\r"));
+    }
+
+    #[test]
+    fn separator_not_needed_after_clear_screen_control_sequences() {
+        assert!(!output_ends_with_unfinished_visible_line(
+            b"",
+            b"\x1b[H\x1b[2J\x1b[3J"
+        ));
+    }
+
+    #[test]
+    fn separator_needed_when_visible_output_is_followed_by_style_reset() {
+        assert!(output_ends_with_unfinished_visible_line(
+            b"",
+            b"hello\x1b[0m"
+        ));
     }
 
     #[test]
