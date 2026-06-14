@@ -33,6 +33,8 @@ pub struct MultiLineConfig<'a> {
     pub prefix: String,
     pub exit_word: Option<String>,
     pub history: &'a [String],
+    pub initial_text: Option<String>,
+    pub initial_browsing: bool,
     pub on_change: Option<ChangeCallback<'a>>,
     pub render_mode: MultiLineRenderMode<'a>,
     pub completion_mode: MultiLineCompletionMode,
@@ -60,6 +62,8 @@ impl Default for MultiLineConfig<'_> {
             prefix: "> ".to_string(),
             exit_word: None,
             history: &[],
+            initial_text: None,
+            initial_browsing: false,
             on_change: None,
             render_mode: MultiLineRenderMode::Plain,
             completion_mode: MultiLineCompletionMode::PathOnly,
@@ -104,18 +108,28 @@ fn read_piped_input(config: &MultiLineConfig<'_>) -> io::Result<String> {
 
 impl<'a> MultiLineEditor<'a> {
     fn new(config: MultiLineConfig<'a>) -> Self {
+        let mut buffer = TextBuffer::new();
+        if let Some(text) = config.initial_text.as_deref() {
+            buffer.replace_with_text(text);
+        }
+        let mut history = HistoryBrowser::default();
+        if config.initial_browsing {
+            history.start_browsing();
+        }
         Self {
             on_change: config.on_change,
             config: MultiLineConfig {
                 prefix: config.prefix,
                 exit_word: config.exit_word,
                 history: config.history,
+                initial_text: None,
+                initial_browsing: false,
                 on_change: None,
                 render_mode: config.render_mode,
                 completion_mode: config.completion_mode,
             },
-            buffer: TextBuffer::new(),
-            history: HistoryBrowser::default(),
+            buffer,
+            history,
             completion: None,
             rendered_rows: 1,
             rendered_cursor_row: 0,
@@ -125,6 +139,9 @@ impl<'a> MultiLineEditor<'a> {
     fn run(&mut self) -> io::Result<String> {
         print!("{}", self.config.prefix);
         io::stdout().flush()?;
+        if !self.buffer.is_empty() {
+            self.render()?;
+        }
 
         loop {
             match event::read()? {
@@ -952,6 +969,29 @@ mod tests {
         editor.stop_history_navigation();
         let lines = editor.render_lines();
         assert_eq!(lines[0].text, "stored prompt");
+    }
+
+    #[test]
+    fn initial_browsing_text_renders_as_history_browsing_until_accepted() {
+        let mut editor = MultiLineEditor::new(MultiLineConfig {
+            initial_text: Some("line one\nline two".to_string()),
+            initial_browsing: true,
+            on_change: None,
+            ..MultiLineConfig::default()
+        });
+
+        assert_eq!(editor.buffer.text(), "line one\nline two");
+        assert!(editor.history.is_browsing());
+        let lines = editor.render_lines();
+        assert!(lines[0].text.contains("\x1b[3m"));
+        assert!(lines[1].text.contains("\x1b[3m"));
+
+        editor.accept_history_browsing();
+
+        assert!(!editor.history.is_browsing());
+        let lines = editor.render_lines();
+        assert!(!lines[0].text.contains("\x1b[3m"));
+        assert!(!lines[1].text.contains("\x1b[3m"));
     }
 
     #[test]

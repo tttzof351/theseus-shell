@@ -3,7 +3,10 @@ use std::{env, io, path::PathBuf};
 use super::pty::PersistentShellSession;
 use super::{
     command_routing::{CommandRoute, classify_command},
-    history::{CommandRecord, format_history, load_string_history, push_string_history},
+    history::{
+        CommandRecord, InputHistoryEntry, InputHistoryKind, InputHistoryMode, format_history,
+        load_input_history, push_input_history,
+    },
     input_syntax::should_read_shell_continuation,
     prompt::{default_prompt, default_shell},
     render::print_command_output,
@@ -16,11 +19,13 @@ use crate::common::{
     cancellation::{CancellationEvent, clear_sigint_request, install_sigint_handler},
     text::{TruncatePosition, truncate_utf8_to_bytes},
 };
-use crate::input::{CommandInputConfig, read_command_input};
+use crate::input::{
+    CommandHistoryItem, CommandInputConfig, CommandInputResult, read_command_input,
+};
 use crate::logging::AppLogger;
 
 #[cfg(not(test))]
-use super::history::{default_ask_history_path, default_command_history_path};
+use super::history::default_command_history_v2_path;
 
 const MAX_AGENT_SHELL_CONTEXT_OUTPUT_BYTES: usize = 32 * 1024;
 const INTERRUPTED_EXIT_HINT: &str = "Interrupted. Type /exit to exit the shell.";
@@ -37,8 +42,7 @@ pub struct ShellConfig {
     pub agent_config_path: Option<PathBuf>,
     pub agent: Option<Agent>,
     pub logger: Option<AppLogger>,
-    pub command_history_path: Option<PathBuf>,
-    pub ask_history_path: Option<PathBuf>,
+    pub command_history_v2_path: Option<PathBuf>,
 }
 
 impl Default for ShellConfig {
@@ -47,13 +51,9 @@ impl Default for ShellConfig {
         let prompt = default_prompt(working_dir.as_ref());
 
         #[cfg(not(test))]
-        let command_history_path = default_command_history_path().ok();
+        let command_history_v2_path = default_command_history_v2_path().ok();
         #[cfg(test)]
-        let command_history_path = None;
-        #[cfg(not(test))]
-        let ask_history_path = default_ask_history_path().ok();
-        #[cfg(test)]
-        let ask_history_path = None;
+        let command_history_v2_path = None;
 
         Self {
             executable: default_shell(),
@@ -65,8 +65,7 @@ impl Default for ShellConfig {
             agent_config_path: None,
             agent: None,
             logger: None,
-            command_history_path,
-            ask_history_path,
+            command_history_v2_path,
         }
     }
 }
@@ -76,8 +75,7 @@ pub struct TheseusShell {
     pub(super) agent: Option<Agent>,
     pub(super) shell_session: Option<PersistentShellSession>,
     history: Vec<CommandRecord>,
-    pub(super) input_history: Vec<String>,
-    pub(super) ask_history: Vec<String>,
+    pub(super) input_history: Vec<InputHistoryEntry>,
 }
 
 impl TheseusShell {
@@ -93,14 +91,9 @@ impl TheseusShell {
             });
 
         let input_history = config
-            .command_history_path
+            .command_history_v2_path
             .as_ref()
-            .and_then(|path| load_string_history(path).ok())
-            .unwrap_or_default();
-        let ask_history = config
-            .ask_history_path
-            .as_ref()
-            .and_then(|path| load_string_history(path).ok())
+            .and_then(|path| load_input_history(path).ok())
             .unwrap_or_default();
 
         Self {
@@ -109,7 +102,6 @@ impl TheseusShell {
             shell_session: None,
             history: Vec::new(),
             input_history,
-            ask_history,
         }
     }
 
@@ -133,14 +125,36 @@ impl TheseusShell {
                 .agent_config
                 .as_ref()
                 .map(|config| &config.shell_settings.shell_highlight);
+            let command_history = self.command_prompt_history();
             let input = match read_command_input(CommandInputConfig {
                 prompt: &self.config.prompt,
                 continuation_prompt: SHELL_CONTINUATION_PROMPT,
-                history: &self.input_history,
+                history: &command_history,
                 should_continue: should_read_shell_continuation,
                 shell_highlight,
             }) {
-                Ok(Some(input)) => input,
+                Ok(Some(CommandInputResult::Command(input))) => input,
+                Ok(Some(CommandInputResult::MultilineAsk(input))) => {
+                    let mut history_entry = None;
+                    let output = match self.read_ask_input(&mut history_entry, Some(input), false) {
+                        Ok(output) => output,
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                            println!("\n{INTERRUPTED_EXIT_HINT}");
+                            clear_sigint_request();
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    print_command_output(&output)?;
+                    if let Some(entry) = history_entry {
+                        self.history.push(CommandRecord {
+                            input: format!("/ask\n{}", entry.text),
+                            output: output.clone(),
+                        });
+                        self.store_input_history(entry);
+                    }
+                    continue;
+                }
                 Ok(None) => {
                     println!();
                     return Ok(0);
@@ -181,7 +195,8 @@ impl TheseusShell {
     }
 
     pub fn handle_command(&mut self, input: &str) -> io::Result<CommandOutput> {
-        let mut history_input = Some(input.to_string());
+        let mut record_input = Some(input.to_string());
+        let mut persistent_history_entry = None;
         self.log_event(
             "info",
             "command_start",
@@ -199,10 +214,14 @@ impl TheseusShell {
             Some(SlashCommand::Compact) => self.handle_compact_command()?,
             Some(SlashCommand::Resume) => self.handle_resume_command()?,
             Some(SlashCommand::Config) => self.handle_config_command()?,
-            Some(SlashCommand::Ask) => self.handle_ask_command(trimmed)?,
-            Some(SlashCommand::Shell) => {
-                self.handle_shell_editor_command(trimmed, &mut history_input)?
+            Some(SlashCommand::Ask) => {
+                self.handle_ask_command(trimmed, &mut persistent_history_entry)?
             }
+            Some(SlashCommand::Shell) => self.handle_shell_editor_command(
+                trimmed,
+                &mut record_input,
+                &mut persistent_history_entry,
+            )?,
             Some(SlashCommand::Help) => self.handle_help_command(),
             None => match trimmed {
                 command if is_exit_command(command) => CommandOutput::success(""),
@@ -210,24 +229,52 @@ impl TheseusShell {
                     if classify_command(command, self.config.working_dir.as_deref())
                         == CommandRoute::Agent =>
                 {
+                    persistent_history_entry = Some(InputHistoryEntry::new(
+                        command,
+                        InputHistoryKind::Agent,
+                        InputHistoryMode::SingleLine,
+                    ));
                     self.agent_output(command)
                 }
                 command
                     if !crate::feature_flags::PERSISTENT_SHELL_SESSION
                         && is_cd_command(command) =>
                 {
+                    persistent_history_entry = Some(InputHistoryEntry::new(
+                        command,
+                        InputHistoryKind::Shell,
+                        InputHistoryMode::SingleLine,
+                    ));
                     self.change_directory(command)
                 }
-                command => self.run_external_command(command)?,
+                command => {
+                    persistent_history_entry = Some(InputHistoryEntry::new(
+                        command,
+                        InputHistoryKind::Shell,
+                        InputHistoryMode::SingleLine,
+                    ));
+                    self.run_external_command(command)?
+                }
             },
         };
 
-        if let Some(history_input) = history_input {
+        if persistent_history_entry.is_none() && record_input.is_some() && !trimmed.is_empty() {
+            persistent_history_entry = Some(InputHistoryEntry::new(
+                trimmed,
+                InputHistoryKind::Special,
+                InputHistoryMode::SingleLine,
+            ));
+        }
+
+        if let Some(history_input) = record_input {
             self.history.push(CommandRecord {
                 input: history_input.clone(),
                 output: output.clone(),
             });
-            self.store_input_history(&history_input);
+        }
+
+        if let Some(entry) = persistent_history_entry {
+            self.store_input_history(entry);
         }
 
         self.log_event(
@@ -248,9 +295,40 @@ impl TheseusShell {
         Ok(output)
     }
 
-    fn store_input_history(&mut self, input: &str) {
-        push_string_history(&mut self.input_history, input);
+    fn store_input_history(&mut self, entry: InputHistoryEntry) {
+        push_input_history(&mut self.input_history, entry);
         self.save_input_history();
+    }
+
+    pub(super) fn command_prompt_history(&self) -> Vec<CommandHistoryItem> {
+        self.input_history
+            .iter()
+            .map(|entry| match (entry.kind, entry.mode) {
+                (InputHistoryKind::Agent, InputHistoryMode::MultiLineAsk) => {
+                    CommandHistoryItem::multiline_ask(entry.text.clone())
+                }
+                (InputHistoryKind::Agent, _) => {
+                    CommandHistoryItem::command(format!("/ask {}", entry.text))
+                }
+                _ => CommandHistoryItem::command(entry.text.clone()),
+            })
+            .collect()
+    }
+
+    pub(super) fn ask_mode_history(&self) -> Vec<String> {
+        self.input_history
+            .iter()
+            .filter(|entry| entry.kind == InputHistoryKind::Agent)
+            .map(|entry| entry.text.clone())
+            .collect()
+    }
+
+    pub(super) fn shell_mode_history(&self) -> Vec<String> {
+        self.input_history
+            .iter()
+            .filter(|entry| entry.kind == InputHistoryKind::Shell)
+            .map(|entry| entry.text.clone())
+            .collect()
     }
 
     pub(super) fn run_agent(&mut self, prompt: &str) -> io::Result<String> {
@@ -547,7 +625,14 @@ mod tests {
             output.transcript_lossy(),
             "say hello \\\nfrom continuation\n"
         );
-        assert_eq!(shell.ask_history, vec!["say hello \\\nfrom continuation"]);
+        assert_eq!(
+            shell.input_history,
+            vec![InputHistoryEntry::new(
+                "say hello \\\nfrom continuation",
+                InputHistoryKind::Agent,
+                InputHistoryMode::SingleLine,
+            )]
+        );
         assert_eq!(
             shell.history()[0].input,
             "/ask say hello \\\nfrom continuation"
@@ -555,41 +640,61 @@ mod tests {
     }
 
     #[test]
-    fn loads_persisted_ask_history() {
+    fn loads_persisted_input_history_v2() {
         let path = env::temp_dir().join(format!(
-            "theseus-ask-history-load-{}-{}.json",
+            "theseus-input-history-v2-load-{}-{}.json",
             std::process::id(),
             unique_test_suffix()
         ));
-        std::fs::write(&path, "[\"old ask\"]\n").unwrap();
+        std::fs::write(
+            &path,
+            r#"[
+  {
+    "text": "old ask",
+    "kind": "agent",
+    "mode": "multi_line_ask"
+  }
+]
+"#,
+        )
+        .unwrap();
 
         let shell = TheseusShell::new(ShellConfig {
-            ask_history_path: Some(path.clone()),
+            command_history_v2_path: Some(path.clone()),
             ..ShellConfig::default()
         });
 
-        assert_eq!(shell.ask_history, vec!["old ask"]);
+        assert_eq!(
+            shell.input_history,
+            vec![InputHistoryEntry::new(
+                "old ask",
+                InputHistoryKind::Agent,
+                InputHistoryMode::MultiLineAsk,
+            )]
+        );
 
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn ask_command_persists_single_line_prompt() {
+    fn ask_command_persists_single_line_prompt_to_v2_history() {
         let path = env::temp_dir().join(format!(
-            "theseus-ask-history-save-{}-{}.json",
+            "theseus-input-history-v2-save-{}-{}.json",
             std::process::id(),
             unique_test_suffix()
         ));
         let mut shell = TheseusShell::new(ShellConfig {
             executable: PathBuf::from("false"),
-            ask_history_path: Some(path.clone()),
+            command_history_v2_path: Some(path.clone()),
             ..ShellConfig::default()
         });
 
         shell.handle_command("/ask say hello").unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
 
-        assert_eq!(saved, "[\n  \"say hello\"\n]\n");
+        assert!(saved.contains("\"text\": \"say hello\""));
+        assert!(saved.contains("\"kind\": \"agent\""));
+        assert!(saved.contains("\"mode\": \"single_line\""));
 
         let _ = std::fs::remove_file(path);
     }
@@ -633,7 +738,11 @@ mod tests {
         assert_eq!(shell.history()[0].input, "printf SHELL_INLINE_OK");
         assert_eq!(
             shell.input_history,
-            vec!["printf SHELL_INLINE_OK".to_string()]
+            vec![InputHistoryEntry::new(
+                "printf SHELL_INLINE_OK",
+                InputHistoryKind::Shell,
+                InputHistoryMode::SingleLine,
+            )]
         );
     }
 

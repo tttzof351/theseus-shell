@@ -28,19 +28,58 @@ use super::{
 };
 use crate::commands::slash_commands;
 
+const MULTILINE_ASK_HINT: &str = "Enter multiline input. Type /end on a new line to finish.";
+
 #[cfg(test)]
 use super::completion::{Completion, CompletionToken};
 
 pub struct CommandInputConfig<'a> {
     pub prompt: &'a str,
     pub continuation_prompt: &'a str,
-    pub history: &'a [String],
+    pub history: &'a [CommandHistoryItem],
     pub should_continue: fn(&str) -> bool,
     pub shell_highlight: Option<&'a ShellHighlightPalette>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandHistoryItem {
+    pub text: String,
+    pub submit: CommandHistorySubmit,
+}
+
+impl CommandHistoryItem {
+    pub fn command(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            submit: CommandHistorySubmit::Command(text.clone()),
+            text,
+        }
+    }
+
+    pub fn multiline_ask(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            text: format!("/ask\n{text}"),
+            submit: CommandHistorySubmit::MultilineAsk(text),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandHistorySubmit {
+    Command(String),
+    MultilineAsk(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandInputResult {
+    Command(String),
+    MultilineAsk(String),
+}
+
 struct CommandEditor<'a> {
     config: CommandInputConfig<'a>,
+    history_texts: Vec<String>,
     buffer: TextBuffer,
     history: HistoryBrowser,
     completion: Option<CompletionState>,
@@ -48,9 +87,11 @@ struct CommandEditor<'a> {
     rendered_cursor_row: u16,
 }
 
-pub fn read_command_input(config: CommandInputConfig<'_>) -> io::Result<Option<String>> {
+pub fn read_command_input(
+    config: CommandInputConfig<'_>,
+) -> io::Result<Option<CommandInputResult>> {
     if !io::stdin().is_terminal() {
-        return read_stdin_line();
+        return read_stdin_line().map(|line| line.map(CommandInputResult::Command));
     }
 
     let _raw_mode = RawModeGuard::enable()?;
@@ -69,8 +110,14 @@ fn read_stdin_line() -> io::Result<Option<String>> {
 
 impl<'a> CommandEditor<'a> {
     fn new(config: CommandInputConfig<'a>) -> Self {
+        let history_texts = config
+            .history
+            .iter()
+            .map(|item| item.text.clone())
+            .collect();
         Self {
             config,
+            history_texts,
             buffer: TextBuffer::new(),
             history: HistoryBrowser::default(),
             completion: None,
@@ -79,7 +126,7 @@ impl<'a> CommandEditor<'a> {
         }
     }
 
-    fn run(&mut self) -> io::Result<Option<String>> {
+    fn run(&mut self) -> io::Result<Option<CommandInputResult>> {
         print!("{}", self.config.prompt);
         io::stdout().flush()?;
 
@@ -101,7 +148,7 @@ impl<'a> CommandEditor<'a> {
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> io::Result<Option<Option<String>>> {
+    fn handle_key(&mut self, key: KeyEvent) -> io::Result<Option<Option<CommandInputResult>>> {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.show_cursor()?;
@@ -117,6 +164,13 @@ impl<'a> CommandEditor<'a> {
             }
             KeyCode::Enter => {
                 self.clear_completion();
+                if let Some(text) = self.selected_multiline_ask_submit() {
+                    self.history.accept();
+                    self.buffer.replace_with_text("/ask");
+                    self.render()?;
+                    self.finish_line()?;
+                    return Ok(Some(Some(CommandInputResult::MultilineAsk(text))));
+                }
                 if self.apply_browsing_input(BrowsingInput::Enter) == BrowsingAction::Accept {
                     self.render()?;
                     return Ok(None);
@@ -126,7 +180,7 @@ impl<'a> CommandEditor<'a> {
                     self.render()?;
                 } else {
                     self.finish_line()?;
-                    return Ok(Some(Some(self.current_text())));
+                    return Ok(Some(Some(CommandInputResult::Command(self.current_text()))));
                 }
             }
             KeyCode::Backspace => {
@@ -191,7 +245,11 @@ impl<'a> CommandEditor<'a> {
                 self.clear_completion();
                 self.apply_browsing_input(BrowsingInput::HistoryPrevious);
                 if self.history.is_browsing() || self.can_navigate_history() {
-                    self.history_previous();
+                    if let Some(result) = self.history_previous() {
+                        self.render()?;
+                        self.finish_line()?;
+                        return Ok(Some(Some(result)));
+                    }
                 } else {
                     self.buffer.move_up();
                 }
@@ -201,7 +259,11 @@ impl<'a> CommandEditor<'a> {
                 self.clear_completion();
                 self.apply_browsing_input(BrowsingInput::HistoryNext);
                 if self.history.is_browsing() || self.can_navigate_history() {
-                    self.history_next();
+                    if let Some(result) = self.history_next() {
+                        self.render()?;
+                        self.finish_line()?;
+                        return Ok(Some(Some(result)));
+                    }
                 } else {
                     self.buffer.move_down();
                 }
@@ -233,7 +295,7 @@ impl<'a> CommandEditor<'a> {
         Ok(None)
     }
 
-    fn handle_paste(&mut self, text: &str) -> io::Result<Option<Option<String>>> {
+    fn handle_paste(&mut self, text: &str) -> io::Result<Option<Option<CommandInputResult>>> {
         self.clear_completion();
         self.apply_browsing_input(BrowsingInput::Paste);
 
@@ -251,7 +313,7 @@ impl<'a> CommandEditor<'a> {
                 self.split_line();
             } else {
                 self.finish_line()?;
-                return Ok(Some(Some(self.current_text())));
+                return Ok(Some(Some(CommandInputResult::Command(self.current_text()))));
             }
         }
 
@@ -308,6 +370,10 @@ impl<'a> CommandEditor<'a> {
     }
 
     fn render_lines(&self) -> Vec<EditorLine<'_>> {
+        if self.selected_multiline_ask_submit().is_some() && self.buffer.lines_len() > 1 {
+            return self.render_multiline_ask_preview_lines();
+        }
+
         let highlighted_shell_lines = if self.line_text(0).starts_with('/') {
             Vec::new()
         } else {
@@ -347,6 +413,37 @@ impl<'a> CommandEditor<'a> {
                 )
             })
             .collect()
+    }
+
+    fn render_multiline_ask_preview_lines(&self) -> Vec<EditorLine<'_>> {
+        let mut lines = Vec::with_capacity(self.buffer.lines_len() + 1);
+        let first_line = self.line_text(0);
+        let first_line = highlighted_input(&first_line);
+        let first_line = colorize_tag("italic", &first_line);
+        lines.push(EditorLine::with_visible_len(
+            self.config.prompt,
+            first_line,
+            text_length(&self.line_text(0), false),
+        ));
+
+        let hint = colorize_tag("bright-black", MULTILINE_ASK_HINT);
+        lines.push(EditorLine::with_visible_len(
+            "",
+            hint,
+            text_length(MULTILINE_ASK_HINT, false),
+        ));
+
+        for index in 1..self.buffer.lines_len() {
+            let line = self.line_text(index);
+            let rendered_line = colorize_tag("italic", &line);
+            lines.push(EditorLine::with_visible_len(
+                self.config.continuation_prompt,
+                rendered_line,
+                text_length(&line, false),
+            ));
+        }
+
+        lines
     }
 
     fn cursor_visible_col(&self) -> usize {
@@ -451,38 +548,66 @@ impl<'a> CommandEditor<'a> {
         self.buffer.move_word_right();
     }
 
-    fn history_previous(&mut self) {
-        if self.config.history.is_empty() {
-            return;
+    fn history_previous(&mut self) -> Option<CommandInputResult> {
+        if self.history_texts.is_empty() {
+            return None;
         }
         let current_text = self.current_text();
         let can_start = self.can_navigate_history();
         let selected = self.history.previous(
-            self.config.history,
+            &self.history_texts,
             current_text,
             can_start,
             command_history_entry_mode,
         );
-        self.apply_history_move(selected);
+        match selected {
+            HistoryMove::Selected { index, text, .. } => {
+                self.apply_selected_history(index, text.to_string())
+            }
+            HistoryMove::RestoredDraft(draft) => {
+                self.buffer.replace_with_text(&draft);
+                None
+            }
+            HistoryMove::Unchanged => None,
+        }
     }
 
-    fn history_next(&mut self) {
+    fn history_next(&mut self) -> Option<CommandInputResult> {
         let can_start = self.can_navigate_history();
         let selected =
             self.history
-                .next(self.config.history, can_start, command_history_entry_mode);
-        self.apply_history_move(selected);
+                .next(&self.history_texts, can_start, command_history_entry_mode);
+        match selected {
+            HistoryMove::Selected { index, text, .. } => {
+                self.apply_selected_history(index, text.to_string())
+            }
+            HistoryMove::RestoredDraft(draft) => {
+                self.buffer.replace_with_text(&draft);
+                None
+            }
+            HistoryMove::Unchanged => None,
+        }
     }
 
     fn can_navigate_history(&self) -> bool {
         self.history.index().is_some() || (self.buffer.lines_len() == 1 && self.buffer.row() == 0)
     }
 
-    fn apply_history_move(&mut self, selected: HistoryMove<'_>) {
-        match selected {
-            HistoryMove::Selected { text, .. } => self.buffer.replace_with_text(text),
-            HistoryMove::RestoredDraft(draft) => self.buffer.replace_with_text(&draft),
-            HistoryMove::Unchanged => {}
+    fn apply_selected_history(
+        &mut self,
+        index: usize,
+        display_text: String,
+    ) -> Option<CommandInputResult> {
+        self.buffer.replace_with_text(&display_text);
+        let _ = index;
+        None
+    }
+
+    fn selected_multiline_ask_submit(&self) -> Option<String> {
+        let index = self.history.index()?;
+        match &self.config.history.get(index)?.submit {
+            CommandHistorySubmit::Command(_) => None,
+            CommandHistorySubmit::MultilineAsk(text) => Some(text.clone()),
         }
     }
 
@@ -615,7 +740,14 @@ mod tests {
         text.trim_start().starts_with("if ") && !text.trim_end().ends_with("\nfi")
     }
 
-    fn config<'a>(history: &'a [String]) -> CommandInputConfig<'a> {
+    fn command_history(entries: &[&str]) -> Vec<CommandHistoryItem> {
+        entries
+            .iter()
+            .map(|entry| CommandHistoryItem::command(*entry))
+            .collect()
+    }
+
+    fn config<'a>(history: &'a [CommandHistoryItem]) -> CommandInputConfig<'a> {
         CommandInputConfig {
             prompt: "main> ",
             continuation_prompt: "> ",
@@ -669,7 +801,10 @@ mod tests {
 
         let submitted = editor.handle_paste("echo ok\n").unwrap();
 
-        assert_eq!(submitted, Some(Some("echo ok".to_string())));
+        assert_eq!(
+            submitted,
+            Some(Some(CommandInputResult::Command("echo ok".to_string())))
+        );
     }
 
     #[test]
@@ -686,7 +821,9 @@ mod tests {
 
         assert_eq!(
             submitted,
-            Some(Some("if true; then\necho IF_FROM_PASTE\nfi".to_string()))
+            Some(Some(CommandInputResult::Command(
+                "if true; then\necho IF_FROM_PASTE\nfi".to_string()
+            )))
         );
     }
 
@@ -777,7 +914,7 @@ mod tests {
 
     #[test]
     fn history_replaces_single_line_buffer() {
-        let history = vec!["first".to_string(), "second".to_string()];
+        let history = command_history(&["first", "second"]);
         let mut editor = CommandEditor::new(config(&history));
 
         editor.history_previous();
@@ -789,12 +926,23 @@ mod tests {
     }
 
     #[test]
+    fn history_multiline_ask_entry_returns_multiline_ask_submit_signal() {
+        let history = vec![CommandHistoryItem::multiline_ask("line one\nline two")];
+        let mut editor = CommandEditor::new(config(&history));
+
+        let selected = editor.history_previous();
+
+        assert_eq!(selected, None);
+        assert_eq!(editor.current_text(), "/ask\nline one\nline two");
+        assert_eq!(
+            editor.selected_multiline_ask_submit(),
+            Some("line one\nline two".to_string())
+        );
+    }
+
+    #[test]
     fn history_navigation_can_leave_multiline_history_entry() {
-        let history = vec![
-            "first".to_string(),
-            "echo \\\n \"test\"".to_string(),
-            "third".to_string(),
-        ];
+        let history = command_history(&["first", "echo \\\n \"test\"", "third"]);
         let mut editor = CommandEditor::new(config(&history));
 
         editor.history_previous();
@@ -819,7 +967,7 @@ mod tests {
 
     #[test]
     fn history_browsing_requires_enter_before_multiline_cursor_navigation() {
-        let history = vec!["echo \\\n \"test\"".to_string()];
+        let history = command_history(&["echo \\\n \"test\""]);
         let mut editor = CommandEditor::new(config(&history));
 
         editor.history_previous();
@@ -834,7 +982,7 @@ mod tests {
 
     #[test]
     fn enter_accepts_history_browsing_before_up_moves_cursor() {
-        let history = vec!["echo \\\n \"test\"".to_string()];
+        let history = command_history(&["echo \\\n \"test\""]);
         let mut editor = CommandEditor::new(config(&history));
 
         editor.history_previous();
@@ -851,7 +999,7 @@ mod tests {
 
     #[test]
     fn history_browsing_render_lines_are_italic_until_editing_is_accepted() {
-        let history = vec!["echo \\\n \"test\"".to_string()];
+        let history = command_history(&["echo \\\n \"test\""]);
         let mut editor = CommandEditor::new(config(&history));
 
         editor.history_previous();
@@ -867,7 +1015,7 @@ mod tests {
 
     #[test]
     fn history_is_disabled_for_multiline_buffer() {
-        let history = vec!["history".to_string()];
+        let history = command_history(&["history"]);
         let mut editor = CommandEditor::new(config(&history));
         editor.insert_text("echo \\\n");
 

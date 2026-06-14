@@ -56,6 +56,12 @@ impl HistoryBrowser {
         self.browsing
     }
 
+    pub(super) fn start_browsing(&mut self) {
+        self.index = None;
+        self.browsing = true;
+        self.draft.clear();
+    }
+
     pub(super) fn accept(&mut self) {
         self.stop();
     }
@@ -224,6 +230,21 @@ mod tests {
             BrowsingAction::Accept
         );
         assert_eq!(browser.index(), None);
+        assert!(!browser.is_browsing());
+    }
+
+    #[test]
+    fn start_browsing_enables_browsing_without_selection() {
+        let mut browser = HistoryBrowser::default();
+
+        browser.start_browsing();
+
+        assert_eq!(browser.index(), None);
+        assert!(browser.is_browsing());
+        assert_eq!(
+            browser.apply_input(BrowsingInput::Enter),
+            BrowsingAction::Accept
+        );
         assert!(!browser.is_browsing());
     }
 

@@ -22,7 +22,10 @@ pub use dedent::{dedent, dedent_keep_indent};
 pub use highlight::{FormatterOpts, available_languages, available_styles, format_source_code};
 pub(crate) use key::{is_alt_key, is_command_key, is_control_key, is_key_press, is_plain_text_key};
 pub(crate) use raw_mode::RawModeGuard;
-pub use read_command::{CommandInputConfig, read_command_input};
+pub use read_command::{
+    CommandHistoryItem, CommandHistorySubmit, CommandInputConfig, CommandInputResult,
+    read_command_input,
+};
 pub use read_line::{read_line_with_history, read_masked_line};
 pub use read_multiline::{
     MultiLineCompletionMode, MultiLineConfig, MultiLineRenderMode, read_multi_line_input,

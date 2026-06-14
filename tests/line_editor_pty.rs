@@ -217,7 +217,7 @@ fn temp_home() -> io::Result<PathBuf> {
 fn command_history_path(home: &std::path::Path) -> PathBuf {
     home.join(".theseus")
         .join("persist")
-        .join("history_command.json")
+        .join("history_command_v2.json")
 }
 
 fn count_matches(haystack: &str, needle: &str) -> usize {
@@ -610,6 +610,160 @@ fn ask_multiline_history_mode_walks_entries_without_cursor_repositioning() -> io
 }
 
 #[test]
+fn command_history_multiline_ask_recall_finishes_prompt_line_before_editor() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let home = temp_home()?;
+    let history_path = command_history_path(&home);
+    fs::create_dir_all(history_path.parent().unwrap())?;
+    fs::write(
+        &history_path,
+        r#"[
+  {
+    "text": "A ты умеешь\nрассказывать\nанекдоты\nпро\nпиратов?",
+    "kind": "agent",
+    "mode": "multi_line_ask"
+  }
+]
+"#,
+    )?;
+    let mut shell = PtyShell::start_with_home(home)?;
+
+    let offset = shell.transcript_len();
+    shell.write("clear")?;
+    shell.write(KEY_UP)?;
+    shell.write("\r")?;
+    shell.wait_until_after(offset, |tail| {
+        tail.contains("Enter multiline input") && tail.contains("пиратов?")
+    })?;
+    let screen = VtScreen::parse(
+        PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        &shell.transcript_string(),
+    )
+    .text();
+
+    assert!(
+        !screen.contains("clearEnter multiline input"),
+        "multiline /ask recall was rendered on the same prompt row as the current draft:\n{screen}"
+    );
+    assert!(
+        screen.contains("theseus-shell> /ask"),
+        "multiline /ask recall did not show the recalled /ask command before opening the editor:\n{screen}"
+    );
+    assert!(
+        screen.contains("> A ты умеешь") && screen.contains("> пиратов?"),
+        "multiline /ask editor did not render the recalled prompt:\n{screen}"
+    );
+    assert_eq!(
+        count_matches(&screen, "пиратов?"),
+        1,
+        "multiline /ask preview was not cleared before opening the editor:\n{screen}"
+    );
+    let transcript = shell.transcript_string();
+    let transition_tail = &transcript[offset..];
+    let editor_tail = transition_tail
+        .rsplit("Enter multiline input")
+        .next()
+        .unwrap_or(transition_tail);
+    let accepted_prompt_tail = transition_tail
+        .rsplit("theseus-shell")
+        .next()
+        .unwrap_or(transition_tail);
+    assert!(
+        !accepted_prompt_tail.contains("\x1b[3m\x1b[96m/ask"),
+        "accepted multiline /ask command should not stay italic after leaving command-history browsing:\n{transition_tail}"
+    );
+    assert!(
+        !editor_tail.contains("\x1b[3mпиратов?"),
+        "multiline /ask editor should open in editing mode after command-history selection:\n{transition_tail}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Ask cancelled")?;
+    shell.exit()
+}
+
+#[test]
+fn command_history_down_returns_from_multiline_ask_preview_to_newer_command() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let home = temp_home()?;
+    let history_path = command_history_path(&home);
+    fs::create_dir_all(history_path.parent().unwrap())?;
+    fs::write(
+        &history_path,
+        r#"[
+  {
+    "text": "A ты умеешь\nрассказывать\nанекдоты?",
+    "kind": "agent",
+    "mode": "multi_line_ask"
+  },
+  {
+    "text": "clear",
+    "kind": "shell",
+    "mode": "single_line"
+  }
+]
+"#,
+    )?;
+    let mut shell = PtyShell::start_with_home(home)?;
+
+    let offset = shell.transcript_len();
+    shell.write(KEY_UP)?;
+    shell.wait_until_after(offset, |tail| tail.contains("clear"))?;
+    shell.write(KEY_UP)?;
+    shell.wait_until_after(offset, |tail| {
+        tail.contains("/ask")
+            && tail.contains("A ты умеешь")
+            && tail.contains("рассказывать")
+            && tail.contains("анекдоты?")
+    })?;
+    let preview_screen = VtScreen::parse(
+        PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        &shell.transcript_string(),
+    )
+    .text();
+    assert!(
+        preview_screen.contains("Enter multiline input. Type /end on a new line to finish."),
+        "multiline /ask command-history preview should show the multiline editor hint:\n{preview_screen}"
+    );
+    shell.write(KEY_DOWN)?;
+    let transcript = shell.wait_until_after(offset, |tail| count_matches(tail, "clear") >= 2)?;
+    let screen = VtScreen::parse(
+        PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        &shell.transcript_string(),
+    )
+    .text();
+
+    assert!(
+        screen.contains("theseus-shell> clear"),
+        "Down did not return from multiline /ask history preview to the newer command:\n{screen}\n\ntranscript:\n{}",
+        &transcript[offset..]
+    );
+    assert!(
+        !screen.contains("Enter multiline input"),
+        "Down should stay inside command history browsing instead of entering multiline /ask editor:\n{screen}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Interrupted. Type /exit to exit the shell.")?;
+    shell.exit()
+}
+
+#[test]
 fn ask_multiline_history_preserves_cancelled_draft() -> io::Result<()> {
     let _lock = pty_test_lock();
     let mut shell = PtyShell::start()?;
@@ -622,15 +776,12 @@ fn ask_multiline_history_preserves_cancelled_draft() -> io::Result<()> {
     shell.write("\u{3}")?;
     shell.wait_for_after(cancel_offset, "Ask cancelled")?;
     shell.wait_for_after(cancel_offset, "theseus-shell")?;
-    let saved = fs::read_to_string(
-        shell
-            .home
-            .join(".theseus")
-            .join("persist")
-            .join("history_ask.json"),
-    )?;
+    let saved = fs::read_to_string(command_history_path(&shell.home))?;
     assert!(
-        saved.contains("ASK_CANCELLED_DRAFT_ONE") && saved.contains("ASK_CANCELLED_DRAFT_TWO"),
+        saved.contains("ASK_CANCELLED_DRAFT_ONE")
+            && saved.contains("ASK_CANCELLED_DRAFT_TWO")
+            && saved.contains("\"kind\": \"agent\"")
+            && saved.contains("\"mode\": \"multi_line_ask\""),
         "cancelled /ask draft was not persisted:\n{saved}"
     );
 
@@ -647,6 +798,67 @@ fn ask_multiline_history_preserves_cancelled_draft() -> io::Result<()> {
             && transcript[offset..].contains("ASK_CANCELLED_DRAFT_TWO"),
         "Up did not recall the cancelled multiline /ask draft:\n{}",
         &transcript[offset..]
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Ask cancelled")?;
+    shell.exit()
+}
+
+#[test]
+fn ask_multiline_history_deduplicates_entries_after_filtering() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let home = temp_home()?;
+    let history_path = command_history_path(&home);
+    fs::create_dir_all(history_path.parent().unwrap())?;
+    fs::write(
+        &history_path,
+        r#"[
+  {
+    "text": "ASK_FILTERED_DUPLICATE_PROMPT",
+    "kind": "agent",
+    "mode": "multi_line_ask"
+  },
+  {
+    "text": "clear",
+    "kind": "shell",
+    "mode": "single_line"
+  },
+  {
+    "text": "ASK_FILTERED_DUPLICATE_PROMPT",
+    "kind": "agent",
+    "mode": "multi_line_ask"
+  }
+]
+"#,
+    )?;
+    let mut shell = PtyShell::start_with_home(home)?;
+
+    let offset = shell.transcript_len();
+    shell.write("/ask\r")?;
+    shell.wait_for_after(offset, "Enter multiline input")?;
+    shell.write(KEY_UP)?;
+    shell.wait_until_after(offset, |tail| {
+        tail.contains("ASK_FILTERED_DUPLICATE_PROMPT")
+    })?;
+    shell.write(KEY_UP)?;
+    let down_offset = shell.transcript_len();
+    shell.write(KEY_DOWN)?;
+    shell.wait_until_after(down_offset, |tail| tail.contains("\x1b[2K"))?;
+    let screen = VtScreen::parse(
+        PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        &shell.transcript_string(),
+    )
+    .text();
+
+    assert!(
+        !screen.contains("ASK_FILTERED_DUPLICATE_PROMPT"),
+        "filtered multiline /ask history still exposed duplicate entries:\n{screen}"
     );
 
     shell.write("\u{3}")?;
@@ -717,9 +929,21 @@ fn shell_multiline_history_filters_non_shell_command_history_entries() -> io::Re
     fs::write(
         &history_path,
         r#"[
-  "printf SHELL_FILTER_OK",
-  "/ask explain this command",
-  "what is wrong with this code?"
+  {
+    "text": "printf SHELL_FILTER_OK",
+    "kind": "shell",
+    "mode": "single_line"
+  },
+  {
+    "text": "explain this command",
+    "kind": "agent",
+    "mode": "single_line"
+  },
+  {
+    "text": "what is wrong with this code?",
+    "kind": "agent",
+    "mode": "single_line"
+  }
 ]
 "#,
     )?;
@@ -784,7 +1008,10 @@ fn shell_multiline_history_preserves_cancelled_draft() -> io::Result<()> {
     shell.wait_for_after(cancel_offset, "theseus-shell")?;
     let saved = fs::read_to_string(command_history_path(&shell.home))?;
     assert!(
-        saved.contains("printf") && saved.contains("SHELL_CANCELLED_DRAFT_TWO"),
+        saved.contains("printf")
+            && saved.contains("SHELL_CANCELLED_DRAFT_TWO")
+            && saved.contains("\"kind\": \"shell\"")
+            && saved.contains("\"mode\": \"multi_line_shell\""),
         "cancelled /shell draft was not persisted:\n{saved}"
     );
 
