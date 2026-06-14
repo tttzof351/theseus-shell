@@ -14,6 +14,9 @@ use super::{
         EditorLine, RenderLayout, cursor_visible_col, cursor_wraps_at_boundary,
         render_editor_lines, render_layout_for_lines_with_cursor_wrap,
     },
+    history_browser::{
+        BrowsingAction, BrowsingInput, HistoryBrowser, HistoryEntryMode, HistoryMove,
+    },
     is_alt_key, is_command_key, is_key_press, is_plain_text_key,
     raw_mode::RawModeGuard,
     shell_highlight::{
@@ -39,9 +42,7 @@ pub struct CommandInputConfig<'a> {
 struct CommandEditor<'a> {
     config: CommandInputConfig<'a>,
     buffer: TextBuffer,
-    history_index: Option<usize>,
-    history_browsing: bool,
-    draft: String,
+    history: HistoryBrowser,
     completion: Option<CompletionState>,
     rendered_rows: u16,
     rendered_cursor_row: u16,
@@ -71,9 +72,7 @@ impl<'a> CommandEditor<'a> {
         Self {
             config,
             buffer: TextBuffer::new(),
-            history_index: None,
-            history_browsing: false,
-            draft: String::new(),
+            history: HistoryBrowser::default(),
             completion: None,
             rendered_rows: 1,
             rendered_cursor_row: 0,
@@ -118,8 +117,7 @@ impl<'a> CommandEditor<'a> {
             }
             KeyCode::Enter => {
                 self.clear_completion();
-                if self.history_browsing {
-                    self.accept_history_browsing();
+                if self.apply_browsing_input(BrowsingInput::Enter) == BrowsingAction::Accept {
                     self.render()?;
                     return Ok(None);
                 }
@@ -143,47 +141,56 @@ impl<'a> CommandEditor<'a> {
             }
             KeyCode::Left if is_command_key(key) => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::Home);
                 self.buffer.set_col(0);
                 self.render()?;
             }
             KeyCode::Right if is_command_key(key) => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::End);
                 self.buffer.set_col_to_line_end();
                 self.render()?;
             }
             KeyCode::Char('b') if is_alt_key(key) => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::MoveWordLeft);
                 self.move_word_left();
                 self.render()?;
             }
             KeyCode::Char('f') if is_alt_key(key) => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::MoveWordRight);
                 self.move_word_right();
                 self.render()?;
             }
             KeyCode::Left if is_alt_key(key) => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::MoveWordLeft);
                 self.move_word_left();
                 self.render()?;
             }
             KeyCode::Right if is_alt_key(key) => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::MoveWordRight);
                 self.move_word_right();
                 self.render()?;
             }
             KeyCode::Left => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::Left);
                 self.move_left();
                 self.render()?;
             }
             KeyCode::Right => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::Right);
                 self.move_right();
                 self.render()?;
             }
             KeyCode::Up => {
                 self.clear_completion();
-                if self.history_browsing || self.can_navigate_history() {
+                self.apply_browsing_input(BrowsingInput::HistoryPrevious);
+                if self.history.is_browsing() || self.can_navigate_history() {
                     self.history_previous();
                 } else {
                     self.buffer.move_up();
@@ -192,7 +199,8 @@ impl<'a> CommandEditor<'a> {
             }
             KeyCode::Down => {
                 self.clear_completion();
-                if self.history_browsing || self.can_navigate_history() {
+                self.apply_browsing_input(BrowsingInput::HistoryNext);
+                if self.history.is_browsing() || self.can_navigate_history() {
                     self.history_next();
                 } else {
                     self.buffer.move_down();
@@ -201,11 +209,13 @@ impl<'a> CommandEditor<'a> {
             }
             KeyCode::Home => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::Home);
                 self.buffer.set_col(0);
                 self.render()?;
             }
             KeyCode::End => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::End);
                 self.buffer.set_col_to_line_end();
                 self.render()?;
             }
@@ -225,7 +235,7 @@ impl<'a> CommandEditor<'a> {
 
     fn handle_paste(&mut self, text: &str) -> io::Result<Option<Option<String>>> {
         self.clear_completion();
-        self.stop_history_navigation();
+        self.apply_browsing_input(BrowsingInput::Paste);
 
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         for segment in normalized.split_inclusive('\n') {
@@ -252,7 +262,7 @@ impl<'a> CommandEditor<'a> {
         let layout = self.render_layout();
         let mut stdout = io::stdout();
         let lines = self.render_lines();
-        if self.history_browsing {
+        if self.history.is_browsing() {
             execute!(stdout, Hide)?;
         } else {
             execute!(stdout, Show)?;
@@ -325,7 +335,7 @@ impl<'a> CommandEditor<'a> {
                 } else {
                     line.clone()
                 };
-                let rendered_line = if self.history_browsing {
+                let rendered_line = if self.history.is_browsing() {
                     colorize_tag("italic", &rendered_line)
                 } else {
                     rendered_line
@@ -376,7 +386,7 @@ impl<'a> CommandEditor<'a> {
         let text = self.current_text();
         let should_continue = (self.config.should_continue)(&text);
         if should_continue {
-            self.stop_history_navigation();
+            self.apply_browsing_input(BrowsingInput::InsertText);
         }
         should_continue
     }
@@ -400,12 +410,12 @@ impl<'a> CommandEditor<'a> {
     #[cfg(test)]
     fn insert_text(&mut self, text: &str) {
         self.clear_completion();
-        self.stop_history_navigation();
+        self.apply_browsing_input(BrowsingInput::InsertText);
         self.buffer.insert_text(text);
     }
 
     fn insert_char(&mut self, ch: char) {
-        self.stop_history_navigation();
+        self.apply_browsing_input(BrowsingInput::InsertText);
         self.buffer.insert_char(ch);
     }
 
@@ -415,13 +425,13 @@ impl<'a> CommandEditor<'a> {
 
     fn backspace(&mut self) {
         if self.buffer.backspace() {
-            self.stop_history_navigation();
+            self.apply_browsing_input(BrowsingInput::Backspace);
         }
     }
 
     fn delete(&mut self) {
         if self.buffer.delete() {
-            self.stop_history_navigation();
+            self.apply_browsing_input(BrowsingInput::Delete);
         }
     }
 
@@ -445,63 +455,44 @@ impl<'a> CommandEditor<'a> {
         if self.config.history.is_empty() {
             return;
         }
-        if !self.history_browsing {
-            if !self.can_navigate_history() {
-                return;
-            }
-            self.draft = self.current_text();
-        }
-
-        let next_index = match self.history_index {
-            Some(0) => 0,
-            Some(index) => index - 1,
-            None => self.config.history.len() - 1,
-        };
-
-        self.set_history_index(next_index);
+        let current_text = self.current_text();
+        let can_start = self.can_navigate_history();
+        let selected = self.history.previous(
+            self.config.history,
+            current_text,
+            can_start,
+            command_history_entry_mode,
+        );
+        self.apply_history_move(selected);
     }
 
     fn history_next(&mut self) {
-        if !self.history_browsing && !self.can_navigate_history() {
-            return;
-        }
-
-        let Some(index) = self.history_index else {
-            return;
-        };
-
-        if index + 1 < self.config.history.len() {
-            self.set_history_index(index + 1);
-        } else {
-            self.history_index = None;
-            self.history_browsing = false;
-            let draft = self.draft.clone();
-            self.replace_with_text(&draft);
-        }
+        let can_start = self.can_navigate_history();
+        let selected =
+            self.history
+                .next(self.config.history, can_start, command_history_entry_mode);
+        self.apply_history_move(selected);
     }
 
     fn can_navigate_history(&self) -> bool {
-        self.history_index.is_some() || (self.buffer.lines_len() == 1 && self.buffer.row() == 0)
+        self.history.index().is_some() || (self.buffer.lines_len() == 1 && self.buffer.row() == 0)
     }
 
-    fn set_history_index(&mut self, index: usize) {
-        self.history_index = Some(index);
-        self.history_browsing = self.config.history[index].contains('\n');
-        self.replace_with_text(&self.config.history[index]);
+    fn apply_history_move(&mut self, selected: HistoryMove<'_>) {
+        match selected {
+            HistoryMove::Selected { text, .. } => self.buffer.replace_with_text(text),
+            HistoryMove::RestoredDraft(draft) => self.buffer.replace_with_text(&draft),
+            HistoryMove::Unchanged => {}
+        }
     }
 
-    fn replace_with_text(&mut self, text: &str) {
-        self.buffer.replace_with_text(text);
-    }
-
-    fn stop_history_navigation(&mut self) {
-        self.history_index = None;
-        self.history_browsing = false;
-        self.draft.clear();
-    }
-
+    #[cfg(test)]
     fn accept_history_browsing(&mut self) {
-        self.stop_history_navigation();
+        self.history.accept();
+    }
+
+    fn apply_browsing_input(&mut self, input: BrowsingInput) -> BrowsingAction {
+        self.history.apply_input(input)
     }
 
     fn clear_completion(&mut self) {
@@ -509,6 +500,8 @@ impl<'a> CommandEditor<'a> {
     }
 
     fn complete(&mut self) -> io::Result<()> {
+        self.apply_browsing_input(BrowsingInput::Completion);
+
         if self.should_restart_completed_directory_completion() {
             self.clear_completion();
         }
@@ -577,9 +570,17 @@ impl<'a> CommandEditor<'a> {
 impl Drop for CommandEditor<'_> {
     fn drop(&mut self) {
         #[cfg(not(test))]
-        if self.history_browsing {
+        if self.history.is_browsing() {
             let _ = self.show_cursor();
         }
+    }
+}
+
+fn command_history_entry_mode(entry: &str) -> HistoryEntryMode {
+    if entry.contains('\n') {
+        HistoryEntryMode::Browsing
+    } else {
+        HistoryEntryMode::Editing
     }
 }
 
@@ -784,7 +785,7 @@ mod tests {
         assert_eq!(editor.current_text(), "second");
         assert_eq!(editor.buffer.row(), 0);
         assert_eq!(editor.buffer.col(), "second".chars().count());
-        assert!(!editor.history_browsing);
+        assert!(!editor.history.is_browsing());
     }
 
     #[test]
@@ -837,15 +838,15 @@ mod tests {
         let mut editor = CommandEditor::new(config(&history));
 
         editor.history_previous();
-        assert!(editor.history_browsing);
+        assert!(editor.history.is_browsing());
 
         editor.accept_history_browsing();
-        assert!(!editor.history_browsing);
+        assert!(!editor.history.is_browsing());
         assert_eq!(editor.current_text(), "echo \\\n \"test\"");
 
         assert!(editor.buffer.move_up());
         assert_eq!(editor.buffer.row(), 0);
-        assert!(editor.history_index.is_none());
+        assert!(editor.history.index().is_none());
     }
 
     #[test]
@@ -873,7 +874,7 @@ mod tests {
         editor.history_previous();
 
         assert_eq!(editor.current_text(), "echo \\\n");
-        assert!(editor.history_index.is_none());
+        assert!(editor.history.index().is_none());
     }
 
     #[test]

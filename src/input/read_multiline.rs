@@ -12,6 +12,9 @@ use super::{
         EditorLine, RenderLayout, cursor_visible_col, cursor_wraps_at_boundary,
         render_editor_lines, render_layout_for_lines_with_cursor_wrap,
     },
+    history_browser::{
+        BrowsingAction, BrowsingInput, HistoryBrowser, HistoryEntryMode, HistoryMove,
+    },
     is_alt_key, is_command_key, is_key_press, is_plain_text_key,
     raw_mode::RawModeGuard,
     shell_highlight::{
@@ -67,9 +70,7 @@ impl Default for MultiLineConfig<'_> {
 struct MultiLineEditor<'a> {
     config: MultiLineConfig<'a>,
     buffer: TextBuffer,
-    history_index: Option<usize>,
-    history_browsing: bool,
-    draft: String,
+    history: HistoryBrowser,
     completion: Option<CompletionState>,
     on_change: Option<ChangeCallback<'a>>,
     rendered_rows: u16,
@@ -114,9 +115,7 @@ impl<'a> MultiLineEditor<'a> {
                 completion_mode: config.completion_mode,
             },
             buffer: TextBuffer::new(),
-            history_index: None,
-            history_browsing: false,
-            draft: String::new(),
+            history: HistoryBrowser::default(),
             completion: None,
             rendered_rows: 1,
             rendered_cursor_row: 0,
@@ -153,8 +152,7 @@ impl<'a> MultiLineEditor<'a> {
             }
             KeyCode::Enter => {
                 self.clear_completion();
-                if self.history_browsing {
-                    self.accept_history_browsing();
+                if self.apply_browsing_input(BrowsingInput::Enter) == BrowsingAction::Accept {
                     self.render()?;
                     return Ok(None);
                 }
@@ -164,7 +162,7 @@ impl<'a> MultiLineEditor<'a> {
                     let text = self.buffer.text_before_last_line();
                     return Ok(Some(text));
                 }
-                self.stop_history_navigation();
+                self.apply_browsing_input(BrowsingInput::InsertText);
                 self.buffer.split_line();
                 self.notify_change();
                 self.render()?;
@@ -181,47 +179,56 @@ impl<'a> MultiLineEditor<'a> {
             }
             KeyCode::Left if is_command_key(key) => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::Home);
                 self.buffer.set_col(0);
                 self.render()?;
             }
             KeyCode::Right if is_command_key(key) => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::End);
                 self.buffer.set_col_to_line_end();
                 self.render()?;
             }
             KeyCode::Char('b') if is_alt_key(key) => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::MoveWordLeft);
                 self.move_word_left();
                 self.render()?;
             }
             KeyCode::Char('f') if is_alt_key(key) => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::MoveWordRight);
                 self.move_word_right();
                 self.render()?;
             }
             KeyCode::Left if is_alt_key(key) => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::MoveWordLeft);
                 self.move_word_left();
                 self.render()?;
             }
             KeyCode::Right if is_alt_key(key) => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::MoveWordRight);
                 self.move_word_right();
                 self.render()?;
             }
             KeyCode::Left => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::Left);
                 self.move_left();
                 self.render()?;
             }
             KeyCode::Right => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::Right);
                 self.move_right();
                 self.render()?;
             }
             KeyCode::Up => {
                 self.clear_completion();
-                if self.history_browsing || self.buffer.is_empty() {
+                self.apply_browsing_input(BrowsingInput::HistoryPrevious);
+                if self.history.is_browsing() || self.buffer.is_empty() {
                     self.history_previous();
                 } else {
                     self.buffer.move_up();
@@ -230,7 +237,8 @@ impl<'a> MultiLineEditor<'a> {
             }
             KeyCode::Down => {
                 self.clear_completion();
-                if self.history_browsing || self.buffer.is_empty() {
+                self.apply_browsing_input(BrowsingInput::HistoryNext);
+                if self.history.is_browsing() || self.buffer.is_empty() {
                     self.history_next();
                 } else {
                     self.buffer.move_down();
@@ -239,11 +247,13 @@ impl<'a> MultiLineEditor<'a> {
             }
             KeyCode::Home => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::Home);
                 self.buffer.set_col(0);
                 self.render()?;
             }
             KeyCode::End => {
                 self.clear_completion();
+                self.apply_browsing_input(BrowsingInput::End);
                 self.buffer.set_col_to_line_end();
                 self.render()?;
             }
@@ -267,6 +277,7 @@ impl<'a> MultiLineEditor<'a> {
     }
 
     fn process_paste(&mut self, text: &str) {
+        self.apply_browsing_input(BrowsingInput::Paste);
         self.insert_text(text);
     }
 
@@ -274,7 +285,7 @@ impl<'a> MultiLineEditor<'a> {
         let layout = self.render_layout();
         let mut stdout = io::stdout();
         let lines = self.render_lines();
-        if self.history_browsing {
+        if self.history.is_browsing() {
             execute!(stdout, Hide)?;
         } else {
             execute!(stdout, Show)?;
@@ -336,7 +347,7 @@ impl<'a> MultiLineEditor<'a> {
                     .get(index)
                     .cloned()
                     .unwrap_or(raw_text);
-                let text = if self.history_browsing {
+                let text = if self.history.is_browsing() {
                     crate::input::colorize_tag("italic", &text)
                 } else {
                     text
@@ -379,6 +390,8 @@ impl<'a> MultiLineEditor<'a> {
     }
 
     fn complete(&mut self) -> io::Result<()> {
+        self.apply_browsing_input(BrowsingInput::Completion);
+
         if self.should_restart_completed_directory_completion() {
             self.clear_completion();
         }
@@ -440,7 +453,7 @@ impl<'a> MultiLineEditor<'a> {
     }
 
     fn replace_before_cursor(&mut self, start: usize, replacement: &str) {
-        self.stop_history_navigation();
+        self.apply_browsing_input(BrowsingInput::Completion);
         self.buffer.replace_before_cursor(start, replacement);
         self.notify_change();
     }
@@ -451,27 +464,27 @@ impl<'a> MultiLineEditor<'a> {
 
     fn insert_text(&mut self, text: &str) {
         self.clear_completion();
-        self.stop_history_navigation();
+        self.apply_browsing_input(BrowsingInput::InsertText);
         self.buffer.insert_text(text);
         self.notify_change();
     }
 
     fn insert_char(&mut self, ch: char) {
-        self.stop_history_navigation();
+        self.apply_browsing_input(BrowsingInput::InsertText);
         self.buffer.insert_char(ch);
         self.notify_change();
     }
 
     fn backspace(&mut self) {
         if self.buffer.backspace() {
-            self.stop_history_navigation();
+            self.apply_browsing_input(BrowsingInput::Backspace);
             self.notify_change();
         }
     }
 
     fn delete(&mut self) {
         if self.buffer.delete() {
-            self.stop_history_navigation();
+            self.apply_browsing_input(BrowsingInput::Delete);
             self.notify_change();
         }
     }
@@ -493,60 +506,51 @@ impl<'a> MultiLineEditor<'a> {
     }
 
     fn history_previous(&mut self) {
-        if self.config.history.is_empty() {
-            return;
-        }
-        if !self.history_browsing {
-            if !self.buffer.is_empty() {
-                return;
-            }
-            self.history_browsing = true;
-            self.draft = self.buffer.text();
-        }
-
-        let next_index = match self.history_index {
-            Some(0) => 0,
-            Some(index) => index - 1,
-            None => self.config.history.len() - 1,
-        };
-
-        self.set_history_index(next_index);
+        let current_text = self.buffer.text();
+        let selected = self.history.previous(
+            self.config.history,
+            current_text,
+            self.buffer.is_empty(),
+            multiline_history_entry_mode,
+        );
+        self.apply_history_move(selected);
     }
 
     fn history_next(&mut self) {
-        if !self.history_browsing {
-            return;
-        }
+        let selected = self.history.next(
+            self.config.history,
+            self.history.is_browsing(),
+            multiline_history_entry_mode,
+        );
+        self.apply_history_move(selected);
+    }
 
-        let Some(index) = self.history_index else {
-            return;
-        };
-
-        if index + 1 < self.config.history.len() {
-            self.set_history_index(index + 1);
-        } else {
-            self.history_index = None;
-            self.history_browsing = false;
-            let draft = self.draft.clone();
-            self.buffer.replace_with_text(&draft);
-            self.notify_change();
+    fn apply_history_move(&mut self, selected: HistoryMove<'_>) {
+        match selected {
+            HistoryMove::Selected { text, .. } => {
+                self.buffer.replace_with_text(text);
+                self.notify_change();
+            }
+            HistoryMove::RestoredDraft(draft) => {
+                self.buffer.replace_with_text(&draft);
+                self.notify_change();
+            }
+            HistoryMove::Unchanged => {}
         }
     }
 
-    fn set_history_index(&mut self, index: usize) {
-        self.history_index = Some(index);
-        self.buffer.replace_with_text(&self.config.history[index]);
-        self.notify_change();
-    }
-
+    #[cfg(test)]
     fn accept_history_browsing(&mut self) {
-        self.stop_history_navigation();
+        self.history.accept();
     }
 
+    #[cfg(test)]
     fn stop_history_navigation(&mut self) {
-        self.history_index = None;
-        self.history_browsing = false;
-        self.draft.clear();
+        self.history.stop();
+    }
+
+    fn apply_browsing_input(&mut self, input: BrowsingInput) -> BrowsingAction {
+        self.history.apply_input(input)
     }
 
     fn notify_change(&mut self) {
@@ -561,10 +565,14 @@ impl<'a> MultiLineEditor<'a> {
 impl Drop for MultiLineEditor<'_> {
     fn drop(&mut self) {
         #[cfg(not(test))]
-        if self.history_browsing {
+        if self.history.is_browsing() {
             let _ = self.show_cursor();
         }
     }
+}
+
+fn multiline_history_entry_mode(_: &str) -> HistoryEntryMode {
+    HistoryEntryMode::Browsing
 }
 
 #[cfg(test)]
@@ -831,12 +839,12 @@ mod tests {
         editor.buffer.set_position(0, 0);
         editor.history_previous();
         assert_eq!(editor.buffer.text(), "draft line one\ndraft line two");
-        assert!(editor.history_index.is_none());
+        assert!(editor.history.index().is_none());
 
         editor.buffer = TextBuffer::new();
         editor.history_previous();
         assert_eq!(editor.buffer.text(), "stored prompt");
-        assert_eq!(editor.history_index, Some(0));
+        assert_eq!(editor.history.index(), Some(0));
     }
 
     #[test]
@@ -898,16 +906,16 @@ mod tests {
         });
 
         editor.history_previous();
-        assert!(editor.history_browsing);
+        assert!(editor.history.is_browsing());
 
         editor.accept_history_browsing();
-        assert!(!editor.history_browsing);
+        assert!(!editor.history.is_browsing());
         assert_eq!(editor.buffer.text(), "line one\nline two");
 
         assert!(editor.buffer.move_up());
         assert_eq!(editor.buffer.text(), "line one\nline two");
         assert_eq!(editor.buffer.row(), 0);
-        assert!(editor.history_index.is_none());
+        assert!(editor.history.index().is_none());
     }
 
     #[test]
@@ -958,13 +966,13 @@ mod tests {
         });
 
         editor.history_previous();
-        assert!(editor.history_browsing);
+        assert!(editor.history.is_browsing());
 
         editor.history_next();
 
         assert_eq!(editor.buffer.text(), "");
-        assert!(!editor.history_browsing);
-        assert!(editor.history_index.is_none());
+        assert!(!editor.history.is_browsing());
+        assert!(editor.history.index().is_none());
         let lines = editor.render_lines();
         assert_eq!(lines[0].text, "");
     }
@@ -981,13 +989,13 @@ mod tests {
         });
 
         editor.history_previous();
-        assert!(editor.history_browsing);
+        assert!(editor.history.is_browsing());
 
         editor.process_paste(" pasted");
 
         assert_eq!(editor.buffer.text(), "stored prompt pasted");
-        assert!(!editor.history_browsing);
-        assert!(editor.history_index.is_none());
+        assert!(!editor.history.is_browsing());
+        assert!(editor.history.index().is_none());
         let lines = editor.render_lines();
         assert_eq!(lines[0].text, "stored prompt pasted");
     }
@@ -1048,7 +1056,7 @@ mod tests {
         editor.history_next();
 
         assert_eq!(editor.buffer.text(), "stored prompt!");
-        assert!(editor.history_index.is_none());
+        assert!(editor.history.index().is_none());
     }
 
     #[test]

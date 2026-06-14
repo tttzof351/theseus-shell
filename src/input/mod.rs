@@ -4,6 +4,7 @@ mod completion;
 mod dedent;
 mod editor_render;
 mod highlight;
+mod history_browser;
 mod key;
 mod line_buffer;
 mod raw_mode;
