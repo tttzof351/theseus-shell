@@ -15,6 +15,9 @@ use theseus::input::{
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_TIMEOUT: Duration = Duration::from_millis(500);
+const ENABLE_BRACKETED_PASTE: &str = "\x1b[?2004h";
+const BRACKETED_PASTE_START: &str = "\x1b[200~";
+const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const KEY_UP: &str = "\x1b[A";
 const KEY_DOWN: &str = "\x1b[B";
 const KEY_LEFT: &str = "\x1b[D";
@@ -240,6 +243,20 @@ fn multiline_prefix_text(text: &str) -> String {
     format!("{DEFAULT_MULTILINE_PREFIX}{text}")
 }
 
+#[test]
+fn command_prompt_enables_bracketed_paste() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let shell = PtyShell::start()?;
+    let transcript = shell.transcript_string();
+
+    assert!(
+        transcript.contains(ENABLE_BRACKETED_PASTE),
+        "command prompt should enable bracketed paste so multiline paste arrives as one Event::Paste:\n{transcript:?}"
+    );
+
+    shell.exit()
+}
+
 struct VtScreen {
     parser: vt100::Parser,
     cols: u16,
@@ -377,6 +394,36 @@ fn pasted_heredoc_command_executes_after_terminator() -> io::Result<()> {
     assert!(
         transcript[offset..].contains("THESEUS_HEREDOC_USER:"),
         "pasted heredoc did not execute the complete command:\n{}",
+        &transcript[offset..]
+    );
+
+    shell.exit()
+}
+
+#[test]
+fn bracketed_paste_assignment_before_heredoc_executes_as_one_command() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    let command = concat!(
+        "USER_ID=42\n",
+        "cat <<JSON\n",
+        "{\n",
+        "  \"userId\": $USER_ID,\n",
+        "  \"body\": \"raw \\$NOT_EXPANDED but \\$USER_ID works\"\n",
+        "}\n",
+        "JSON\n",
+    );
+
+    let offset = shell.transcript_len();
+    shell.write(BRACKETED_PASTE_START)?;
+    shell.write(command)?;
+    shell.write(BRACKETED_PASTE_END)?;
+    let transcript = shell.wait_until_after(offset, |tail| tail.contains("\"userId\": 42"))?;
+
+    assert!(
+        transcript[offset..].contains("raw $NOT_EXPANDED but $USER_ID works"),
+        "bracketed pasted heredoc did not preserve escaped variables:\n{}",
         &transcript[offset..]
     );
 

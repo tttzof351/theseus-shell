@@ -391,21 +391,24 @@ impl<'a> CommandEditor<'a> {
         }
 
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        for segment in normalized.split_inclusive('\n') {
-            let Some(line) = segment.strip_suffix('\n') else {
-                if !segment.is_empty() {
-                    self.buffer.insert_text(segment);
-                }
-                continue;
-            };
+        let ended_with_newline = normalized.ends_with('\n');
+        let parts: Vec<_> = normalized.split('\n').collect();
+        for (index, line) in parts.iter().enumerate() {
+            if ended_with_newline && index == parts.len() - 1 {
+                break;
+            }
 
             self.buffer.insert_text(line);
-            if self.enter_should_continue() {
+            let next_index = index + 1;
+            if next_index < parts.len() && !(ended_with_newline && next_index == parts.len() - 1) {
                 self.split_line();
-            } else {
-                self.finish_line()?;
-                return Ok(Some(Some(CommandInputResult::Command(self.current_text()))));
             }
+        }
+
+        if ended_with_newline && !self.enter_should_continue() {
+            let command = self.current_text();
+            self.finish_line()?;
+            return Ok(Some(Some(CommandInputResult::Command(command))));
         }
 
         Ok(None)
@@ -968,6 +971,23 @@ mod tests {
             submitted,
             Some(Some(CommandInputResult::Command(
                 "if true; then\necho IF_FROM_PASTE\nfi".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn paste_waits_until_end_of_event_before_submitting() {
+        let history = Vec::new();
+        let mut editor = CommandEditor::new(config(&history));
+
+        let submitted = editor
+            .handle_paste("USER_ID=42\ncat <<JSON\n{\"userId\": $USER_ID}\nJSON\n")
+            .unwrap();
+
+        assert_eq!(
+            submitted,
+            Some(Some(CommandInputResult::Command(
+                "USER_ID=42\ncat <<JSON\n{\"userId\": $USER_ID}\nJSON".to_string()
             )))
         );
     }
