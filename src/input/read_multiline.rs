@@ -24,6 +24,7 @@ use super::{
     },
     text_buffer::TextBuffer,
 };
+use crate::common::terminal_output;
 
 #[cfg(test)]
 use super::completion::{Completion, CompletionToken};
@@ -138,8 +139,10 @@ impl<'a> MultiLineEditor<'a> {
     }
 
     fn run(&mut self) -> io::Result<String> {
-        print!("{}", self.config.prefix);
-        io::stdout().flush()?;
+        terminal_output::with_stdout(|stdout| {
+            write!(stdout, "{}", self.config.prefix)?;
+            stdout.flush()
+        })?;
         if !self.buffer.is_empty() {
             self.render()?;
         }
@@ -301,20 +304,21 @@ impl<'a> MultiLineEditor<'a> {
 
     fn render(&mut self) -> io::Result<()> {
         let layout = self.render_layout();
-        let mut stdout = io::stdout();
         let lines = self.render_lines();
-        if self.history.is_browsing() {
-            execute!(stdout, Hide)?;
-        } else {
-            execute!(stdout, Show)?;
-        }
-        render_editor_lines(
-            &mut stdout,
-            &lines,
-            layout,
-            self.rendered_rows,
-            self.rendered_cursor_row,
-        )?;
+        terminal_output::with_stdout(|stdout| {
+            if self.history.is_browsing() {
+                execute!(stdout, Hide)?;
+            } else {
+                execute!(stdout, Show)?;
+            }
+            render_editor_lines(
+                stdout,
+                &lines,
+                layout,
+                self.rendered_rows,
+                self.rendered_cursor_row,
+            )
+        })?;
 
         self.rendered_rows = layout.rows;
         self.rendered_cursor_row = layout.cursor_row;
@@ -386,14 +390,15 @@ impl<'a> MultiLineEditor<'a> {
     }
 
     fn finish_line(&self) -> io::Result<()> {
-        let mut stdout = io::stdout();
-        execute!(stdout, Show)?;
-        write!(stdout, "\r\n")?;
-        stdout.flush()
+        terminal_output::with_stdout(|stdout| {
+            execute!(stdout, Show)?;
+            write!(stdout, "\r\n")?;
+            stdout.flush()
+        })
     }
 
     fn show_cursor(&self) -> io::Result<()> {
-        execute!(io::stdout(), Show)
+        terminal_output::with_stdout(|stdout| execute!(stdout, Show))
     }
 
     fn is_exit_line(&self) -> bool {

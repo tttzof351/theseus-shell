@@ -1,13 +1,15 @@
 use std::{io, io::Write};
 
 use super::markdown_preprocessor::preprocess_markdown;
-use crate::common::output::CommandOutput;
+use crate::common::{output::CommandOutput, terminal_output};
 
 pub(super) fn print_command_output(output: &CommandOutput) -> io::Result<()> {
-    if !output.streamed {
-        io::stdout().write_all(&output.transcript)?;
-    }
-    io::stdout().flush()
+    terminal_output::with_stdout(|stdout| {
+        if !output.streamed {
+            stdout.write_all(&output.transcript)?;
+        }
+        stdout.flush()
+    })
 }
 
 pub(super) fn render_markdown(text: &str) -> String {

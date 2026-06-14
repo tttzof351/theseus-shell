@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    common::text::truncate_chars_end,
+    common::{terminal_output, text::truncate_chars_end},
     input::{
         RawModeGuard, ViewportState, colorize_tag, is_control_key, is_key_press, is_plain_text_key,
     },
@@ -138,7 +138,7 @@ fn select_session_with_search(sessions: Vec<ResumeSession>) -> io::Result<Resume
     let mut state = ResumeSelectState::new(sessions);
     let _raw_mode = RawModeGuard::enable()?;
     let _cursor = HiddenCursorGuard::hide()?;
-    writeln!(io::stdout())?;
+    terminal_output::with_stdout(|stdout| writeln!(stdout))?;
     render_resume_select(&mut state)?;
 
     loop {
@@ -248,17 +248,18 @@ impl ResumeSelectState {
 }
 
 fn render_resume_select(state: &mut ResumeSelectState) -> io::Result<()> {
-    let mut stdout = io::stdout();
     let lines = resume_select_lines(state);
     state.rendered_lines = lines.len() as u16;
 
-    for line in lines {
-        execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-        writeln!(stdout, "{line}")?;
-    }
+    terminal_output::with_stdout(|stdout| {
+        for line in lines {
+            execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+            writeln!(stdout, "{line}")?;
+        }
 
-    execute!(stdout, MoveUp(state.rendered_lines))?;
-    stdout.flush()
+        execute!(stdout, MoveUp(state.rendered_lines))?;
+        stdout.flush()
+    })
 }
 
 fn resume_select_lines(state: &ResumeSelectState) -> Vec<String> {
@@ -364,28 +365,29 @@ fn resume_viewport_rows() -> usize {
 }
 
 fn finish_resume_select(rendered_lines: u16) -> io::Result<()> {
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        MoveDown(rendered_lines),
-        MoveToColumn(0),
-        Clear(ClearType::CurrentLine)
-    )?;
-    stdout.flush()
+    terminal_output::with_stdout(|stdout| {
+        execute!(
+            stdout,
+            MoveDown(rendered_lines),
+            MoveToColumn(0),
+            Clear(ClearType::CurrentLine)
+        )?;
+        stdout.flush()
+    })
 }
 
 struct HiddenCursorGuard;
 
 impl HiddenCursorGuard {
     fn hide() -> io::Result<Self> {
-        execute!(io::stdout(), Hide)?;
+        terminal_output::with_stdout(|stdout| execute!(stdout, Hide))?;
         Ok(Self)
     }
 }
 
 impl Drop for HiddenCursorGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), Show);
+        let _ = terminal_output::with_stdout(|stdout| execute!(stdout, Show));
     }
 }
 

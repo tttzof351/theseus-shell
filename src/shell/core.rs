@@ -17,6 +17,7 @@ use crate::commands::{SlashCommand, parse_slash_command};
 use crate::common::output::CommandOutput;
 use crate::common::{
     cancellation::{CancellationEvent, clear_sigint_request, install_sigint_handler},
+    terminal_output,
     text::{TruncatePosition, truncate_utf8_to_bytes},
 };
 use crate::input::{
@@ -139,7 +140,7 @@ impl TheseusShell {
                     let output = match self.read_ask_input(&mut history_entry, Some(input), false) {
                         Ok(output) => output,
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                            println!("\n{INTERRUPTED_EXIT_HINT}");
+                            print_interrupted_exit_hint()?;
                             clear_sigint_request();
                             continue;
                         }
@@ -165,7 +166,7 @@ impl TheseusShell {
                     ) {
                         Ok(output) => output,
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                            println!("\n{INTERRUPTED_EXIT_HINT}");
+                            print_interrupted_exit_hint()?;
                             clear_sigint_request();
                             continue;
                         }
@@ -184,11 +185,16 @@ impl TheseusShell {
                     continue;
                 }
                 Ok(None) => {
-                    println!();
+                    terminal_output::with_stdout(|stdout| {
+                        use std::io::Write;
+
+                        writeln!(stdout)?;
+                        stdout.flush()
+                    })?;
                     return Ok(0);
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                    println!("\n{INTERRUPTED_EXIT_HINT}");
+                    print_interrupted_exit_hint()?;
                     clear_sigint_request();
                     continue;
                 }
@@ -204,7 +210,7 @@ impl TheseusShell {
             let output = match self.handle_command(&input) {
                 Ok(output) => output,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                    println!("\n{INTERRUPTED_EXIT_HINT}");
+                    print_interrupted_exit_hint()?;
                     clear_sigint_request();
                     continue;
                 }
@@ -418,6 +424,15 @@ impl TheseusShell {
             let _ = logger.event(level, event, fields);
         }
     }
+}
+
+fn print_interrupted_exit_hint() -> io::Result<()> {
+    terminal_output::with_stdout(|stdout| {
+        use std::io::Write;
+
+        writeln!(stdout, "\n{INTERRUPTED_EXIT_HINT}")?;
+        stdout.flush()
+    })
 }
 
 pub fn run_shell(config: ShellConfig) -> io::Result<i32> {

@@ -11,7 +11,7 @@ use super::{
     input::forward_terminal_input_until_exit,
     platform::{RawModeGuard, current_pty_size, shell_command_args},
 };
-use crate::common::output::CommandOutput;
+use crate::common::{output::CommandOutput, terminal_output};
 
 pub fn run_pty_command(config: PtyCommandConfig) -> io::Result<CommandOutput> {
     let pty_system = native_pty_system();
@@ -44,7 +44,6 @@ pub fn run_pty_command(config: PtyCommandConfig) -> io::Result<CommandOutput> {
 
     let reader_thread = thread::spawn(move || {
         let mut transcript = Vec::new();
-        let mut stdout = io::stdout();
         let mut buffer = [0; 8192];
 
         loop {
@@ -52,10 +51,14 @@ pub fn run_pty_command(config: PtyCommandConfig) -> io::Result<CommandOutput> {
                 Ok(0) => break,
                 Ok(n) => {
                     transcript.extend_from_slice(&buffer[..n]);
-                    if stdout.write_all(&buffer[..n]).is_err() {
+                    if terminal_output::with_stdout(|stdout| {
+                        stdout.write_all(&buffer[..n])?;
+                        stdout.flush()
+                    })
+                    .is_err()
+                    {
                         break;
                     }
-                    let _ = stdout.flush();
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => break,

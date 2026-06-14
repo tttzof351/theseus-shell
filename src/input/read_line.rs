@@ -19,7 +19,7 @@ use super::{
     raw_mode::RawModeGuard,
     text_length,
 };
-use crate::commands::slash_commands;
+use crate::{commands::slash_commands, common::terminal_output};
 
 #[cfg(test)]
 use super::completion::{Completion, CompletionToken};
@@ -80,8 +80,10 @@ impl<'a> MaskedLineEditor<'a> {
         let (start_col, start_row) = cursor::position()?;
         self.start_col = start_col;
         self.start_row = start_row;
-        print!("{}", self.prompt);
-        io::stdout().flush()?;
+        terminal_output::with_stdout(|stdout| {
+            write!(stdout, "{}", self.prompt)?;
+            stdout.flush()
+        })?;
 
         loop {
             match event::read()? {
@@ -123,50 +125,52 @@ impl<'a> MaskedLineEditor<'a> {
     }
 
     fn clear_screen_and_render(&mut self) -> io::Result<()> {
-        let mut stdout = io::stdout();
-        execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
+        terminal_output::with_stdout(|stdout| {
+            execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
+            stdout.flush()
+        })?;
         self.start_col = 0;
         self.start_row = 0;
         self.rendered_rows = 1;
         self.rendered_cursor_row = 0;
-        stdout.flush()?;
         self.render()
     }
 
     fn render(&mut self) -> io::Result<()> {
-        let mut stdout = io::stdout();
         let layout = masked_render_layout(self.start_col, self.prompt, self.input.chars().count());
         self.make_room_for_rows(layout.rows)?;
 
-        execute!(stdout, MoveTo(self.start_col, self.start_row))?;
-        for row in 0..self.rendered_rows {
-            execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-            if row + 1 < self.rendered_rows {
-                execute!(stdout, MoveDown(1))?;
+        terminal_output::with_stdout(|stdout| {
+            execute!(stdout, MoveTo(self.start_col, self.start_row))?;
+            for row in 0..self.rendered_rows {
+                execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+                if row + 1 < self.rendered_rows {
+                    execute!(stdout, MoveDown(1))?;
+                }
             }
-        }
 
-        if self.rendered_rows > 1 {
-            execute!(stdout, MoveUp(self.rendered_rows - 1))?;
-        }
+            if self.rendered_rows > 1 {
+                execute!(stdout, MoveUp(self.rendered_rows - 1))?;
+            }
 
-        execute!(stdout, MoveTo(self.start_col, self.start_row))?;
-        write!(
-            stdout,
-            "{}{}",
-            self.prompt,
-            "*".repeat(self.input.chars().count())
-        )?;
+            execute!(stdout, MoveTo(self.start_col, self.start_row))?;
+            write!(
+                stdout,
+                "{}{}",
+                self.prompt,
+                "*".repeat(self.input.chars().count())
+            )?;
 
-        execute!(
-            stdout,
-            MoveTo(layout.cursor_col, self.start_row + layout.cursor_row)
-        )?;
+            execute!(
+                stdout,
+                MoveTo(layout.cursor_col, self.start_row + layout.cursor_row)
+            )?;
+            stdout.flush()
+        })?;
 
         self.rendered_rows = layout.rows;
         self.rendered_cursor_row = layout.cursor_row;
-
-        stdout.flush()
+        Ok(())
     }
 
     fn make_room_for_rows(&mut self, rows: u16) -> io::Result<()> {
@@ -177,23 +181,25 @@ impl<'a> MaskedLineEditor<'a> {
         }
 
         let scroll_rows = required_end_row - terminal_rows;
-        let mut stdout = io::stdout();
-        for _ in 0..scroll_rows {
-            write!(stdout, "\r\n")?;
-        }
-        stdout.flush()?;
+        terminal_output::with_stdout(|stdout| {
+            for _ in 0..scroll_rows {
+                write!(stdout, "\r\n")?;
+            }
+            stdout.flush()
+        })?;
         self.start_row = self.start_row.saturating_sub(scroll_rows);
         Ok(())
     }
 
     fn finish_line(&self) -> io::Result<()> {
-        let mut stdout = io::stdout();
-        let rows_below_cursor = self.rendered_rows - 1 - self.rendered_cursor_row;
-        if rows_below_cursor > 0 {
-            execute!(stdout, MoveDown(rows_below_cursor))?;
-        }
-        write!(stdout, "\r\n")?;
-        stdout.flush()
+        terminal_output::with_stdout(|stdout| {
+            let rows_below_cursor = self.rendered_rows - 1 - self.rendered_cursor_row;
+            if rows_below_cursor > 0 {
+                execute!(stdout, MoveDown(rows_below_cursor))?;
+            }
+            write!(stdout, "\r\n")?;
+            stdout.flush()
+        })
     }
 }
 
@@ -221,8 +227,10 @@ impl<'a> LineEditor<'a> {
     }
 
     fn run(&mut self) -> io::Result<Option<String>> {
-        print!("{}", self.prompt);
-        io::stdout().flush()?;
+        terminal_output::with_stdout(|stdout| {
+            write!(stdout, "{}", self.prompt)?;
+            stdout.flush()
+        })?;
 
         loop {
             match event::read()? {
@@ -342,16 +350,17 @@ impl<'a> LineEditor<'a> {
     }
 
     fn render(&mut self) -> io::Result<()> {
-        let mut stdout = io::stdout();
         let layout = self.render_layout();
         let lines = self.render_lines();
-        render_editor_lines(
-            &mut stdout,
-            &lines,
-            layout,
-            self.rendered_rows,
-            self.rendered_cursor_row,
-        )?;
+        terminal_output::with_stdout(|stdout| {
+            render_editor_lines(
+                stdout,
+                &lines,
+                layout,
+                self.rendered_rows,
+                self.rendered_cursor_row,
+            )
+        })?;
 
         self.rendered_rows = layout.rows;
         self.rendered_cursor_row = layout.cursor_row;
@@ -360,11 +369,12 @@ impl<'a> LineEditor<'a> {
     }
 
     fn clear_screen_and_render(&mut self) -> io::Result<()> {
-        let mut stdout = io::stdout();
-        execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
+        terminal_output::with_stdout(|stdout| {
+            execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
+            stdout.flush()
+        })?;
         self.rendered_rows = 1;
         self.rendered_cursor_row = 0;
-        stdout.flush()?;
         self.render()
     }
 
@@ -402,13 +412,14 @@ impl<'a> LineEditor<'a> {
     }
 
     fn finish_line(&self) -> io::Result<()> {
-        let mut stdout = io::stdout();
-        let rows_below_cursor = self.rendered_rows - 1 - self.rendered_cursor_row;
-        if rows_below_cursor > 0 {
-            execute!(stdout, MoveDown(rows_below_cursor))?;
-        }
-        write!(stdout, "\r\n")?;
-        stdout.flush()
+        terminal_output::with_stdout(|stdout| {
+            let rows_below_cursor = self.rendered_rows - 1 - self.rendered_cursor_row;
+            if rows_below_cursor > 0 {
+                execute!(stdout, MoveDown(rows_below_cursor))?;
+            }
+            write!(stdout, "\r\n")?;
+            stdout.flush()
+        })
     }
 
     fn current_line(&self) -> String {

@@ -2,6 +2,8 @@ use std::io;
 
 use serde_json::json;
 
+use crate::common::terminal_output;
+
 use super::super::{config::ImageInputSettings, core::AgentRunContext, messages::ToolCall};
 use super::{
     AgentTool, ToolOutput, args::parse_arguments, bash::BashTool, edit_file::EditFileTool,
@@ -127,9 +129,12 @@ fn log_tool_call(tool: &dyn AgentTool, arguments: &serde_json::Value) -> io::Res
         return Ok(());
     }
 
-    println!("{}", tool.display(arguments));
-    use std::io::Write;
-    io::stdout().flush()
+    terminal_output::with_stdout(|stdout| {
+        use std::io::Write;
+
+        writeln!(stdout, "{}", tool.display(arguments))?;
+        stdout.flush()
+    })
 }
 
 #[cfg(test)]

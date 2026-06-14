@@ -13,7 +13,7 @@ use crossterm::{
 use serde_json::json;
 
 use crate::{
-    common::text::truncate_chars_end,
+    common::{terminal_output, text::truncate_chars_end},
     input::{
         RawModeGuard, ViewportState, colorize_tag, is_control_key, is_key_press, is_plain_text_key,
         read_masked_line,
@@ -123,12 +123,18 @@ fn select_config_option() -> io::Result<ConfigOption> {
 }
 
 fn select_config_option_plain() -> io::Result<ConfigOption> {
-    println!("What would you like to configure?");
-    for (index, option) in ConfigOption::ALL.iter().enumerate() {
-        println!("{}", format_config_option_row(index, *option, index == 0));
-    }
-    print!("Option [1]: ");
-    io::stdout().flush()?;
+    terminal_output::with_stdout(|stdout| {
+        writeln!(stdout, "What would you like to configure?")?;
+        for (index, option) in ConfigOption::ALL.iter().enumerate() {
+            writeln!(
+                stdout,
+                "{}",
+                format_config_option_row(index, *option, index == 0)
+            )?;
+        }
+        write!(stdout, "Option [1]: ")?;
+        stdout.flush()
+    })?;
 
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
@@ -184,21 +190,22 @@ fn select_config_option_with_arrows() -> io::Result<ConfigOption> {
 }
 
 fn render_config_option_select(selected: usize) -> io::Result<()> {
-    let mut stdout = io::stdout();
-    execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-    writeln!(stdout, "What would you like to configure?")?;
-
-    for (index, option) in ConfigOption::ALL.iter().enumerate() {
+    terminal_output::with_stdout(|stdout| {
         execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-        writeln!(
-            stdout,
-            "{}",
-            format_config_option_row(index, *option, index == selected)
-        )?;
-    }
+        writeln!(stdout, "What would you like to configure?")?;
 
-    execute!(stdout, MoveUp(ConfigOption::ALL.len() as u16 + 1))?;
-    stdout.flush()
+        for (index, option) in ConfigOption::ALL.iter().enumerate() {
+            execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+            writeln!(
+                stdout,
+                "{}",
+                format_config_option_row(index, *option, index == selected)
+            )?;
+        }
+
+        execute!(stdout, MoveUp(ConfigOption::ALL.len() as u16 + 1))?;
+        stdout.flush()
+    })
 }
 
 fn format_config_option_row(index: usize, option: ConfigOption, selected: bool) -> String {
@@ -224,14 +231,15 @@ fn config_option_label_width() -> usize {
 }
 
 fn finish_config_option_select() -> io::Result<()> {
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        MoveDown(ConfigOption::ALL.len() as u16 + 1),
-        MoveToColumn(0),
-        Clear(ClearType::CurrentLine)
-    )?;
-    stdout.flush()
+    terminal_output::with_stdout(|stdout| {
+        execute!(
+            stdout,
+            MoveDown(ConfigOption::ALL.len() as u16 + 1),
+            MoveToColumn(0),
+            Clear(ClearType::CurrentLine)
+        )?;
+        stdout.flush()
+    })
 }
 
 fn select_model(current_model: Option<&str>) -> io::Result<String> {
@@ -254,16 +262,19 @@ fn select_model_plain(current_model: Option<&str>, catalog: &ModelCatalog) -> io
     let fallback = current_model
         .or_else(|| catalog.models.first().map(|model| model.id.as_str()))
         .unwrap_or_default();
-    println!();
-    println!(
-        "{}",
-        colorize_tag(
-            "bold",
-            "Model id or search query. Leave empty to keep current/default model."
-        )
-    );
-    print!("Model [{fallback}]: ");
-    io::stdout().flush()?;
+    terminal_output::with_stdout(|stdout| {
+        writeln!(stdout)?;
+        writeln!(
+            stdout,
+            "{}",
+            colorize_tag(
+                "bold",
+                "Model id or search query. Leave empty to keep current/default model."
+            )
+        )?;
+        write!(stdout, "Model [{fallback}]: ")?;
+        stdout.flush()
+    })?;
 
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
@@ -290,7 +301,7 @@ fn select_model_with_search(
     let mut state = ModelSelectState::new(catalog, current_model);
     let _raw_mode = RawModeGuard::enable()?;
     let _cursor = HiddenCursorGuard::hide()?;
-    writeln!(io::stdout())?;
+    terminal_output::with_stdout(|stdout| writeln!(stdout))?;
     render_model_select(&mut state)?;
 
     loop {
@@ -408,18 +419,18 @@ impl ModelSelectState {
 }
 
 fn render_model_select(state: &mut ModelSelectState) -> io::Result<()> {
-    let mut stdout = io::stdout();
-
     let lines = model_select_lines(state);
     state.rendered_lines = lines.len() as u16;
 
-    for line in lines {
-        execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-        writeln!(stdout, "{line}")?;
-    }
+    terminal_output::with_stdout(|stdout| {
+        for line in lines {
+            execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+            writeln!(stdout, "{line}")?;
+        }
 
-    execute!(stdout, MoveUp(state.rendered_lines))?;
-    stdout.flush()
+        execute!(stdout, MoveUp(state.rendered_lines))?;
+        stdout.flush()
+    })
 }
 
 fn model_select_lines(state: &ModelSelectState) -> Vec<String> {
@@ -558,14 +569,15 @@ fn format_context_length(context_length: u64) -> String {
 }
 
 fn finish_model_select(rendered_lines: u16) -> io::Result<()> {
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        MoveDown(rendered_lines),
-        MoveToColumn(0),
-        Clear(ClearType::CurrentLine)
-    )?;
-    stdout.flush()
+    terminal_output::with_stdout(|stdout| {
+        execute!(
+            stdout,
+            MoveDown(rendered_lines),
+            MoveToColumn(0),
+            Clear(ClearType::CurrentLine)
+        )?;
+        stdout.flush()
+    })
 }
 
 fn prompt_api_key() -> io::Result<String> {
@@ -582,14 +594,14 @@ struct HiddenCursorGuard;
 
 impl HiddenCursorGuard {
     fn hide() -> io::Result<Self> {
-        execute!(io::stdout(), Hide)?;
+        terminal_output::with_stdout(|stdout| execute!(stdout, Hide))?;
         Ok(Self)
     }
 }
 
 impl Drop for HiddenCursorGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), Show);
+        let _ = terminal_output::with_stdout(|stdout| execute!(stdout, Show));
     }
 }
 

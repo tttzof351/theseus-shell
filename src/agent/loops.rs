@@ -7,7 +7,10 @@ use super::{
     tools::{ToolAttachment, ToolOutput, execute_tool_call},
 };
 use crate::{
-    common::text::{TruncatePosition, truncate_utf8_to_bytes},
+    common::{
+        terminal_output,
+        text::{TruncatePosition, truncate_utf8_to_bytes},
+    },
     input::colorize_tag,
 };
 use serde_json::json;
@@ -172,8 +175,10 @@ fn log_assistant_tool_message(content: &str) -> io::Result<()> {
         return Ok(());
     }
 
-    println!("\n{}\n", format_assistant_tool_message(content));
-    io::stdout().flush()
+    terminal_output::with_stdout(|stdout| {
+        writeln!(stdout, "\n{}\n", format_assistant_tool_message(content))?;
+        stdout.flush()
+    })
 }
 
 fn format_assistant_tool_message(content: &str) -> String {

@@ -19,7 +19,7 @@ use rmcp::{
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 
-use crate::logging::AppLogger;
+use crate::{common::terminal_output, logging::AppLogger};
 
 use super::{
     config::{McpServerConfig, McpTransport},
@@ -603,15 +603,21 @@ async fn handle_mcp_request(
 }
 
 fn log_mcp_tool_call(public_tool_name: &str) -> io::Result<()> {
-    println!("{}", format_tool_call_name(public_tool_name));
-    use std::io::Write;
-    io::stdout().flush()
+    terminal_output::with_stdout(|stdout| {
+        use std::io::Write;
+
+        writeln!(stdout, "{}", format_tool_call_name(public_tool_name))?;
+        stdout.flush()
+    })
 }
 
 fn log_mcp_discovery() -> io::Result<()> {
-    println!("{}", format_tool_call_name("mcp_discover"));
-    use std::io::Write;
-    io::stdout().flush()
+    terminal_output::with_stdout(|stdout| {
+        use std::io::Write;
+
+        writeln!(stdout, "{}", format_tool_call_name("mcp_discover"))?;
+        stdout.flush()
+    })
 }
 
 fn warn_mcp_discovery_failed(error: &str) -> io::Result<()> {

@@ -14,7 +14,7 @@ use super::{
 use crate::{
     agent::{Agent, AgentConfig, CompactOutcome, default_config_path},
     common::info::render_info,
-    common::output::CommandOutput,
+    common::{output::CommandOutput, terminal_output},
     feature_flags,
     input::{
         DEFAULT_MULTILINE_PREFIX, MultiLineCompletionMode, MultiLineConfig, MultiLineRenderMode,
@@ -321,12 +321,18 @@ impl TheseusShell {
         initial_text: Option<String>,
         initial_browsing: bool,
     ) -> io::Result<CommandOutput> {
-        println!(
-            "{}",
-            colorize_nested(
-                "<bright-black>Enter multiline input. Type <bold>/end</bold> on a new line to finish.</bright-black>"
-            )
-        );
+        terminal_output::with_stdout(|stdout| {
+            use std::io::Write;
+
+            writeln!(
+                stdout,
+                "{}",
+                colorize_nested(
+                    "<bright-black>Enter multiline input. Type <bold>/end</bold> on a new line to finish.</bright-black>"
+                )
+            )?;
+            stdout.flush()
+        })?;
 
         let history = self.ask_mode_history();
         let draft_slot = self.input_history.len();
@@ -386,12 +392,18 @@ impl TheseusShell {
         history_entry: &mut Option<InputHistoryEntry>,
         initial_text: Option<String>,
     ) -> io::Result<CommandOutput> {
-        println!(
-            "{}",
-            colorize_nested(
-                "<bright-black>Enter multiline shell command. Type <bold>/end</bold> on a new line to run.</bright-black>"
-            )
-        );
+        terminal_output::with_stdout(|stdout| {
+            use std::io::Write;
+
+            writeln!(
+                stdout,
+                "{}",
+                colorize_nested(
+                    "<bright-black>Enter multiline shell command. Type <bold>/end</bold> on a new line to run.</bright-black>"
+                )
+            )?;
+            stdout.flush()
+        })?;
 
         // Keep the /shell history view focused on commands, even though it
         // shares persistent storage with the regular command prompt.

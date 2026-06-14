@@ -84,6 +84,7 @@ pub const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         description: "exit from shell",
         allows_trailing_input: false,
     },
+    //TODO: Need remove
     // SlashCommandSpec {
     //     command: SlashCommand::History,
     //     name: "/history",

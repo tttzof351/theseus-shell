@@ -2,6 +2,7 @@ use std::io::{self, Write};
 
 use theseus::agent::{Agent, AgentConfig};
 use theseus::common::info::render_info;
+use theseus::common::terminal_output;
 use theseus::common::tmp_files::cleanup_expired_tmp_files_async;
 use theseus::input::{BoxOptions, colorize_nested, wrap_in_box};
 use theseus::logging::AppLogger;
@@ -18,11 +19,18 @@ fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     match parse_cli(&raw) {
         Ok(Cli::Version) => {
-            println!("theseus {}", theseus::commands::VERSION);
+            if let Err(err) = write_stdout_line(&format!("theseus {}", theseus::commands::VERSION))
+            {
+                eprintln!("theseus: failed to write to stdout: {err}");
+                std::process::exit(EXIT_USAGE);
+            }
             std::process::exit(EXIT_OK);
         }
         Ok(Cli::Help) => {
-            print_help();
+            if let Err(err) = print_help() {
+                eprintln!("theseus: failed to write help: {err}");
+                std::process::exit(EXIT_USAGE);
+            }
             std::process::exit(EXIT_OK);
         }
         Ok(Cli::Headless(prompt)) => {
@@ -38,7 +46,9 @@ fn main() {
         },
         Err(usage_error) => {
             eprintln!("theseus: {usage_error}\n");
-            print_help();
+            if let Err(err) = print_help() {
+                eprintln!("theseus: failed to write help: {err}");
+            }
             std::process::exit(EXIT_USAGE);
         }
     }
@@ -87,7 +97,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     Ok(Cli::Shell(shell_args))
 }
 
-fn print_help() {
+fn print_help() -> io::Result<()> {
     let usage = format!(
         "<bold><green>Theseus shell wrapper (v{})</green></bold>\n\n\
          <bright-black>-p --prompt 'Say Hello'   run the agent non-interactively</bright-black>\n\
@@ -107,8 +117,11 @@ fn print_help() {
         },
     );
 
-    println!("{}", colorize_nested(&boxed));
-    println!();
+    terminal_output::with_stdout(|stdout| {
+        writeln!(stdout, "{}", colorize_nested(&boxed))?;
+        writeln!(stdout)?;
+        stdout.flush()
+    })
 }
 
 fn run_shell_command(args: Vec<String>) -> std::io::Result<i32> {
@@ -125,7 +138,10 @@ fn run_shell_command(args: Vec<String>) -> std::io::Result<i32> {
         ..ShellConfig::default()
     };
 
-    print!("{}", render_info());
+    terminal_output::with_stdout(|stdout| {
+        write!(stdout, "{}", render_info())?;
+        stdout.flush()
+    })?;
 
     run_shell(config)
 }
@@ -156,11 +172,10 @@ fn run_headless(prompt: &str) -> i32 {
     match agent.run_with_context(prompt, context) {
         Ok(output) => {
             // `output` already ends with a trailing newline.
-            if let Err(err) = io::stdout().write_all(output.as_bytes()) {
-                eprintln!("theseus: failed to write to stdout: {err}");
-                return EXIT_USAGE;
-            }
-            if let Err(err) = io::stdout().flush() {
+            if let Err(err) = terminal_output::with_stdout(|stdout| {
+                stdout.write_all(output.as_bytes())?;
+                stdout.flush()
+            }) {
                 eprintln!("theseus: failed to flush stdout: {err}");
                 return EXIT_USAGE;
             }
@@ -171,6 +186,13 @@ fn run_headless(prompt: &str) -> i32 {
             EXIT_AGENT_ERROR
         }
     }
+}
+
+fn write_stdout_line(line: &str) -> io::Result<()> {
+    terminal_output::with_stdout(|stdout| {
+        writeln!(stdout, "{line}")?;
+        stdout.flush()
+    })
 }
 
 #[cfg(test)]

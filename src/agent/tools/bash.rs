@@ -16,6 +16,7 @@ use crate::{
     common::{
         output::CommandOutput,
         system_tools::{SearchToolAvailability, search_tool_availability},
+        terminal_output,
         text::{TruncatePosition, truncate_utf8_to_bytes},
         tmp_files::create_tmp_log_file,
     },
@@ -51,8 +52,10 @@ impl AgentTool for BashTool {
 
     fn execute(&self, arguments: &Value, context: &AgentRunContext) -> io::Result<ToolOutput> {
         let command = string_arg(arguments, "command")?;
-        print!("{}", format_bash_command_preview(command, context));
-        io::stdout().flush()?;
+        terminal_output::with_stdout(|stdout| {
+            write!(stdout, "{}", format_bash_command_preview(command, context))?;
+            stdout.flush()
+        })?;
 
         let output = run_agent_shell_command(command, context)?;
         let truncated = truncate_utf8_to_bytes(
@@ -200,8 +203,6 @@ where
 {
     thread::spawn(move || {
         let mut buffer = [0; 8192];
-        let mut stdout = io::stdout();
-
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
@@ -213,8 +214,10 @@ where
                         let _ = log_file.write_all(&buffer[..n]);
                         let _ = log_file.flush();
                     }
-                    let _ = stdout.write_all(&buffer[..n]);
-                    let _ = stdout.flush();
+                    let _ = terminal_output::with_stdout(|stdout| {
+                        stdout.write_all(&buffer[..n])?;
+                        stdout.flush()
+                    });
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => break,

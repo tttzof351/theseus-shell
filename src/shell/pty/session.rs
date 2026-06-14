@@ -18,7 +18,7 @@ use std::fs::OpenOptions;
 #[cfg(unix)]
 use super::platform::NonBlockingFileGuard;
 use super::platform::{RawModeGuard, current_pty_size, interactive_shell_args};
-use crate::common::output::CommandOutput;
+use crate::common::{output::CommandOutput, terminal_output};
 
 const POST_SENTINEL_DRAIN_TIMEOUT: Duration = Duration::from_millis(25);
 const STREAM_HOLD_BACK_BYTES: usize = 512;
@@ -240,8 +240,6 @@ impl PersistentShellSession {
     fn read_until_sentinel_streaming(&mut self, payload: &str) -> io::Result<CompletedCommand> {
         let mut pending = Vec::new();
         let mut transcript = Vec::new();
-        let mut stdout = io::stdout();
-
         loop {
             let chunk = self.reader_rx.recv().map_err(|_| {
                 io::Error::new(
@@ -259,8 +257,10 @@ impl PersistentShellSession {
             pending.extend_from_slice(&chunk);
             if let Some(mut completed) = parse_completed_command(&pending, &self.nonce) {
                 strip_echoed_payload(&mut completed.transcript, payload);
-                stdout.write_all(&completed.transcript)?;
-                stdout.flush()?;
+                terminal_output::with_stdout(|stdout| {
+                    stdout.write_all(&completed.transcript)?;
+                    stdout.flush()
+                })?;
                 transcript.extend_from_slice(&completed.transcript);
                 completed.transcript = transcript;
                 self.drain_pending_output();
@@ -273,8 +273,10 @@ impl PersistentShellSession {
             }
             let safe_len = streamable_prefix_len(&pending, &self.nonce);
             if safe_len > 0 {
-                stdout.write_all(&pending[..safe_len])?;
-                stdout.flush()?;
+                terminal_output::with_stdout(|stdout| {
+                    stdout.write_all(&pending[..safe_len])?;
+                    stdout.flush()
+                })?;
                 transcript.extend_from_slice(&pending[..safe_len]);
                 pending.drain(..safe_len);
             }
