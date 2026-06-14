@@ -36,9 +36,13 @@ Natural-language shell workflow:
 
 ![Natural language shell workflow](assets/largest_files.gif)
 
-Fixing the last failed command:
+Multiline editor for shell commands:
 
-![Fix the last failed command](assets/fix_it.gif)
+![Multiline shell mode](assets/syntax_shell_mode.gif)
+
+Agent-assisted repository inspection:
+
+![Agent repo inspection](assets/agent_repo_inspection.gif)
 
 ## MCP servers
 
