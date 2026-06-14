@@ -29,6 +29,7 @@ use super::{
 use crate::commands::slash_commands;
 
 const MULTILINE_ASK_HINT: &str = "Enter multiline input. Type /end on a new line to finish.";
+const MULTILINE_SHELL_HINT: &str = "Enter multiline shell command. Type /end on a new line to run.";
 
 #[cfg(test)]
 use super::completion::{Completion, CompletionToken};
@@ -63,18 +64,28 @@ impl CommandHistoryItem {
             submit: CommandHistorySubmit::MultilineAsk(text),
         }
     }
+
+    pub fn multiline_shell(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            text: format!("/shell\n{text}"),
+            submit: CommandHistorySubmit::MultilineShell(text),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandHistorySubmit {
     Command(String),
     MultilineAsk(String),
+    MultilineShell(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandInputResult {
     Command(String),
     MultilineAsk(String),
+    MultilineShell(String),
 }
 
 struct CommandEditor<'a> {
@@ -85,6 +96,10 @@ struct CommandEditor<'a> {
     completion: Option<CompletionState>,
     rendered_rows: u16,
     rendered_cursor_row: u16,
+}
+
+struct MultilinePreview {
+    hint: &'static str,
 }
 
 pub fn read_command_input(
@@ -164,12 +179,17 @@ impl<'a> CommandEditor<'a> {
             }
             KeyCode::Enter => {
                 self.clear_completion();
-                if let Some(text) = self.selected_multiline_ask_submit() {
+                if let Some(result) = self.selected_multiline_submit() {
                     self.history.accept();
-                    self.buffer.replace_with_text("/ask");
+                    let command = match &result {
+                        CommandInputResult::MultilineAsk(_) => "/ask",
+                        CommandInputResult::MultilineShell(_) => "/shell",
+                        CommandInputResult::Command(_) => unreachable!(),
+                    };
+                    self.buffer.replace_with_text(command);
                     self.render()?;
                     self.finish_line()?;
-                    return Ok(Some(Some(CommandInputResult::MultilineAsk(text))));
+                    return Ok(Some(Some(result)));
                 }
                 if self.apply_browsing_input(BrowsingInput::Enter) == BrowsingAction::Accept {
                     self.render()?;
@@ -370,8 +390,10 @@ impl<'a> CommandEditor<'a> {
     }
 
     fn render_lines(&self) -> Vec<EditorLine<'_>> {
-        if self.selected_multiline_ask_submit().is_some() && self.buffer.lines_len() > 1 {
-            return self.render_multiline_ask_preview_lines();
+        if let Some(preview) = self.selected_multiline_preview()
+            && self.buffer.lines_len() > 1
+        {
+            return self.render_multiline_preview_lines(preview.hint);
         }
 
         let highlighted_shell_lines = if self.line_text(0).starts_with('/') {
@@ -415,7 +437,7 @@ impl<'a> CommandEditor<'a> {
             .collect()
     }
 
-    fn render_multiline_ask_preview_lines(&self) -> Vec<EditorLine<'_>> {
+    fn render_multiline_preview_lines(&self, hint_text: &'static str) -> Vec<EditorLine<'_>> {
         let mut lines = Vec::with_capacity(self.buffer.lines_len() + 1);
         let first_line = self.line_text(0);
         let first_line = highlighted_input(&first_line);
@@ -426,11 +448,11 @@ impl<'a> CommandEditor<'a> {
             text_length(&self.line_text(0), false),
         ));
 
-        let hint = colorize_tag("bright-black", MULTILINE_ASK_HINT);
+        let hint = colorize_tag("bright-black", hint_text);
         lines.push(EditorLine::with_visible_len(
             "",
             hint,
-            text_length(MULTILINE_ASK_HINT, false),
+            text_length(hint_text, false),
         ));
 
         for index in 1..self.buffer.lines_len() {
@@ -603,11 +625,29 @@ impl<'a> CommandEditor<'a> {
         None
     }
 
-    fn selected_multiline_ask_submit(&self) -> Option<String> {
+    fn selected_multiline_submit(&self) -> Option<CommandInputResult> {
         let index = self.history.index()?;
         match &self.config.history.get(index)?.submit {
             CommandHistorySubmit::Command(_) => None,
-            CommandHistorySubmit::MultilineAsk(text) => Some(text.clone()),
+            CommandHistorySubmit::MultilineAsk(text) => {
+                Some(CommandInputResult::MultilineAsk(text.clone()))
+            }
+            CommandHistorySubmit::MultilineShell(text) => {
+                Some(CommandInputResult::MultilineShell(text.clone()))
+            }
+        }
+    }
+
+    fn selected_multiline_preview(&self) -> Option<MultilinePreview> {
+        let index = self.history.index()?;
+        match &self.config.history.get(index)?.submit {
+            CommandHistorySubmit::Command(_) => None,
+            CommandHistorySubmit::MultilineAsk(_) => Some(MultilinePreview {
+                hint: MULTILINE_ASK_HINT,
+            }),
+            CommandHistorySubmit::MultilineShell(_) => Some(MultilinePreview {
+                hint: MULTILINE_SHELL_HINT,
+            }),
         }
     }
 
@@ -935,8 +975,27 @@ mod tests {
         assert_eq!(selected, None);
         assert_eq!(editor.current_text(), "/ask\nline one\nline two");
         assert_eq!(
-            editor.selected_multiline_ask_submit(),
-            Some("line one\nline two".to_string())
+            editor.selected_multiline_submit(),
+            Some(CommandInputResult::MultilineAsk(
+                "line one\nline two".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn history_multiline_shell_entry_returns_multiline_shell_submit_signal() {
+        let history = vec![CommandHistoryItem::multiline_shell("echo \\\n  ok")];
+        let mut editor = CommandEditor::new(config(&history));
+
+        let selected = editor.history_previous();
+
+        assert_eq!(selected, None);
+        assert_eq!(editor.current_text(), "/shell\necho \\\n  ok");
+        assert_eq!(
+            editor.selected_multiline_submit(),
+            Some(CommandInputResult::MultilineShell(
+                "echo \\\n  ok".to_string()
+            ))
         );
     }
 

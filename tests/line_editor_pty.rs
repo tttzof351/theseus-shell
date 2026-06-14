@@ -764,6 +764,73 @@ fn command_history_down_returns_from_multiline_ask_preview_to_newer_command() ->
 }
 
 #[test]
+fn command_history_multiline_shell_recall_uses_shell_preview_and_editor() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let home = temp_home()?;
+    let history_path = command_history_path(&home);
+    fs::create_dir_all(history_path.parent().unwrap())?;
+    fs::write(
+        &history_path,
+        r#"[
+  {
+    "text": "printf '%s\\n' \\\n  SHELL_COMMAND_HISTORY_PREVIEW",
+    "kind": "shell",
+    "mode": "multi_line_shell"
+  }
+]
+"#,
+    )?;
+    let mut shell = PtyShell::start_with_home(home)?;
+
+    let offset = shell.transcript_len();
+    shell.write(KEY_UP)?;
+    shell.wait_until_after(offset, |tail| {
+        tail.contains("/shell") && tail.contains("SHELL_COMMAND_HISTORY_PREVIEW")
+    })?;
+    let preview_screen = VtScreen::parse(
+        PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        &shell.transcript_string(),
+    )
+    .text();
+
+    assert!(
+        preview_screen.contains("theseus-shell> /shell"),
+        "multiline /shell command-history preview should show /shell:\n{preview_screen}"
+    );
+    assert!(
+        preview_screen.contains("Enter multiline shell command. Type /end on a new line to run."),
+        "multiline /shell command-history preview should show the shell editor hint:\n{preview_screen}"
+    );
+    assert!(
+        preview_screen.contains("> printf")
+            && preview_screen.contains(">   SHELL_COMMAND_HISTORY_PREVIEW"),
+        "multiline /shell command-history preview should render the command body with continuation prompts:\n{preview_screen}"
+    );
+
+    shell.write("\r")?;
+    shell.wait_for_after(offset, "Enter multiline shell command")?;
+    let transcript = shell.transcript_string();
+    let transition_tail = &transcript[offset..];
+    let editor_tail = transition_tail
+        .rsplit("Enter multiline shell command")
+        .next()
+        .unwrap_or(transition_tail);
+    assert!(
+        !editor_tail.contains("\x1b[3mSHELL_COMMAND_HISTORY_PREVIEW"),
+        "multiline /shell editor should open in editing mode after command-history selection:\n{transition_tail}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Shell cancelled")?;
+    shell.exit()
+}
+
+#[test]
 fn ask_multiline_history_preserves_cancelled_draft() -> io::Result<()> {
     let _lock = pty_test_lock();
     let mut shell = PtyShell::start()?;

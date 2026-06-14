@@ -155,6 +155,34 @@ impl TheseusShell {
                     }
                     continue;
                 }
+                Ok(Some(CommandInputResult::MultilineShell(input))) => {
+                    let mut record_input = None;
+                    let mut history_entry = None;
+                    let output = match self.read_shell_input(
+                        &mut record_input,
+                        &mut history_entry,
+                        Some(input),
+                    ) {
+                        Ok(output) => output,
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                            println!("\n{INTERRUPTED_EXIT_HINT}");
+                            clear_sigint_request();
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    print_command_output(&output)?;
+                    if let Some(input) = record_input {
+                        self.history.push(CommandRecord {
+                            input,
+                            output: output.clone(),
+                        });
+                    }
+                    if let Some(entry) = history_entry {
+                        self.store_input_history(entry);
+                    }
+                    continue;
+                }
                 Ok(None) => {
                     println!();
                     return Ok(0);
@@ -306,6 +334,9 @@ impl TheseusShell {
             .map(|entry| match (entry.kind, entry.mode) {
                 (InputHistoryKind::Agent, InputHistoryMode::MultiLineAsk) => {
                     CommandHistoryItem::multiline_ask(entry.text.clone())
+                }
+                (InputHistoryKind::Shell, InputHistoryMode::MultiLineShell) => {
+                    CommandHistoryItem::multiline_shell(entry.text.clone())
                 }
                 (InputHistoryKind::Agent, _) => {
                     CommandHistoryItem::command(format!("/ask {}", entry.text))

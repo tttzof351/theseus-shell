@@ -139,7 +139,7 @@ impl TheseusShell {
         let shell_command = command.strip_prefix("/shell").unwrap_or_default().trim();
 
         if shell_command.is_empty() {
-            return self.read_shell_input(record_input, history_entry);
+            return self.read_shell_input(record_input, history_entry, None);
         }
 
         *record_input = Some(shell_command.to_string());
@@ -380,10 +380,11 @@ impl TheseusShell {
         Ok(self.agent_output(prompt))
     }
 
-    fn read_shell_input(
+    pub(super) fn read_shell_input(
         &mut self,
         record_input: &mut Option<String>,
         history_entry: &mut Option<InputHistoryEntry>,
+        initial_text: Option<String>,
     ) -> io::Result<CommandOutput> {
         println!(
             "{}",
@@ -408,7 +409,7 @@ impl TheseusShell {
                 prefix: "> ".to_string(),
                 exit_word: Some("/end".to_string()),
                 history: &history,
-                initial_text: None,
+                initial_text,
                 initial_browsing: false,
                 on_change: Some(Box::new(move |text| {
                     update_input_history_draft(
