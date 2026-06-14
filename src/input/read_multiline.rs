@@ -190,47 +190,79 @@ impl<'a> MultiLineEditor<'a> {
             }
             KeyCode::Backspace => {
                 self.clear_completion();
+                if self.apply_browsing_input_and_should_ignore(BrowsingInput::Backspace) {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.backspace();
                 self.render()?;
             }
             KeyCode::Delete => {
                 self.clear_completion();
+                if self.apply_browsing_input_and_should_ignore(BrowsingInput::Delete) {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.delete();
                 self.render()?;
             }
             KeyCode::Left if is_command_key(key) => {
                 self.clear_completion();
                 self.apply_browsing_input(BrowsingInput::Home);
+                if self.history.is_browsing() {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.buffer.set_col(0);
                 self.render()?;
             }
             KeyCode::Right if is_command_key(key) => {
                 self.clear_completion();
                 self.apply_browsing_input(BrowsingInput::End);
+                if self.history.is_browsing() {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.buffer.set_col_to_line_end();
                 self.render()?;
             }
             KeyCode::Char('b') if is_alt_key(key) => {
                 self.clear_completion();
                 self.apply_browsing_input(BrowsingInput::MoveWordLeft);
+                if self.history.is_browsing() {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.move_word_left();
                 self.render()?;
             }
             KeyCode::Char('f') if is_alt_key(key) => {
                 self.clear_completion();
                 self.apply_browsing_input(BrowsingInput::MoveWordRight);
+                if self.history.is_browsing() {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.move_word_right();
                 self.render()?;
             }
             KeyCode::Left if is_alt_key(key) => {
                 self.clear_completion();
                 self.apply_browsing_input(BrowsingInput::MoveWordLeft);
+                if self.history.is_browsing() {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.move_word_left();
                 self.render()?;
             }
             KeyCode::Right if is_alt_key(key) => {
                 self.clear_completion();
                 self.apply_browsing_input(BrowsingInput::MoveWordRight);
+                if self.history.is_browsing() {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.move_word_right();
                 self.render()?;
             }
@@ -269,20 +301,36 @@ impl<'a> MultiLineEditor<'a> {
             KeyCode::Home => {
                 self.clear_completion();
                 self.apply_browsing_input(BrowsingInput::Home);
+                if self.history.is_browsing() {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.buffer.set_col(0);
                 self.render()?;
             }
             KeyCode::End => {
                 self.clear_completion();
                 self.apply_browsing_input(BrowsingInput::End);
+                if self.history.is_browsing() {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.buffer.set_col_to_line_end();
                 self.render()?;
             }
             KeyCode::Tab => {
+                if self.apply_browsing_input_and_should_ignore(BrowsingInput::Completion) {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.complete()?;
             }
             KeyCode::Char(ch) if is_plain_text_key(key) => {
                 self.clear_completion();
+                if self.apply_browsing_input_and_should_ignore(BrowsingInput::InsertText) {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.insert_char(ch);
                 self.render()?;
             }
@@ -298,6 +346,9 @@ impl<'a> MultiLineEditor<'a> {
     }
 
     fn process_paste(&mut self, text: &str) {
+        if self.apply_browsing_input_and_should_ignore(BrowsingInput::Paste) {
+            return;
+        }
         self.apply_browsing_input(BrowsingInput::Paste);
         self.insert_text(text);
     }
@@ -599,6 +650,10 @@ impl<'a> MultiLineEditor<'a> {
 
     fn apply_browsing_input(&mut self, input: BrowsingInput) -> BrowsingAction {
         self.history.apply_input(input)
+    }
+
+    fn apply_browsing_input_and_should_ignore(&mut self, input: BrowsingInput) -> bool {
+        self.apply_browsing_input(input) == BrowsingAction::Keep && self.history.is_browsing()
     }
 
     fn notify_change(&mut self) {
@@ -1094,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn paste_accepts_history_browsing_and_inserts_text() {
+    fn paste_keeps_history_browsing_without_inserting_text() {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
@@ -1109,11 +1164,11 @@ mod tests {
 
         editor.process_paste(" pasted");
 
-        assert_eq!(editor.buffer.text(), "stored prompt pasted");
-        assert!(!editor.history.is_browsing());
-        assert!(editor.history.index().is_none());
+        assert_eq!(editor.buffer.text(), "stored prompt");
+        assert!(editor.history.is_browsing());
+        assert_eq!(editor.history.index(), Some(0));
         let lines = editor.render_lines();
-        assert_eq!(lines[0].text, "stored prompt pasted");
+        assert!(lines[0].text.contains("stored prompt"));
     }
 
     #[test]
@@ -1157,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn editing_recalled_prompt_stops_history_navigation() {
+    fn accepted_recalled_prompt_can_be_edited() {
         let history = vec!["stored prompt".to_string()];
         let mut editor = MultiLineEditor::new(MultiLineConfig {
             prefix: DEFAULT_MULTILINE_PREFIX.to_string(),
@@ -1168,6 +1223,8 @@ mod tests {
         });
 
         editor.history_previous();
+        assert!(editor.history.is_browsing());
+        editor.accept_history_browsing();
         editor.insert_char('!');
         editor.history_next();
 

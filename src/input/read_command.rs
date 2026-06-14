@@ -180,15 +180,7 @@ impl<'a> CommandEditor<'a> {
             KeyCode::Enter => {
                 self.clear_completion();
                 if let Some(result) = self.selected_multiline_submit() {
-                    self.history.accept();
-                    let command = match &result {
-                        CommandInputResult::MultilineAsk(_) => "/ask",
-                        CommandInputResult::MultilineShell(_) => "/shell",
-                        CommandInputResult::Command(_) => unreachable!(),
-                    };
-                    self.buffer.replace_with_text(command);
-                    self.render()?;
-                    self.finish_line()?;
+                    self.finish_selected_multiline_submit(&result)?;
                     return Ok(Some(Some(result)));
                 }
                 if self.apply_browsing_input(BrowsingInput::Enter) == BrowsingAction::Accept {
@@ -205,59 +197,115 @@ impl<'a> CommandEditor<'a> {
             }
             KeyCode::Backspace => {
                 self.clear_completion();
+                if self.apply_browsing_input_and_should_ignore(BrowsingInput::Backspace) {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.backspace();
                 self.render()?;
             }
             KeyCode::Delete => {
                 self.clear_completion();
+                if self.apply_browsing_input_and_should_ignore(BrowsingInput::Delete) {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.delete();
                 self.render()?;
             }
             KeyCode::Left if is_command_key(key) => {
                 self.clear_completion();
-                self.apply_browsing_input(BrowsingInput::Home);
+                if let Some(result) = self.accept_browsing_navigation(BrowsingInput::Home)? {
+                    return Ok(Some(Some(result)));
+                }
+                if self.history.is_browsing() {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.buffer.set_col(0);
                 self.render()?;
             }
             KeyCode::Right if is_command_key(key) => {
                 self.clear_completion();
-                self.apply_browsing_input(BrowsingInput::End);
+                if let Some(result) = self.accept_browsing_navigation(BrowsingInput::End)? {
+                    return Ok(Some(Some(result)));
+                }
+                if self.history.is_browsing() {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.buffer.set_col_to_line_end();
                 self.render()?;
             }
             KeyCode::Char('b') if is_alt_key(key) => {
                 self.clear_completion();
-                self.apply_browsing_input(BrowsingInput::MoveWordLeft);
+                if let Some(result) =
+                    self.accept_browsing_navigation(BrowsingInput::MoveWordLeft)?
+                {
+                    return Ok(Some(Some(result)));
+                }
+                if self.history.is_browsing() {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.move_word_left();
                 self.render()?;
             }
             KeyCode::Char('f') if is_alt_key(key) => {
                 self.clear_completion();
-                self.apply_browsing_input(BrowsingInput::MoveWordRight);
+                if let Some(result) =
+                    self.accept_browsing_navigation(BrowsingInput::MoveWordRight)?
+                {
+                    return Ok(Some(Some(result)));
+                }
+                if self.history.is_browsing() {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.move_word_right();
                 self.render()?;
             }
             KeyCode::Left if is_alt_key(key) => {
                 self.clear_completion();
-                self.apply_browsing_input(BrowsingInput::MoveWordLeft);
+                if let Some(result) =
+                    self.accept_browsing_navigation(BrowsingInput::MoveWordLeft)?
+                {
+                    return Ok(Some(Some(result)));
+                }
+                if self.history.is_browsing() {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.move_word_left();
                 self.render()?;
             }
             KeyCode::Right if is_alt_key(key) => {
                 self.clear_completion();
-                self.apply_browsing_input(BrowsingInput::MoveWordRight);
+                if let Some(result) =
+                    self.accept_browsing_navigation(BrowsingInput::MoveWordRight)?
+                {
+                    return Ok(Some(Some(result)));
+                }
+                if self.history.is_browsing() {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.move_word_right();
                 self.render()?;
             }
             KeyCode::Left => {
                 self.clear_completion();
-                self.apply_browsing_input(BrowsingInput::Left);
+                if let Some(result) = self.accept_browsing_navigation(BrowsingInput::Left)? {
+                    return Ok(Some(Some(result)));
+                }
                 self.move_left();
                 self.render()?;
             }
             KeyCode::Right => {
                 self.clear_completion();
-                self.apply_browsing_input(BrowsingInput::Right);
+                if let Some(result) = self.accept_browsing_navigation(BrowsingInput::Right)? {
+                    return Ok(Some(Some(result)));
+                }
                 self.move_right();
                 self.render()?;
             }
@@ -291,21 +339,41 @@ impl<'a> CommandEditor<'a> {
             }
             KeyCode::Home => {
                 self.clear_completion();
-                self.apply_browsing_input(BrowsingInput::Home);
+                if let Some(result) = self.accept_browsing_navigation(BrowsingInput::Home)? {
+                    return Ok(Some(Some(result)));
+                }
+                if self.history.is_browsing() {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.buffer.set_col(0);
                 self.render()?;
             }
             KeyCode::End => {
                 self.clear_completion();
-                self.apply_browsing_input(BrowsingInput::End);
+                if let Some(result) = self.accept_browsing_navigation(BrowsingInput::End)? {
+                    return Ok(Some(Some(result)));
+                }
+                if self.history.is_browsing() {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.buffer.set_col_to_line_end();
                 self.render()?;
             }
             KeyCode::Tab => {
+                if self.apply_browsing_input_and_should_ignore(BrowsingInput::Completion) {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.complete()?;
             }
             KeyCode::Char(ch) if is_plain_text_key(key) => {
                 self.clear_completion();
+                if self.apply_browsing_input_and_should_ignore(BrowsingInput::InsertText) {
+                    self.render()?;
+                    return Ok(None);
+                }
                 self.insert_char(ch);
                 self.render()?;
             }
@@ -317,7 +385,10 @@ impl<'a> CommandEditor<'a> {
 
     fn handle_paste(&mut self, text: &str) -> io::Result<Option<Option<CommandInputResult>>> {
         self.clear_completion();
-        self.apply_browsing_input(BrowsingInput::Paste);
+        if self.apply_browsing_input_and_should_ignore(BrowsingInput::Paste) {
+            self.render()?;
+            return Ok(None);
+        }
 
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         for segment in normalized.split_inclusive('\n') {
@@ -626,6 +697,37 @@ impl<'a> CommandEditor<'a> {
         self.buffer.replace_with_text(&display_text);
         let _ = index;
         None
+    }
+
+    fn accept_browsing_navigation(
+        &mut self,
+        input: BrowsingInput,
+    ) -> io::Result<Option<CommandInputResult>> {
+        let selected_multiline = self.selected_multiline_submit();
+        let action = self.apply_browsing_input(input);
+        if action == BrowsingAction::Accept
+            && let Some(result) = selected_multiline
+        {
+            self.finish_selected_multiline_submit(&result)?;
+            return Ok(Some(result));
+        }
+        Ok(None)
+    }
+
+    fn apply_browsing_input_and_should_ignore(&mut self, input: BrowsingInput) -> bool {
+        self.apply_browsing_input(input) == BrowsingAction::Keep && self.history.is_browsing()
+    }
+
+    fn finish_selected_multiline_submit(&mut self, result: &CommandInputResult) -> io::Result<()> {
+        self.history.accept();
+        let command = match result {
+            CommandInputResult::MultilineAsk(_) => "/ask",
+            CommandInputResult::MultilineShell(_) => "/shell",
+            CommandInputResult::Command(_) => unreachable!(),
+        };
+        self.buffer.replace_with_text(command);
+        self.render()?;
+        self.finish_line()
     }
 
     fn selected_multiline_submit(&self) -> Option<CommandInputResult> {

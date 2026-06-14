@@ -36,7 +36,6 @@ pub(super) enum BrowsingInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BrowsingAction {
     Accept,
-    Stop,
     Keep,
 }
 
@@ -73,15 +72,13 @@ impl HistoryBrowser {
             | BrowsingInput::Backspace
             | BrowsingInput::Delete
             | BrowsingInput::Paste
-            | BrowsingInput::Completion => BrowsingAction::Stop,
-            BrowsingInput::Left
-            | BrowsingInput::Right
-            | BrowsingInput::Home
+            | BrowsingInput::Completion => BrowsingAction::Keep,
+            BrowsingInput::Left | BrowsingInput::Right => BrowsingAction::Accept,
+            BrowsingInput::Home
             | BrowsingInput::End
             | BrowsingInput::MoveWordLeft
-            | BrowsingInput::MoveWordRight
-            | BrowsingInput::HistoryPrevious
-            | BrowsingInput::HistoryNext => BrowsingAction::Keep,
+            | BrowsingInput::MoveWordRight => BrowsingAction::Keep,
+            BrowsingInput::HistoryPrevious | BrowsingInput::HistoryNext => BrowsingAction::Keep,
         }
     }
 
@@ -92,10 +89,6 @@ impl HistoryBrowser {
                 BrowsingAction::Accept
             }
             BrowsingAction::Accept => BrowsingAction::Keep,
-            BrowsingAction::Stop => {
-                self.stop();
-                BrowsingAction::Stop
-            }
             BrowsingAction::Keep => BrowsingAction::Keep,
         }
     }
@@ -201,14 +194,22 @@ mod tests {
         );
         assert_eq!(
             HistoryBrowser::action_for_input(BrowsingInput::InsertText),
-            BrowsingAction::Stop
-        );
-        assert_eq!(
-            HistoryBrowser::action_for_input(BrowsingInput::Left),
             BrowsingAction::Keep
         );
         assert_eq!(
+            HistoryBrowser::action_for_input(BrowsingInput::Left),
+            BrowsingAction::Accept
+        );
+        assert_eq!(
             HistoryBrowser::action_for_input(BrowsingInput::HistoryPrevious),
+            BrowsingAction::Keep
+        );
+        assert_eq!(
+            HistoryBrowser::action_for_input(BrowsingInput::HistoryNext),
+            BrowsingAction::Keep
+        );
+        assert_eq!(
+            HistoryBrowser::action_for_input(BrowsingInput::Home),
             BrowsingAction::Keep
         );
     }
@@ -231,6 +232,36 @@ mod tests {
         );
         assert_eq!(browser.index(), None);
         assert!(!browser.is_browsing());
+    }
+
+    #[test]
+    fn left_and_right_accept_active_browsing() {
+        let history = history();
+        let mut browser = HistoryBrowser::default();
+
+        browser.previous(&history, "draft".to_string(), true, browsing);
+
+        assert_eq!(
+            browser.apply_input(BrowsingInput::Left),
+            BrowsingAction::Accept
+        );
+        assert_eq!(browser.index(), None);
+        assert!(!browser.is_browsing());
+    }
+
+    #[test]
+    fn text_input_keeps_active_browsing() {
+        let history = history();
+        let mut browser = HistoryBrowser::default();
+
+        browser.previous(&history, "draft".to_string(), true, browsing);
+
+        assert_eq!(
+            browser.apply_input(BrowsingInput::InsertText),
+            BrowsingAction::Keep
+        );
+        assert!(browser.is_browsing());
+        assert_eq!(browser.index(), Some(2));
     }
 
     #[test]

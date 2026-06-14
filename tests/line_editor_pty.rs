@@ -17,6 +17,7 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_TIMEOUT: Duration = Duration::from_millis(500);
 const KEY_UP: &str = "\x1b[A";
 const KEY_DOWN: &str = "\x1b[B";
+const KEY_LEFT: &str = "\x1b[D";
 static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct PtyShell {
@@ -777,6 +778,129 @@ fn command_history_multiline_ask_recall_finishes_prompt_line_before_editor() -> 
 }
 
 #[test]
+fn command_history_multiline_ask_left_accepts_preview_into_editor() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let home = temp_home()?;
+    let history_path = command_history_path(&home);
+    fs::create_dir_all(history_path.parent().unwrap())?;
+    fs::write(
+        &history_path,
+        r#"[
+  {
+    "text": "Расскажи\nанекдот\nпро врачей",
+    "kind": "agent",
+    "mode": "multi_line_ask"
+  }
+]
+"#,
+    )?;
+    let mut shell = PtyShell::start_with_home(home)?;
+
+    let offset = shell.transcript_len();
+    shell.write(KEY_UP)?;
+    shell.wait_until_after(offset, |tail| {
+        tail.contains("/ask") && tail.contains("про врачей")
+    })?;
+
+    let left_offset = shell.transcript_len();
+    shell.write(KEY_LEFT)?;
+    shell.wait_until_after(left_offset, |tail| {
+        let visible = strip_ansi_codes(tail);
+        visible.contains("theseus-shell> /ask")
+            && visible.contains(&multiline_prefix_text("Расскажи"))
+    })?;
+    let screen = VtScreen::parse(
+        PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        &shell.transcript_string(),
+    )
+    .text();
+
+    assert!(
+        screen.contains(&format!(
+            "Enter multiline input. Type {MULTILINE_SUBMIT_COMMAND} on a new line to finish."
+        )),
+        "Left from multiline /ask preview should keep the ask editor hint:\n{screen}"
+    );
+    assert!(
+        screen.contains(&multiline_prefix_text("Расскажи"))
+            && screen.contains(&multiline_prefix_text("про врачей")),
+        "Left from multiline /ask preview should open the real multiline editor with body prompts:\n{screen}"
+    );
+    assert_eq!(
+        count_matches(&screen, "про врачей"),
+        1,
+        "Left from multiline /ask preview should clear the preview before opening the editor:\n{screen}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Ask cancelled")?;
+    shell.exit()
+}
+
+#[test]
+fn command_history_multiline_ask_text_key_keeps_preview_browsing() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let home = temp_home()?;
+    let history_path = command_history_path(&home);
+    fs::create_dir_all(history_path.parent().unwrap())?;
+    fs::write(
+        &history_path,
+        r#"[
+  {
+    "text": "Расскажи\nанекдот\nпро врачей",
+    "kind": "agent",
+    "mode": "multi_line_ask"
+  }
+]
+"#,
+    )?;
+    let mut shell = PtyShell::start_with_home(home)?;
+
+    let offset = shell.transcript_len();
+    shell.write(KEY_UP)?;
+    shell.wait_until_after(offset, |tail| {
+        tail.contains("/ask") && tail.contains("про врачей")
+    })?;
+
+    let key_offset = shell.transcript_len();
+    shell.write("u")?;
+    shell.wait_until_after(key_offset, |tail| {
+        strip_ansi_codes(tail).contains("про врачей")
+    })?;
+    let screen = VtScreen::parse(
+        PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        &shell.transcript_string(),
+    )
+    .text();
+
+    assert!(
+        screen.contains(&format!(
+            "Enter multiline input. Type {MULTILINE_SUBMIT_COMMAND} on a new line to finish."
+        )),
+        "Text key in multiline /ask preview should keep browsing preview instead of opening a partial editor:\n{screen}"
+    );
+    assert_eq!(
+        count_matches(&screen, "про врачей"),
+        1,
+        "Text key in multiline /ask preview should not duplicate or edit the recalled prompt:\n{screen}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Interrupted. Type /exit to exit the shell.")?;
+    shell.exit()
+}
+
+#[test]
 fn command_history_down_returns_from_multiline_ask_preview_to_newer_command() -> io::Result<()> {
     let _lock = pty_test_lock();
     let home = temp_home()?;
@@ -920,6 +1044,131 @@ fn command_history_multiline_shell_recall_uses_shell_preview_and_editor() -> io:
 
     shell.write("\u{3}")?;
     shell.wait_for_after(offset, "Shell cancelled")?;
+    shell.exit()
+}
+
+#[test]
+fn command_history_multiline_shell_left_accepts_preview_into_editor() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let home = temp_home()?;
+    let history_path = command_history_path(&home);
+    fs::create_dir_all(history_path.parent().unwrap())?;
+    fs::write(
+        &history_path,
+        r#"[
+  {
+    "text": "curl -sS https://example.com \\\n  -H \"Content-Type: application/json\"",
+    "kind": "shell",
+    "mode": "multi_line_shell"
+  }
+]
+"#,
+    )?;
+    let mut shell = PtyShell::start_with_home(home)?;
+
+    let offset = shell.transcript_len();
+    shell.write(KEY_UP)?;
+    shell.wait_until_after(offset, |tail| {
+        tail.contains("/shell") && tail.contains("Content-Type: application/json")
+    })?;
+
+    let left_offset = shell.transcript_len();
+    shell.write(KEY_LEFT)?;
+    shell.wait_until_after(left_offset, |tail| {
+        let visible = strip_ansi_codes(tail);
+        visible.contains("theseus-shell> /shell")
+            && visible.contains(&multiline_prefix_text("curl -sS https://example.com \\"))
+    })?;
+    let screen = VtScreen::parse(
+        PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        &shell.transcript_string(),
+    )
+    .text();
+
+    assert!(
+        screen.contains(&format!(
+            "Enter multiline shell command. Type {MULTILINE_SUBMIT_COMMAND} on a new line to run."
+        )),
+        "Left from multiline /shell preview should keep the shell editor hint:\n{screen}"
+    );
+    assert!(
+        screen.contains(&multiline_prefix_text("curl -sS https://example.com \\"))
+            && screen.contains(&multiline_prefix_text(
+                "  -H \"Content-Type: application/json\""
+            )),
+        "Left from multiline /shell preview should open the real multiline editor with body prompts:\n{screen}"
+    );
+    assert_eq!(
+        count_matches(&screen, "Content-Type: application/json"),
+        1,
+        "Left from multiline /shell preview should clear the preview before opening the editor:\n{screen}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Shell cancelled")?;
+    shell.exit()
+}
+
+#[test]
+fn command_history_multiline_shell_text_key_keeps_preview_browsing() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let home = temp_home()?;
+    let history_path = command_history_path(&home);
+    fs::create_dir_all(history_path.parent().unwrap())?;
+    fs::write(
+        &history_path,
+        r#"[
+  {
+    "text": "curl -sS https://example.com \\\n  -H \"Content-Type: application/json\"",
+    "kind": "shell",
+    "mode": "multi_line_shell"
+  }
+]
+"#,
+    )?;
+    let mut shell = PtyShell::start_with_home(home)?;
+
+    let offset = shell.transcript_len();
+    shell.write(KEY_UP)?;
+    shell.wait_until_after(offset, |tail| {
+        tail.contains("/shell") && tail.contains("Content-Type: application/json")
+    })?;
+
+    let key_offset = shell.transcript_len();
+    shell.write("u")?;
+    shell.wait_until_after(key_offset, |tail| {
+        strip_ansi_codes(tail).contains("Content-Type: application/json")
+    })?;
+    let screen = VtScreen::parse(
+        PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        &shell.transcript_string(),
+    )
+    .text();
+
+    assert!(
+        screen.contains(&format!(
+            "Enter multiline shell command. Type {MULTILINE_SUBMIT_COMMAND} on a new line to run."
+        )),
+        "Text key in multiline /shell preview should keep browsing preview instead of opening a partial editor:\n{screen}"
+    );
+    assert_eq!(
+        count_matches(&screen, "Content-Type: application/json"),
+        1,
+        "Text key in multiline /shell preview should not duplicate or edit the recalled command:\n{screen}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Interrupted. Type /exit to exit the shell.")?;
     shell.exit()
 }
 
