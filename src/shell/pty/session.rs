@@ -257,8 +257,15 @@ impl PersistentShellSession {
             pending.extend_from_slice(&chunk);
             if let Some(mut completed) = parse_completed_command(&pending, &self.nonce) {
                 strip_echoed_payload(&mut completed.transcript, payload);
+                let needs_prompt_separator = (!completed.transcript.is_empty()
+                    || !transcript.is_empty())
+                    && trailing_line_break_len(&completed.transcript) == 0
+                    && trailing_line_break_len(&transcript) == 0;
                 terminal_output::with_stdout(|stdout| {
                     stdout.write_all(&completed.transcript)?;
+                    if needs_prompt_separator {
+                        stdout.write_all(b"\r\n")?;
+                    }
                     stdout.flush()
                 })?;
                 transcript.extend_from_slice(&completed.transcript);

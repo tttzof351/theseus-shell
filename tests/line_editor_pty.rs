@@ -431,6 +431,39 @@ fn bracketed_paste_assignment_before_heredoc_executes_as_one_command() -> io::Re
 }
 
 #[test]
+fn bracketed_paste_output_without_trailing_newline_does_not_merge_with_prompt() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    let command = "printf '{\\n  \"ok\": true\\n}'\n";
+
+    let offset = shell.transcript_len();
+    shell.write(BRACKETED_PASTE_START)?;
+    shell.write(command)?;
+    shell.write(BRACKETED_PASTE_END)?;
+    shell.wait_until_after(offset, |tail| {
+        tail.contains("\"ok\": true") && tail.contains("theseus-shell")
+    })?;
+    let screen = VtScreen::parse(
+        PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        &shell.transcript_string(),
+    )
+    .text();
+
+    assert!(
+        !screen.contains("}euclid"),
+        "prompt was rendered on the same row as bracketed pasted command output without trailing newline:\n{screen}"
+    );
+
+    shell.exit()
+}
+
+#[test]
 fn long_running_command_moves_to_next_line_immediately_after_enter() -> io::Result<()> {
     let _lock = pty_test_lock();
     let mut shell = PtyShell::start()?;
@@ -447,6 +480,35 @@ fn long_running_command_moves_to_next_line_immediately_after_enter() -> io::Resu
     );
 
     shell.wait_for_after(offset, "theseus-shell")?;
+    shell.exit()
+}
+
+#[test]
+fn command_output_without_trailing_newline_does_not_merge_with_next_prompt() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    let offset = shell.transcript_len();
+    shell.write("printf NO_NEWLINE_PROMPT_OK\r")?;
+    shell.wait_until_after(offset, |tail| {
+        tail.contains("NO_NEWLINE_PROMPT_OK") && tail.contains("theseus-shell")
+    })?;
+    let screen = VtScreen::parse(
+        PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        &shell.transcript_string(),
+    )
+    .text();
+
+    assert!(
+        !screen.contains("NO_NEWLINE_PROMPT_OKeuclid"),
+        "prompt was rendered on the same row as command output without trailing newline:\n{screen}"
+    );
+
     shell.exit()
 }
 
