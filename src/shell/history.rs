@@ -140,14 +140,20 @@ pub(super) fn push_input_history(history: &mut Vec<InputHistoryEntry>, entry: In
     normalize_input_history_in_place(history);
 }
 
+/// Update the live draft entry and return the slot where that draft ended up.
+///
+/// The returned slot must be used for the next draft update because
+/// normalization may remove duplicates and trim old entries when history is at
+/// capacity. For an empty draft, entries from `slot` onward are removed and the
+/// returned slot is the next append position.
 pub(super) fn update_input_history_draft(
     history: &mut Vec<InputHistoryEntry>,
     slot: usize,
     entry: InputHistoryEntry,
-) {
+) -> usize {
     let Some(entry) = normalize_input_history_entry(entry) else {
         history.truncate(slot);
-        return;
+        return history.len();
     };
 
     if history.len() > slot {
@@ -158,6 +164,7 @@ pub(super) fn update_input_history_draft(
     }
 
     normalize_input_history_in_place(history);
+    history.len().saturating_sub(1)
 }
 
 pub(super) fn format_history(history: &[CommandRecord]) -> String {
@@ -454,7 +461,7 @@ mod tests {
             ),
         ];
 
-        update_input_history_draft(
+        let slot = update_input_history_draft(
             &mut history,
             1,
             InputHistoryEntry::new(
@@ -479,8 +486,9 @@ mod tests {
                 ),
             ]
         );
+        assert_eq!(slot, 1);
 
-        update_input_history_draft(
+        let slot = update_input_history_draft(
             &mut history,
             1,
             InputHistoryEntry::new(" ", InputHistoryKind::Agent, InputHistoryMode::MultiLineAsk),
@@ -493,6 +501,55 @@ mod tests {
                 InputHistoryKind::Shell,
                 InputHistoryMode::SingleLine,
             )]
+        );
+        assert_eq!(slot, 1);
+    }
+
+    #[test]
+    fn typed_history_draft_update_returns_trimmed_slot_for_full_history() {
+        let mut history = (0..MAX_PERSISTED_HISTORY)
+            .map(|index| {
+                InputHistoryEntry::new(
+                    format!("command-{index}"),
+                    InputHistoryKind::Shell,
+                    InputHistoryMode::SingleLine,
+                )
+            })
+            .collect::<Vec<_>>();
+        let slot = history.len();
+
+        let slot = update_input_history_draft(
+            &mut history,
+            slot,
+            InputHistoryEntry::new(
+                "draft-1",
+                InputHistoryKind::Agent,
+                InputHistoryMode::MultiLineAsk,
+            ),
+        );
+        let slot = update_input_history_draft(
+            &mut history,
+            slot,
+            InputHistoryEntry::new(
+                "draft-2",
+                InputHistoryKind::Agent,
+                InputHistoryMode::MultiLineAsk,
+            ),
+        );
+
+        assert_eq!(history.len(), MAX_PERSISTED_HISTORY);
+        assert_eq!(slot, MAX_PERSISTED_HISTORY - 1);
+        assert_eq!(
+            history.first().map(|entry| entry.text.as_str()),
+            Some("command-1")
+        );
+        assert_eq!(
+            history.last(),
+            Some(&InputHistoryEntry::new(
+                "draft-2",
+                InputHistoryKind::Agent,
+                InputHistoryMode::MultiLineAsk
+            ))
         );
     }
 }

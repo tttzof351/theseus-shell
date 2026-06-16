@@ -1,4 +1,4 @@
-use std::{env, io};
+use std::{cell::Cell, env, io};
 
 use super::{
     core::TheseusShell,
@@ -335,7 +335,7 @@ impl TheseusShell {
         })?;
 
         let history = self.ask_mode_history();
-        let draft_slot = self.input_history.len();
+        let draft_slot = Cell::new(self.input_history.len());
         let history_path = self.config.command_history_v2_path.clone();
         let text = {
             let input_history = &mut self.input_history;
@@ -345,16 +345,17 @@ impl TheseusShell {
                 history: &history,
                 initial_text,
                 initial_browsing,
-                on_change: Some(Box::new(move |text| {
-                    update_input_history_draft(
+                on_change: Some(Box::new(|text| {
+                    let slot = update_input_history_draft(
                         input_history,
-                        draft_slot,
+                        draft_slot.get(),
                         InputHistoryEntry::new(
                             text,
                             InputHistoryKind::Agent,
                             InputHistoryMode::MultiLineAsk,
                         ),
                     );
+                    draft_slot.set(slot);
                     save_input_history_to_path(&history_path, input_history, "command_v2");
                 })),
                 ..MultiLineConfig::default()
@@ -370,7 +371,7 @@ impl TheseusShell {
         let prompt = text.trim();
         update_input_history_draft(
             &mut self.input_history,
-            draft_slot,
+            draft_slot.get(),
             InputHistoryEntry::new(
                 prompt,
                 InputHistoryKind::Agent,
@@ -408,7 +409,7 @@ impl TheseusShell {
         // Keep the /shell history view focused on commands, even though it
         // shares persistent storage with the regular command prompt.
         let history = self.shell_mode_history();
-        let draft_slot = self.input_history.len();
+        let draft_slot = Cell::new(self.input_history.len());
         let history_path = self.config.command_history_v2_path.clone();
         let shell_highlight = self
             .config
@@ -423,16 +424,17 @@ impl TheseusShell {
                 history: &history,
                 initial_text,
                 initial_browsing: false,
-                on_change: Some(Box::new(move |text| {
-                    update_input_history_draft(
+                on_change: Some(Box::new(|text| {
+                    let slot = update_input_history_draft(
                         input_history,
-                        draft_slot,
+                        draft_slot.get(),
                         InputHistoryEntry::new(
                             text,
                             InputHistoryKind::Shell,
                             InputHistoryMode::MultiLineShell,
                         ),
                     );
+                    draft_slot.set(slot);
                     save_input_history_to_path(&history_path, input_history, "command_v2");
                 })),
                 render_mode: MultiLineRenderMode::Shell { shell_highlight },
@@ -451,7 +453,7 @@ impl TheseusShell {
         if command.is_empty() {
             update_input_history_draft(
                 &mut self.input_history,
-                draft_slot,
+                draft_slot.get(),
                 InputHistoryEntry::new(
                     command,
                     InputHistoryKind::Shell,
@@ -468,7 +470,7 @@ impl TheseusShell {
         // duplicate and skip the append.
         update_input_history_draft(
             &mut self.input_history,
-            draft_slot,
+            draft_slot.get(),
             InputHistoryEntry::new(
                 command,
                 InputHistoryKind::Shell,

@@ -1462,6 +1462,74 @@ fn ask_multiline_history_preserves_cancelled_draft() -> io::Result<()> {
 }
 
 #[test]
+fn ask_multiline_persistent_draft_replaces_intermediate_edits() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let home = temp_home()?;
+    let history_path = command_history_path(&home);
+    fs::create_dir_all(history_path.parent().unwrap())?;
+    let history = (0..100)
+        .map(|index| {
+            serde_json::json!({
+                "text": format!("prefilled-command-{index}"),
+                "kind": "shell",
+                "mode": "single_line",
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut text = serde_json::to_string_pretty(&history).map_err(io::Error::other)?;
+    text.push('\n');
+    fs::write(&history_path, text)?;
+    let mut shell = PtyShell::start_with_home(home)?;
+
+    shell.write("/ask\r")?;
+    shell.wait_for("Enter multiline input")?;
+    shell.write("ASK_INCREMENTAL_DRAFT")?;
+    shell.wait_for("ASK_INCREMENTAL_DRAFT")?;
+
+    let saved = fs::read_to_string(command_history_path(&shell.home))?;
+    let history: Vec<serde_json::Value> = serde_json::from_str(&saved).map_err(io::Error::other)?;
+    let matching_drafts = history
+        .iter()
+        .filter(|entry| {
+            entry.get("kind").and_then(serde_json::Value::as_str) == Some("agent")
+                && entry.get("mode").and_then(serde_json::Value::as_str) == Some("multi_line_ask")
+                && entry
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| text.starts_with("ASK_INCREMENTAL"))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        history.len(),
+        100,
+        "multiline /ask persistent history should stay capped while editing:\n{saved}"
+    );
+    assert!(
+        !history.iter().any(|entry| {
+            entry.get("text").and_then(serde_json::Value::as_str) == Some("ASK_INCREMENTAL")
+        }),
+        "multiline /ask persistent history should not keep an intermediate draft:\n{saved}"
+    );
+    assert_eq!(
+        matching_drafts.len(),
+        1,
+        "multiline /ask persistent history should keep one live draft, not every intermediate edit:\n{saved}"
+    );
+    assert_eq!(
+        matching_drafts[0]
+            .get("text")
+            .and_then(serde_json::Value::as_str),
+        Some("ASK_INCREMENTAL_DRAFT"),
+        "multiline /ask persistent draft should contain the latest edit:\n{saved}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for("Ask cancelled")?;
+    shell.exit()
+}
+
+#[test]
 fn ask_multiline_history_deduplicates_entries_after_filtering() -> io::Result<()> {
     let _lock = pty_test_lock();
     let home = temp_home()?;
@@ -1652,6 +1720,75 @@ fn shell_multiline_success_normalizes_draft_before_history_append() -> io::Resul
         "/shell submit stored both the raw draft and trimmed command:\n{saved}"
     );
 
+    shell.exit()
+}
+
+#[test]
+fn shell_multiline_persistent_draft_replaces_intermediate_edits() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let home = temp_home()?;
+    let history_path = command_history_path(&home);
+    fs::create_dir_all(history_path.parent().unwrap())?;
+    let history = (0..100)
+        .map(|index| {
+            serde_json::json!({
+                "text": format!("prefilled-command-{index}"),
+                "kind": "shell",
+                "mode": "single_line",
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut text = serde_json::to_string_pretty(&history).map_err(io::Error::other)?;
+    text.push('\n');
+    fs::write(&history_path, text)?;
+    let mut shell = PtyShell::start_with_home(home)?;
+
+    shell.write("/shell\r")?;
+    shell.wait_for("Enter multiline shell command")?;
+    shell.write("printf SHELL_INCREMENTAL_DRAFT")?;
+    shell.wait_for("SHELL_INCREMENTAL_DRAFT")?;
+
+    let saved = fs::read_to_string(command_history_path(&shell.home))?;
+    let history: Vec<serde_json::Value> = serde_json::from_str(&saved).map_err(io::Error::other)?;
+    let matching_drafts = history
+        .iter()
+        .filter(|entry| {
+            entry.get("kind").and_then(serde_json::Value::as_str) == Some("shell")
+                && entry.get("mode").and_then(serde_json::Value::as_str) == Some("multi_line_shell")
+                && entry
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| text.starts_with("printf SHELL_INCREMENTAL"))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        history.len(),
+        100,
+        "multiline /shell persistent history should stay capped while editing:\n{saved}"
+    );
+    assert!(
+        !history.iter().any(|entry| {
+            entry.get("text").and_then(serde_json::Value::as_str)
+                == Some("printf SHELL_INCREMENTAL")
+        }),
+        "multiline /shell persistent history should not keep an intermediate draft:\n{saved}"
+    );
+    assert_eq!(
+        matching_drafts.len(),
+        1,
+        "multiline /shell persistent history should keep one live draft, not every intermediate edit:\n{saved}"
+    );
+    assert_eq!(
+        matching_drafts[0]
+            .get("text")
+            .and_then(serde_json::Value::as_str),
+        Some("printf SHELL_INCREMENTAL_DRAFT"),
+        "multiline /shell persistent draft should contain the latest edit:\n{saved}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for("Shell cancelled")?;
     shell.exit()
 }
 
