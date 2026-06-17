@@ -1,7 +1,7 @@
 use std::{
     fs,
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -21,6 +21,7 @@ const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const KEY_UP: &str = "\x1b[A";
 const KEY_DOWN: &str = "\x1b[B";
 const KEY_LEFT: &str = "\x1b[D";
+const KEY_TAB: &str = "\t";
 static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct PtyShell {
@@ -241,6 +242,53 @@ fn command_continuation_text(text: &str) -> String {
 
 fn multiline_prefix_text(text: &str) -> String {
     format!("{DEFAULT_MULTILINE_PREFIX}{text}")
+}
+
+fn create_path_completion_fixture(root: &Path) -> io::Result<PathBuf> {
+    let dir = root.join("path-completion");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("theseus-mojo"))?;
+    fs::create_dir_all(dir.join("theseus-shell"))?;
+    Ok(dir)
+}
+
+fn enter_path_completion_fixture(shell: &mut PtyShell, dir: &Path) -> io::Result<()> {
+    shell.write(&format!("cd {}\r", dir.display()))?;
+    wait_for_default_screen(shell, |screen| screen.contains("path-completion>"))?;
+    Ok(())
+}
+
+fn default_screen_text(shell: &PtyShell) -> String {
+    VtScreen::parse(
+        PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        &shell.transcript_string(),
+    )
+    .text()
+}
+
+fn wait_for_default_screen<F>(shell: &PtyShell, predicate: F) -> io::Result<String>
+where
+    F: Fn(&str) -> bool,
+{
+    let start = Instant::now();
+    loop {
+        let screen = default_screen_text(shell);
+        if predicate(&screen) {
+            return Ok(screen);
+        }
+        if start.elapsed() > WAIT_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out waiting for screen; screen was:\n{screen}"),
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -1853,6 +1901,143 @@ fn shell_multiline_mode_completes_commands_on_first_row() -> io::Result<()> {
 
     shell.write("\u{3}")?;
     shell.wait_for_after(offset, "Shell cancelled")?;
+    shell.exit()
+}
+
+#[test]
+fn path_completion_uses_common_prefix_in_single_line_mode() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+    let fixture = create_path_completion_fixture(&shell.home)?;
+    enter_path_completion_fixture(&mut shell, &fixture)?;
+
+    let offset = shell.transcript_len();
+    shell.write("printf '%s\\n' th")?;
+    shell.write(KEY_TAB)?;
+    let screen = wait_for_default_screen(&shell, |screen| {
+        screen.contains("printf '%s\\n' theseus-") || screen.contains("printf '%s\\n' theseus-mojo")
+    })?;
+
+    assert!(
+        screen.contains("printf '%s\\n' theseus-"),
+        "single-line path completion should first apply only the shared path prefix:\n{screen}"
+    );
+    assert!(
+        !screen.contains("printf '%s\\n' theseus-mojo")
+            && !screen.contains("printf '%s\\n' theseus-shell"),
+        "single-line path completion should not select a full candidate on first Tab:\n{screen}"
+    );
+
+    let cycle_offset = shell.transcript_len();
+    shell.write(KEY_TAB)?;
+    shell.wait_for_after(cycle_offset, "theseus-mojo")?;
+    let screen = wait_for_default_screen(&shell, |screen| {
+        screen.contains("printf '%s\\n' theseus-mojo")
+    })?;
+    assert!(
+        screen.contains("printf '%s\\n' theseus-mojo"),
+        "second Tab should move from the shared prefix to the first concrete path candidate:\n{screen}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Interrupted. Type /exit to exit the shell.")?;
+    shell.exit()
+}
+
+#[test]
+fn path_completion_uses_common_prefix_in_command_multiline_mode() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+    let fixture = create_path_completion_fixture(&shell.home)?;
+    enter_path_completion_fixture(&mut shell, &fixture)?;
+
+    shell.write("printf '%s\\n' \\\r")?;
+    shell.wait_for(&command_continuation_row())?;
+
+    let offset = shell.transcript_len();
+    shell.write("th")?;
+    shell.write(KEY_TAB)?;
+    let screen = wait_for_default_screen(&shell, |screen| {
+        screen.contains(&command_continuation_text("theseus-"))
+            || screen.contains(&command_continuation_text("theseus-mojo"))
+    })?;
+
+    assert!(
+        screen.contains(&command_continuation_text("theseus-")),
+        "command multiline path completion should first apply only the shared path prefix:\n{screen}"
+    );
+    assert!(
+        !screen.contains(&command_continuation_text("theseus-mojo"))
+            && !screen.contains(&command_continuation_text("theseus-shell")),
+        "command multiline path completion should not select a full candidate on first Tab:\n{screen}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Interrupted. Type /exit to exit the shell.")?;
+    shell.exit()
+}
+
+#[test]
+fn path_completion_uses_common_prefix_in_shell_multiline_mode() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+    let fixture = create_path_completion_fixture(&shell.home)?;
+    enter_path_completion_fixture(&mut shell, &fixture)?;
+
+    let offset = shell.transcript_len();
+    shell.write("/shell\r")?;
+    shell.wait_for_after(offset, "Enter multiline shell command")?;
+    shell.write("printf '%s\\n' th")?;
+    shell.write(KEY_TAB)?;
+    let screen = wait_for_default_screen(&shell, |screen| {
+        screen.contains(&multiline_prefix_text("printf '%s\\n' theseus-"))
+            || screen.contains(&multiline_prefix_text("printf '%s\\n' theseus-mojo"))
+    })?;
+
+    assert!(
+        screen.contains(&multiline_prefix_text("printf '%s\\n' theseus-")),
+        "/shell path completion should first apply only the shared path prefix:\n{screen}"
+    );
+    assert!(
+        !screen.contains(&multiline_prefix_text("printf '%s\\n' theseus-mojo"))
+            && !screen.contains(&multiline_prefix_text("printf '%s\\n' theseus-shell")),
+        "/shell path completion should not select a full candidate on first Tab:\n{screen}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Shell cancelled")?;
+    shell.exit()
+}
+
+#[test]
+fn path_completion_uses_common_prefix_in_ask_multiline_mode() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+    let fixture = create_path_completion_fixture(&shell.home)?;
+    enter_path_completion_fixture(&mut shell, &fixture)?;
+
+    let offset = shell.transcript_len();
+    shell.write("/ask\r")?;
+    shell.wait_for_after(offset, "Enter multiline input")?;
+    shell.write("th")?;
+    shell.write(KEY_TAB)?;
+    let screen = wait_for_default_screen(&shell, |screen| {
+        screen.contains(&multiline_prefix_text("theseus-"))
+            || screen.contains(&multiline_prefix_text("theseus-mojo"))
+    })?;
+
+    assert!(
+        screen.contains(&multiline_prefix_text("theseus-")),
+        "/ask path completion should first apply only the shared path prefix:\n{screen}"
+    );
+    assert!(
+        !screen.contains(&multiline_prefix_text("theseus-mojo"))
+            && !screen.contains(&multiline_prefix_text("theseus-shell")),
+        "/ask path completion should not select a full candidate on first Tab:\n{screen}"
+    );
+
+    shell.write("\u{3}")?;
+    shell.wait_for_after(offset, "Ask cancelled")?;
     shell.exit()
 }
 

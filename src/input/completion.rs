@@ -228,7 +228,50 @@ fn path_completions(prefix: &str) -> Vec<Completion> {
     if completions.len() == 1 && completions[0].display.ends_with('/') {
         completions[0].replacement.push('/');
     }
+    prepend_common_path_prefix_completion(prefix, &mut completions);
     completions
+}
+
+fn prepend_common_path_prefix_completion(prefix: &str, completions: &mut Vec<Completion>) {
+    if completions.len() < 2 {
+        return;
+    }
+
+    let common_prefix = common_replacement_prefix(completions);
+    if common_prefix == prefix || !common_prefix.starts_with(prefix) {
+        return;
+    }
+
+    completions.insert(
+        0,
+        Completion {
+            display: common_prefix.clone(),
+            replacement: common_prefix,
+        },
+    );
+}
+
+fn common_replacement_prefix(completions: &[Completion]) -> String {
+    let mut prefix = completions[0].replacement.clone();
+    for completion in &completions[1..] {
+        prefix = common_char_prefix(&prefix, &completion.replacement);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix
+}
+
+fn common_char_prefix(left: &str, right: &str) -> String {
+    let mut end = 0;
+    for ((left_index, left_char), (_, right_char)) in left.char_indices().zip(right.char_indices())
+    {
+        if left_char != right_char {
+            break;
+        }
+        end = left_index + left_char.len_utf8();
+    }
+    left[..end].to_string()
 }
 
 fn split_path_prefix(prefix: &str) -> (PathBuf, String) {
@@ -409,6 +452,25 @@ mod tests {
                 .any(|item| item.replacement.ends_with("/src/")
                     || item.replacement.ends_with("/scripts/"))
         );
+    }
+
+    #[test]
+    fn multiple_path_candidates_start_with_shared_prefix_completion() {
+        let temp_root = env::temp_dir().join(format!(
+            "theseus-read-line-prefix-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(temp_root.join("theseus-mojo")).unwrap();
+        fs::create_dir_all(temp_root.join("theseus-shell")).unwrap();
+
+        let prefix = temp_root.join("th").to_string_lossy().into_owned();
+        let completions = path_completions(&prefix);
+        fs::remove_dir_all(&temp_root).unwrap();
+
+        assert!(completions[0].replacement.ends_with("/theseus-"));
+        assert!(completions[1].replacement.ends_with("/theseus-mojo"));
+        assert!(completions[2].replacement.ends_with("/theseus-shell"));
     }
 
     #[test]
