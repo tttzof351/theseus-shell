@@ -235,12 +235,16 @@ fn path_completions(prefix: &str) -> Vec<Completion> {
 fn escape_path_completion_name(name: &str) -> String {
     let mut escaped = String::new();
     for ch in name.chars() {
-        if ch.is_whitespace() || ch == '\\' {
+        if should_escape_path_completion_char(ch) {
             escaped.push('\\');
         }
         escaped.push(ch);
     }
     escaped
+}
+
+fn should_escape_path_completion_char(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '\\' | '$' | '&' | '[' | ']' | '\'')
 }
 
 fn prepend_common_path_prefix_completion(prefix: &str, completions: &mut Vec<Completion>) {
@@ -485,22 +489,41 @@ mod tests {
     }
 
     #[test]
-    fn path_candidate_replacement_escapes_spaces() {
+    fn path_candidate_replacement_escapes_shell_special_characters() {
         let temp_root = env::temp_dir().join(format!(
-            "theseus-read-line-space-test-{}",
+            "theseus-read-line-escape-test-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&temp_root);
         fs::create_dir_all(&temp_root).unwrap();
-        fs::write(temp_root.join("Hello, World!"), "hello\n").unwrap();
+        let cases = [
+            ("Hello World", "Hello", "Hello\\ World"),
+            ("file$HOME.txt", "file", "file\\$HOME.txt"),
+            ("a&b", "a", "a\\&b"),
+            ("x[1].txt", "x", "x\\[1\\].txt"),
+            ("it's.txt", "it", "it\\'s.txt"),
+        ];
 
-        let prefix = temp_root.join("He").to_string_lossy().into_owned();
-        let completions = path_completions(&prefix);
+        for (name, _, _) in cases {
+            fs::write(temp_root.join(name), "hello\n").unwrap();
+        }
+
+        for (name, prefix, expected) in cases {
+            let prefix = temp_root.join(prefix).to_string_lossy().into_owned();
+            let completions = path_completions(&prefix);
+            let completion = completions
+                .iter()
+                .find(|completion| completion.display == name)
+                .unwrap_or_else(|| panic!("missing completion for {name}: {completions:?}"));
+
+            assert!(
+                completion.replacement.ends_with(&format!("/{expected}")),
+                "replacement for {name:?} should end with {expected:?}, got {:?}",
+                completion.replacement
+            );
+        }
+
         fs::remove_dir_all(&temp_root).unwrap();
-
-        assert_eq!(completions.len(), 1);
-        assert!(completions[0].replacement.ends_with("/Hello,\\ World!"));
-        assert_eq!(completions[0].display, "Hello, World!");
     }
 
     #[test]
