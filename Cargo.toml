@@ -1,6 +1,6 @@
 [package]
 name = "theseus"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.96.0"
 
