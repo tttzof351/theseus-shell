@@ -254,7 +254,11 @@ fn create_path_completion_fixture(root: &Path) -> io::Result<PathBuf> {
 
 fn enter_path_completion_fixture(shell: &mut PtyShell, dir: &Path) -> io::Result<()> {
     shell.write(&format!("cd {}\r", dir.display()))?;
-    wait_for_default_screen(shell, |screen| screen.contains("path-completion>"))?;
+    let prompt_name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("path-completion");
+    wait_for_default_screen(shell, |screen| screen.contains(&format!("{prompt_name}>")))?;
     Ok(())
 }
 
@@ -1941,6 +1945,42 @@ fn path_completion_uses_common_prefix_in_single_line_mode() -> io::Result<()> {
 
     shell.write("\u{3}")?;
     shell.wait_for_after(offset, "Interrupted. Type /exit to exit the shell.")?;
+    shell.exit()
+}
+
+#[test]
+fn path_completion_escapes_spaces_in_single_line_mode() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+    let fixture = shell.home.join("path-space-completion");
+    let _ = fs::remove_dir_all(&fixture);
+    fs::create_dir_all(&fixture)?;
+    fs::write(fixture.join("Hello, World!"), "hello\n")?;
+    enter_path_completion_fixture(&mut shell, &fixture)?;
+
+    let offset = shell.transcript_len();
+    shell.write("du -h He")?;
+    shell.write(KEY_TAB)?;
+    let screen =
+        wait_for_default_screen(&shell, |screen| screen.contains("du -h Hello,\\ World!"))?;
+
+    assert!(
+        screen.contains("du -h Hello,\\ World!"),
+        "path completion should escape spaces before inserting a shell path:\n{screen}"
+    );
+
+    shell.write("\r")?;
+    let transcript = shell.wait_until_after(offset, |tail| {
+        tail.contains("Hello, World!") && tail.contains("path-space-completion")
+    })?;
+    let visible = strip_ansi_codes(&transcript[offset..]);
+
+    assert!(
+        !visible.contains("du: Hello,: No such file or directory")
+            && !visible.contains("du: World!: No such file or directory"),
+        "completed path with spaces should execute as one shell argument:\n{visible}"
+    );
+
     shell.exit()
 }
 

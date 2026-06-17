@@ -214,7 +214,7 @@ fn path_completions(prefix: &str) -> Vec<Completion> {
             }
 
             let is_dir = entry.file_type().is_ok_and(|file_type| file_type.is_dir());
-            let replacement = join_completion_prefix(prefix, &name);
+            let replacement = join_completion_prefix(prefix, &escape_path_completion_name(&name));
             let display = if is_dir { format!("{name}/") } else { name };
 
             Some(Completion {
@@ -230,6 +230,17 @@ fn path_completions(prefix: &str) -> Vec<Completion> {
     }
     prepend_common_path_prefix_completion(prefix, &mut completions);
     completions
+}
+
+fn escape_path_completion_name(name: &str) -> String {
+    let mut escaped = String::new();
+    for ch in name.chars() {
+        if ch.is_whitespace() || ch == '\\' {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 fn prepend_common_path_prefix_completion(prefix: &str, completions: &mut Vec<Completion>) {
@@ -471,6 +482,25 @@ mod tests {
         assert!(completions[0].replacement.ends_with("/theseus-"));
         assert!(completions[1].replacement.ends_with("/theseus-mojo"));
         assert!(completions[2].replacement.ends_with("/theseus-shell"));
+    }
+
+    #[test]
+    fn path_candidate_replacement_escapes_spaces() {
+        let temp_root = env::temp_dir().join(format!(
+            "theseus-read-line-space-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(&temp_root).unwrap();
+        fs::write(temp_root.join("Hello, World!"), "hello\n").unwrap();
+
+        let prefix = temp_root.join("He").to_string_lossy().into_owned();
+        let completions = path_completions(&prefix);
+        fs::remove_dir_all(&temp_root).unwrap();
+
+        assert_eq!(completions.len(), 1);
+        assert!(completions[0].replacement.ends_with("/Hello,\\ World!"));
+        assert_eq!(completions[0].display, "Hello, World!");
     }
 
     #[test]
