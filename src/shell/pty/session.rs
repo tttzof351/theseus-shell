@@ -20,6 +20,12 @@ use super::platform::NonBlockingFileGuard;
 use super::platform::{RawModeGuard, current_pty_size, interactive_shell_args};
 use crate::common::{output::CommandOutput, terminal_output};
 
+#[cfg(unix)]
+use signal_hook::{
+    consts::signal::SIGWINCH,
+    iterator::{Handle as SignalHandle, Signals},
+};
+
 const POST_SENTINEL_DRAIN_TIMEOUT: Duration = Duration::from_millis(25);
 const STREAM_HOLD_BACK_BYTES: usize = 512;
 
@@ -36,8 +42,12 @@ pub struct PersistentShellSession {
     child: Box<dyn Child + Send + Sync>,
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    reader_rx: mpsc::Receiver<io::Result<Vec<u8>>>,
+    event_rx: mpsc::Receiver<ShellEvent>,
     reader_thread: Option<thread::JoinHandle<()>>,
+    #[cfg(unix)]
+    resize_signal_handle: Option<SignalHandle>,
+    #[cfg(unix)]
+    resize_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl PersistentShellSession {
@@ -74,7 +84,10 @@ impl PersistentShellSession {
             .master
             .take_writer()
             .map_err(|err| io::Error::other(err.to_string()))?;
-        let (reader_rx, reader_thread) = spawn_reader_thread(reader);
+        let (event_tx, event_rx) = mpsc::channel();
+        let reader_thread = spawn_reader_thread(reader, event_tx.clone());
+        #[cfg(unix)]
+        let (resize_signal_handle, resize_thread) = spawn_resize_thread(event_tx)?;
 
         let mut session = Self {
             nonce: new_nonce(),
@@ -82,8 +95,12 @@ impl PersistentShellSession {
             child,
             master: pair.master,
             writer: Arc::new(Mutex::new(writer)),
-            reader_rx,
+            event_rx,
             reader_thread: Some(reader_thread),
+            #[cfg(unix)]
+            resize_signal_handle: Some(resize_signal_handle),
+            #[cfg(unix)]
+            resize_thread: Some(resize_thread),
         };
         session.initialize_shell()?;
 
@@ -203,12 +220,7 @@ impl PersistentShellSession {
         let mut transcript = Vec::new();
 
         loop {
-            let chunk = self.reader_rx.recv().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "shell reader ended before command sentinel",
-                )
-            })??;
+            let chunk = self.recv_shell_chunk()?;
             if chunk.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -241,12 +253,7 @@ impl PersistentShellSession {
         let mut pending = Vec::new();
         let mut transcript = Vec::new();
         loop {
-            let chunk = self.reader_rx.recv().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "shell reader ended before command sentinel",
-                )
-            })??;
+            let chunk = self.recv_shell_chunk()?;
             if chunk.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -288,53 +295,142 @@ impl PersistentShellSession {
         }
     }
 
+    fn recv_shell_chunk(&mut self) -> io::Result<Vec<u8>> {
+        loop {
+            match self.event_rx.recv() {
+                Ok(event) => {
+                    if let Some(chunk) =
+                        handle_shell_event(event, || self.resize_to_current_terminal())?
+                    {
+                        return Ok(chunk);
+                    }
+                }
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "shell reader ended before command sentinel",
+                    ));
+                }
+            }
+        }
+    }
+
     fn drain_pending_output(&mut self) {
-        while self
-            .reader_rx
-            .recv_timeout(POST_SENTINEL_DRAIN_TIMEOUT)
-            .is_ok()
-        {}
+        while let Ok(event) = self.event_rx.recv_timeout(POST_SENTINEL_DRAIN_TIMEOUT) {
+            let _ = handle_shell_event(event, || self.resize_to_current_terminal());
+        }
     }
 }
 
 impl Drop for PersistentShellSession {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(handle) = self.resize_signal_handle.take() {
+            // A final SIGWINCH may be dropped while the resize watcher exits; the next
+            // command resizes the PTY before writing user input.
+            handle.close();
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(reader_thread) = self.reader_thread.take() {
             let _ = reader_thread.join();
+        }
+        #[cfg(unix)]
+        if let Some(resize_thread) = self.resize_thread.take() {
+            let _ = resize_thread.join();
+        }
+    }
+}
+
+enum ShellEvent {
+    Chunk(io::Result<Vec<u8>>),
+    Resize,
+}
+
+#[cfg(test)]
+fn recv_shell_chunk_from(
+    rx: &mpsc::Receiver<ShellEvent>,
+    mut resize: impl FnMut() -> io::Result<()>,
+) -> io::Result<Vec<u8>> {
+    loop {
+        match rx.recv() {
+            Ok(event) => {
+                if let Some(chunk) = handle_shell_event(event, &mut resize)? {
+                    return Ok(chunk);
+                }
+            }
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "shell reader ended before command sentinel",
+                ));
+            }
+        }
+    }
+}
+
+fn handle_shell_event(
+    event: ShellEvent,
+    mut resize: impl FnMut() -> io::Result<()>,
+) -> io::Result<Option<Vec<u8>>> {
+    match event {
+        ShellEvent::Chunk(chunk) => chunk.map(Some),
+        ShellEvent::Resize => {
+            // A resize failure means the active PTY is no longer in a trustworthy
+            // state, so fail the current command instead of letting a TUI keep
+            // rendering into stale geometry.
+            resize()?;
+            Ok(None)
         }
     }
 }
 
 fn spawn_reader_thread(
     mut reader: Box<dyn Read + Send>,
-) -> (mpsc::Receiver<io::Result<Vec<u8>>>, thread::JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
+    tx: mpsc::Sender<ShellEvent>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
         let mut buffer = [0; 8192];
 
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => {
-                    let _ = tx.send(Ok(Vec::new()));
+                    let _ = tx.send(ShellEvent::Chunk(Ok(Vec::new())));
                     break;
                 }
                 Ok(n) => {
-                    if tx.send(Ok(buffer[..n].to_vec())).is_err() {
+                    if tx
+                        .send(ShellEvent::Chunk(Ok(buffer[..n].to_vec())))
+                        .is_err()
+                    {
                         break;
                     }
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                 Err(err) => {
-                    let _ = tx.send(Err(err));
+                    let _ = tx.send(ShellEvent::Chunk(Err(err)));
                     break;
                 }
             }
         }
+    })
+}
+
+#[cfg(unix)]
+fn spawn_resize_thread(
+    tx: mpsc::Sender<ShellEvent>,
+) -> io::Result<(SignalHandle, thread::JoinHandle<()>)> {
+    let mut signals = Signals::new([SIGWINCH])?;
+    let handle = signals.handle();
+    let thread = thread::spawn(move || {
+        for _ in &mut signals {
+            if tx.send(ShellEvent::Resize).is_err() {
+                break;
+            }
+        }
     });
 
-    (rx, handle)
+    Ok((handle, thread))
 }
 
 #[cfg(unix)]
@@ -743,6 +839,67 @@ mod tests {
     #[test]
     fn ignores_other_nonce() {
         assert!(parse_completed_command(b"__THESEUS_DONE_other_0__\n", "nonce").is_none());
+    }
+
+    #[test]
+    fn resize_event_triggers_resize_without_returning_output() {
+        let resize_calls = std::cell::Cell::new(0);
+
+        let output = handle_shell_event(ShellEvent::Resize, || {
+            resize_calls.set(resize_calls.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(output, None);
+        assert_eq!(resize_calls.get(), 1);
+    }
+
+    #[test]
+    fn output_event_returns_shell_chunk_without_resizing() {
+        let resize_calls = std::cell::Cell::new(0);
+
+        let output = handle_shell_event(ShellEvent::Chunk(Ok(b"hello".to_vec())), || {
+            resize_calls.set(resize_calls.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(output, Some(b"hello".to_vec()));
+        assert_eq!(resize_calls.get(), 0);
+    }
+
+    #[test]
+    fn drain_event_handling_applies_resize_events() {
+        let events = [ShellEvent::Chunk(Ok(b"stale".to_vec())), ShellEvent::Resize];
+        let resize_calls = std::cell::Cell::new(0);
+
+        for event in events {
+            let _ = handle_shell_event(event, || {
+                resize_calls.set(resize_calls.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        assert_eq!(resize_calls.get(), 1);
+    }
+
+    #[test]
+    fn recv_shell_chunk_applies_resize_and_returns_next_chunk() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(ShellEvent::Resize).unwrap();
+        tx.send(ShellEvent::Chunk(Ok(b"next".to_vec()))).unwrap();
+        let resize_calls = std::cell::Cell::new(0);
+
+        let chunk = recv_shell_chunk_from(&rx, || {
+            resize_calls.set(resize_calls.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(chunk, b"next");
+        assert_eq!(resize_calls.get(), 1);
     }
 
     #[test]
