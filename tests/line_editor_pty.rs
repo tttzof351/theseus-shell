@@ -662,6 +662,48 @@ fn command_output_without_trailing_newline_does_not_merge_with_next_prompt() -> 
 }
 
 #[test]
+fn shell_command_output_starts_on_next_visible_line_without_blank_gap() -> io::Result<()> {
+    let _lock = pty_test_lock();
+    let mut shell = PtyShell::start()?;
+
+    let offset = shell.transcript_len();
+    shell.write("ls\r")?;
+    shell.wait_until_after(offset, |tail| {
+        tail.contains("Cargo.toml") && tail.contains("theseus-shell")
+    })?;
+    let screen = VtScreen::parse(
+        PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        &shell.transcript_string(),
+    )
+    .text();
+    let lines = screen.lines().collect::<Vec<_>>();
+    let command_row = lines
+        .iter()
+        .position(|line| line.contains("theseus-shell> ls"))
+        .ok_or_else(|| io::Error::other(format!("command row was not rendered:\n{screen}")))?;
+    let output_row = lines
+        .iter()
+        .enumerate()
+        .skip(command_row + 1)
+        .find(|(_, line)| line.contains("Cargo.toml"))
+        .map(|(index, _)| index)
+        .ok_or_else(|| io::Error::other(format!("ls output row was not rendered:\n{screen}")))?;
+
+    assert_eq!(
+        output_row,
+        command_row + 1,
+        "ls output should start immediately after the submitted command without blank rows:\n{screen}"
+    );
+
+    shell.exit()
+}
+
+#[test]
 fn clear_command_does_not_add_blank_line_before_next_prompt() -> io::Result<()> {
     let _lock = pty_test_lock();
     let mut shell = PtyShell::start()?;
