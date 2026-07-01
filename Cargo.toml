@@ -26,3 +26,14 @@ unicode-width = "0.2.2"
 
 [dev-dependencies]
 vt100 = "0.16.2"
+
+# Explicit binary targets. `src/main.rs` and `src/lib.rs` are auto-discovered
+# when both are present, but listing them explicitly makes the project layout
+# obvious and lets us add additional binaries next to them.
+[[bin]]
+name = "theseus"
+path = "src/main.rs"
+
+[[bin]]
+name = "playground"
+path = "src/bin/playground.rs"

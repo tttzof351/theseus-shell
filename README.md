@@ -16,6 +16,47 @@ is described in [docs/MOTIVATION.md](docs/MOTIVATION.md).
 curl -fsSL https://raw.githubusercontent.com/tttzof351/theseus-shell/master/install.sh | bash
 ```
 
+## Build from source
+
+The project ships two binaries that share the same `theseus` library crate
+(exposed by `src/lib.rs`):
+
+- `theseus` — the production shell wrapper (entry point: `src/main.rs`).
+- `playground` — a scratchpad binary for experimenting with the internal
+  modules without touching the production code (entry point: `src/bin/playground.rs`).
+
+Both targets are declared explicitly in `Cargo.toml` under `[[bin]]` and
+end up in `target/<profile>/` after a build.
+
+Useful cargo invocations:
+
+```sh
+# Build both binaries
+cargo build --bins
+
+# Build only the production shell
+cargo build --bin theseus
+
+# Build only the playground
+cargo build --bin playground
+
+# Run the playground (smoke-tests that the library is linked correctly)
+cargo run --bin playground
+
+# Run the production shell in the foreground
+cargo run --bin theseus
+
+# Build a release version of both binaries (optimized, stripped of debug info)
+cargo build --bins --release
+# → target/release/theseus
+# → target/release/playground
+```
+
+The `playground` binary can `use theseus::...` for any public module
+(`agent`, `shell`, `input`, `common`, `commands`, `logging`) and is meant
+for one-off experiments, debug probes, and quick local checks during
+development.
+
 ## Shell usage
 
 Regular input is executed as a shell command. Natural-language input is routed to
