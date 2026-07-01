@@ -2,8 +2,9 @@
 use std::io::{self, Write};
 
 use crossterm::{
+    cursor::MoveTo,
     event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, read},
-    terminal::{ScrollDown, ScrollUp, disable_raw_mode, enable_raw_mode},
+    terminal::{Clear, ClearType, ScrollDown, ScrollUp, disable_raw_mode, enable_raw_mode},
 };
 
 const ENABLE_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
@@ -22,14 +23,10 @@ impl Drop for RawGuard {
 fn main() -> io::Result<()> {
     let mut stdout = io::stdout();
 
-    write!(stdout, "raw echo + mouse demo: type, click around, Ctrl-C to exit\r\n")?;
-    write!(stdout, "entering raw mode with mouse capture...\r\n")?;
-
     enable_raw_mode()?;
-    write!(stdout, "{}", ENABLE_MOUSE)?;
+    write!(stdout, "{}{}{}", ENABLE_MOUSE, Clear(ClearType::All), MoveTo(0, 0))?;
     let _guard = RawGuard;
 
-    write!(stdout, "\r\nraw> ")?;
     stdout.flush()?;
 
     loop {
@@ -49,7 +46,7 @@ fn main() -> io::Result<()> {
 
                 match code {
                     KeyCode::Char(ch) => write!(stdout, "{}", ch)?,
-                    KeyCode::Enter => write!(stdout, "\r\nraw> ")?,
+                    KeyCode::Enter => write!(stdout, "\r\n")?,
                     KeyCode::Backspace => write!(stdout, "\u{8} \u{8}")?,
                     KeyCode::Esc => write!(stdout, "<Esc>")?,
                     KeyCode::Tab => write!(stdout, "<Tab>")?,
@@ -68,7 +65,7 @@ fn main() -> io::Result<()> {
                         MouseButton::Right => 'R',
                         MouseButton::Middle => 'M',
                     };
-                    write!(stdout, "\r\n[{}@col{},row{}]\r\nraw> ", btn, column, row)?;
+                    write!(stdout, "\r\n[{}@col{},row{}]\r\n", btn, column, row)?;
                 }
             }
             Event::Resize(_, _) => write!(stdout, "<TERMINAL_RESIZE>")?,
