@@ -37,3 +37,7 @@ path = "src/main.rs"
 [[bin]]
 name = "playground"
 path = "src/bin/playground.rs"
+
+[[bin]]
+name = "render_v2"
+path = "src/bin/render_v2.rs"
