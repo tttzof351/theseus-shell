@@ -1,8 +1,9 @@
+// cargo run --bin playground
 use std::io::{self, Write};
 
 use crossterm::{
     event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, read},
-    terminal::{disable_raw_mode, enable_raw_mode},
+    terminal::{ScrollDown, ScrollUp, disable_raw_mode, enable_raw_mode},
 };
 
 const ENABLE_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
@@ -52,8 +53,8 @@ fn main() -> io::Result<()> {
                     KeyCode::Backspace => write!(stdout, "\u{8} \u{8}")?,
                     KeyCode::Esc => write!(stdout, "<Esc>")?,
                     KeyCode::Tab => write!(stdout, "<Tab>")?,
-                    KeyCode::Up => write!(stdout, "<Up>")?,
-                    KeyCode::Down => write!(stdout, "<Down>")?,
+                    KeyCode::Up => write!(stdout, "{}", ScrollUp(1))?,
+                    KeyCode::Down => write!(stdout, "{}", ScrollDown(1))?,
                     KeyCode::Left => write!(stdout, "<Left>")?,
                     KeyCode::Right => write!(stdout, "<Right>")?,
                     KeyCode::F(n) => write!(stdout, "<F{}>", n)?,
@@ -70,6 +71,7 @@ fn main() -> io::Result<()> {
                     write!(stdout, "\r\n[{}@col{},row{}]\r\nraw> ", btn, column, row)?;
                 }
             }
+            Event::Resize(_, _) => write!(stdout, "<TERMINAL_RESIZE>")?,
             _ => {}
         }
 
