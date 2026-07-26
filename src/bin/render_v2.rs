@@ -18,7 +18,7 @@ use crossterm::{
 };
 use unicode_width::UnicodeWidthChar;
 
-const SHELL_PROMPT: &str = "user>";
+const SHELL_PROMPT: &str = "user> ";
 const TAB_WIDTH: usize = 4;
 
 fn main() -> io::Result<()> {
@@ -734,7 +734,7 @@ mod tests {
         assert_eq!(visible_row_text(&terminal.rows[0]), "user>");
         assert_eq!(
             terminal.cursor.position,
-            PhysicalPosition { row: 0, column: 5 }
+            PhysicalPosition { row: 0, column: 6 }
         );
     }
 
@@ -743,8 +743,8 @@ mod tests {
         let screen = VirtualScreen::with_line("abcdefghij", 10);
         let terminal = layout_virtual_screen(&screen, test_size(10, 5));
 
-        assert_eq!(visible_row_text(&terminal.rows[0]), "user>abcde");
-        assert_eq!(visible_row_text(&terminal.rows[1]), "fghij");
+        assert_eq!(visible_row_text(&terminal.rows[0]), "user> abcd");
+        assert_eq!(visible_row_text(&terminal.rows[1]), "efghij");
         assert_eq!(
             terminal
                 .rows
@@ -756,7 +756,7 @@ mod tests {
         );
         assert_eq!(
             terminal.cursor.position,
-            PhysicalPosition { row: 1, column: 5 }
+            PhysicalPosition { row: 1, column: 6 }
         );
     }
 
@@ -774,11 +774,11 @@ mod tests {
                 char_offset: 0
             }
         );
-        assert_eq!(visible_row_text(&terminal.rows[0]), "user>hello");
+        assert_eq!(visible_row_text(&terminal.rows[0]), "user> hello");
         assert_eq!(visible_row_text(&terminal.rows[1]), "user>");
         assert_eq!(
             terminal.cursor.position,
-            PhysicalPosition { row: 1, column: 5 }
+            PhysicalPosition { row: 1, column: 6 }
         );
     }
 
@@ -814,19 +814,19 @@ mod tests {
         let wide = layout_virtual_screen(&screen, test_size(10, 6));
         let narrow = layout_virtual_screen(&screen, test_size(7, 6));
 
-        assert_eq!(visible_row_text(&wide.rows[0]), "user>abcde");
-        assert_eq!(visible_row_text(&wide.rows[1]), "fghij");
-        assert_eq!(visible_row_text(&narrow.rows[0]), "user>ab");
-        assert_eq!(visible_row_text(&narrow.rows[1]), "cdefghi");
-        assert_eq!(visible_row_text(&narrow.rows[2]), "j");
+        assert_eq!(visible_row_text(&wide.rows[0]), "user> abcd");
+        assert_eq!(visible_row_text(&wide.rows[1]), "efghij");
+        assert_eq!(visible_row_text(&narrow.rows[0]), "user> a");
+        assert_eq!(visible_row_text(&narrow.rows[1]), "bcdefgh");
+        assert_eq!(visible_row_text(&narrow.rows[2]), "ij");
     }
 
     #[test]
     fn exact_terminal_boundary_places_cursor_on_next_row() {
-        let screen = VirtualScreen::with_line("abcde", 5);
+        let screen = VirtualScreen::with_line("abcd", 4);
         let terminal = layout_virtual_screen(&screen, test_size(10, 5));
 
-        assert_eq!(visible_row_text(&terminal.rows[0]), "user>abcde");
+        assert_eq!(visible_row_text(&terminal.rows[0]), "user> abcd");
         assert_eq!(
             terminal.cursor.position,
             PhysicalPosition { row: 1, column: 0 }
@@ -839,19 +839,19 @@ mod tests {
         let terminal = layout_virtual_screen(&screen, test_size(20, 5));
 
         assert_eq!(
-            terminal.rows[0].cells[5],
+            terminal.rows[0].cells[6],
             PhysicalCell::Glyph {
                 text: "界".to_string(),
                 width: 2
             }
         );
         assert_eq!(
-            terminal.rows[0].cells[6],
-            PhysicalCell::Continuation { leading_column: 5 }
+            terminal.rows[0].cells[7],
+            PhysicalCell::Continuation { leading_column: 6 }
         );
         assert_eq!(
             terminal.cursor.position,
-            PhysicalPosition { row: 0, column: 7 }
+            PhysicalPosition { row: 0, column: 8 }
         );
     }
 
@@ -869,13 +869,16 @@ mod tests {
         let terminal = layout_virtual_screen(&VirtualScreen::new(), test_size(20, 5));
         let diff = diff_physical_terminal(None, &terminal);
 
-        assert!(
-            diff.operations
-                .contains(&PhysicalOperation::Write("user>".to_string()))
-        );
-        assert!(!diff.operations.iter().any(
-            |operation| matches!(operation, PhysicalOperation::Write(text) if text.ends_with(' '))
-        ));
+        let writes = diff
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                PhysicalOperation::Write(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(writes, ["user> "]);
     }
 
     #[test]
@@ -912,8 +915,8 @@ mod tests {
         screen.insert_paste("one\ntwo\nthree\nfour");
         let terminal = layout_virtual_screen(&screen, test_size(20, 2));
 
-        assert_eq!(visible_row_text(&terminal.rows[0]), "user>three");
-        assert_eq!(visible_row_text(&terminal.rows[1]), "user>four");
+        assert_eq!(visible_row_text(&terminal.rows[0]), "user> three");
+        assert_eq!(visible_row_text(&terminal.rows[1]), "user> four");
         assert_eq!(terminal.cursor.position.row, 1);
     }
 }
