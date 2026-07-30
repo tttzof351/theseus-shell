@@ -69,7 +69,7 @@ use logging::{AppLogger, default_logs_dir};
 use shell::pty::{PersistentShellConfig, PersistentShellSession};
 
 const SHELL_PROMPT: &str = "user> ";
-const TAB_WIDTH: usize = 4;
+const TERMINAL_TAB_STOP: usize = 8;
 const MAX_PERSISTED_HISTORY: usize = 100;
 const MAX_AGENT_SHELL_CONTEXT_OUTPUT_BYTES: usize = 32 * 1024;
 
@@ -2294,7 +2294,16 @@ impl Application {
         }
         let text = output.transcript_lossy();
         if !output.streamed || !uses_alternate_screen(&text) {
-            self.append_text(&text);
+            if let Some(visible_suffix) = suffix_after_last_display_clear(&text) {
+                // The streamed terminal has already discarded everything that
+                // preceded ED 2. Mirror that state transition in the
+                // persistent virtual scene so the recovery frame cannot bring
+                // the old transcript back.
+                self.transcript.clear();
+                self.append_text(visible_suffix);
+            } else {
+                self.append_text(&text);
+            }
         }
         self.last_shell_command = Some(ShellCommandContext {
             command: command.to_string(),
@@ -3228,10 +3237,12 @@ fn ansi_render_lines(text: &str) -> Vec<RenderLine> {
                 ));
             }
             '\t' => {
-                for _ in 0..TAB_WIDTH {
-                    line.push(' ');
-                    styles.push(current_style);
-                }
+                // Keep the control character in the logical scene. Expanding
+                // it here loses the current physical column and cannot match
+                // the terminal's native tab stops when streamed PTY output is
+                // later reconstructed by the diff renderer.
+                line.push('\t');
+                styles.push(current_style);
             }
             ch if !ch.is_control() => {
                 line.push(ch);
@@ -3333,6 +3344,35 @@ fn uses_alternate_screen(text: &str) -> bool {
     ["\x1b[?1049h", "\x1b[?47h", "\x1b[?1047h"]
         .iter()
         .any(|sequence| text.contains(sequence))
+}
+
+fn suffix_after_last_display_clear(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    let mut suffix_start = None;
+
+    while index + 2 < bytes.len() {
+        if bytes[index] != b'\x1b' || bytes[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+
+        let parameters_start = index + 2;
+        let mut final_index = parameters_start;
+        while final_index < bytes.len() && !(0x40..=0x7e).contains(&bytes[final_index]) {
+            final_index += 1;
+        }
+        if final_index == bytes.len() {
+            break;
+        }
+
+        if bytes[final_index] == b'J' && &bytes[parameters_start..final_index] == b"2" {
+            suffix_start = Some(final_index + 1);
+        }
+        index = final_index + 1;
+    }
+
+    suffix_start.map(|start| &text[start..])
 }
 
 fn basic_color(index: u16, bright: bool) -> Option<TerminalColor> {
@@ -4034,7 +4074,7 @@ impl LayoutBuilder {
 
         for ch in text.chars() {
             let mut width = if ch == '\t' {
-                (TAB_WIDTH - self.column % TAB_WIDTH).min(self.width)
+                (TERMINAL_TAB_STOP - self.column % TERMINAL_TAB_STOP).min(self.width)
             } else {
                 display_width(ch)
             };
@@ -4047,7 +4087,7 @@ impl LayoutBuilder {
             if width > 0 && self.column + width > self.width {
                 self.start_row();
                 if ch == '\t' {
-                    width = TAB_WIDTH.min(self.width);
+                    width = TERMINAL_TAB_STOP.min(self.width);
                 }
             }
 
@@ -5129,6 +5169,50 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn ansi_tab_is_preserved_and_uses_native_terminal_tab_stop() {
+        let lines = ansi_render_lines("X\tTAB_RIGHT\n");
+
+        assert_eq!(lines[0].text, "X\tTAB_RIGHT");
+        assert_eq!(lines[0].styles.len(), char_len("X\tTAB_RIGHT"));
+
+        let screen = VirtualScreen::from_render_lines(
+            lines,
+            VirtualCursor {
+                line: 0,
+                char_offset: char_len("X\tTAB_RIGHT"),
+            },
+            true,
+        );
+        let terminal = layout_virtual_screen(&screen, test_size(80, 2));
+
+        assert_eq!(visible_row_text(&terminal.rows[0]), "X       TAB_RIGHT");
+        assert_eq!(terminal.cursor.position.column, 17);
+    }
+
+    #[test]
+    fn terminal_clear_keeps_only_output_after_last_display_clear() {
+        assert_eq!(suffix_after_last_display_clear("plain text"), None);
+        assert_eq!(
+            suffix_after_last_display_clear("discard\x1b[H\x1b[2Jkeep"),
+            Some("keep")
+        );
+        assert_eq!(
+            suffix_after_last_display_clear("discard\x1b[2Jmiddle\x1b[2Jfinal"),
+            Some("final")
+        );
+        assert_eq!(
+            suffix_after_last_display_clear("keep\x1b[0Jtoo"),
+            None,
+            "ED 0 only clears below the cursor and must not discard the transcript"
+        );
+        assert_eq!(
+            suffix_after_last_display_clear("keep\x1b[3Jtoo"),
+            None,
+            "ED 3 clears scrollback, not the visible display"
+        );
     }
 
     #[test]
