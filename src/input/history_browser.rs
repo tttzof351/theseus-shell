@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces the legacy editor history state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HistoryEntryMode {
     Editing,

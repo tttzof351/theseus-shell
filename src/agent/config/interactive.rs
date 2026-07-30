@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces this direct-terminal config editor.
 use std::{
     io,
     io::{IsTerminal, Write},

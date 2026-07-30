@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces legacy prompt and shell construction.
 use std::{env, path::PathBuf};
 
 use crate::input::colorize_nested;

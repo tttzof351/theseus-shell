@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces this legacy shell application loop.
 use std::{env, io, path::PathBuf};
 
 use super::pty::PersistentShellSession;

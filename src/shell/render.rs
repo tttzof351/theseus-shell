@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces direct command-output rendering.
 use std::{io, io::Write};
 
 use super::markdown_preprocessor::preprocess_markdown;

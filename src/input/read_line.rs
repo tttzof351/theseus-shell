@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces these direct-terminal line editors.
 use std::io::{self, IsTerminal, Write};
 
 use crossterm::{

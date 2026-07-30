@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` owns raw mode for every UI state.
 use std::io::{self, Write};
 
 use crossterm::{

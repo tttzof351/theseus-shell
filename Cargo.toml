@@ -34,10 +34,7 @@ vt100 = "0.16.2"
 name = "theseus"
 path = "src/main.rs"
 
-[[bin]]
-name = "playground"
-path = "src/bin/playground.rs"
-
+#TODO: Depricated after this implementation becomes the `theseus` binary.
 [[bin]]
 name = "render_v2"
 path = "src/bin/render_v2.rs"

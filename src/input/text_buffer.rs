@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces the legacy multiline editor model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TextBuffer {
     lines: Vec<Vec<char>>,

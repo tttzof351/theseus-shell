@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` standardizes on `PersistentShellSession`.
 use std::{
     io::{self, IsTerminal, Read, Write},
     sync::mpsc,

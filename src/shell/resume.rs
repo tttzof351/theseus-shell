@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces this direct-terminal resume picker.
 use std::{
     fs, io,
     io::Write,

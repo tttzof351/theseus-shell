@@ -50,6 +50,7 @@ pub(crate) fn highlight_shell_command_with_palette(
         .collect()
 }
 
+//TODO: Depricated after `render_v2` renders multiline submit styles as physical cells.
 pub(crate) fn highlight_multiline_submit_command(
     line: &str,
     submit_command: &str,
@@ -352,6 +353,7 @@ mod tests {
     }
 
     #[test]
+    //TODO: Depricated with `highlight_multiline_submit_command` after the renderer migration.
     fn highlights_multiline_submit_command_with_dedicated_palette_key() {
         let mut palette = default_shell_highlight_palette();
         palette.insert(
@@ -371,6 +373,7 @@ mod tests {
     }
 
     #[test]
+    //TODO: Depricated with `highlight_multiline_submit_command` after the renderer migration.
     fn multiline_submit_highlight_can_be_disabled() {
         let mut palette = default_shell_highlight_palette();
         palette.insert("multiline_submit".to_string(), None);

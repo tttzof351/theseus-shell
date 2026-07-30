@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces the legacy single-line editor model.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct LineBuffer {
     chars: Vec<char>,

@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces the legacy `theseus` PTY behavior.
 use std::{
     fs,
     io::{self, Read, Write},

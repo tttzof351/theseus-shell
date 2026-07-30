@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` removes the one-shot PTY command runner.
 use std::{
     io::{self, Write},
     thread,

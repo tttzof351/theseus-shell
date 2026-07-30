@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces the legacy editor completion engine.
 use std::{
     collections::BTreeSet,
     env, fs,

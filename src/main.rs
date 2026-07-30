@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces this legacy entry point.
 use std::io::{self, Write};
 
 use theseus::agent::{Agent, AgentConfig};

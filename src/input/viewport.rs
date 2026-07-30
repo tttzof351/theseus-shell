@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces the legacy config/resume pickers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ViewportState {
     total: usize,

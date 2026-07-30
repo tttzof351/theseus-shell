@@ -18,12 +18,11 @@ curl -fsSL https://raw.githubusercontent.com/tttzof351/theseus-shell/master/inst
 
 ## Build from source
 
-The project ships two binaries that share the same `theseus` library crate
-(exposed by `src/lib.rs`):
+The project currently ships two application binaries:
 
 - `theseus` — the production shell wrapper (entry point: `src/main.rs`).
-- `playground` — a scratchpad binary for experimenting with the internal
-  modules without touching the production code (entry point: `src/bin/playground.rs`).
+- `render_v2` — the prototype diff-rendered shell (entry point:
+  `src/bin/render_v2.rs`).
 
 Both targets are declared explicitly in `Cargo.toml` under `[[bin]]` and
 end up in `target/<profile>/` after a build.
@@ -37,11 +36,8 @@ cargo build --bins
 # Build only the production shell
 cargo build --bin theseus
 
-# Build only the playground
-cargo build --bin playground
-
-# Run the playground (smoke-tests that the library is linked correctly)
-cargo run --bin playground
+# Build only the diff-rendered prototype
+cargo build --bin render_v2
 
 # Run the production shell in the foreground
 cargo run --bin theseus
@@ -49,13 +45,8 @@ cargo run --bin theseus
 # Build a release version of both binaries (optimized, stripped of debug info)
 cargo build --bins --release
 # → target/release/theseus
-# → target/release/playground
+# → target/release/render_v2
 ```
-
-The `playground` binary can `use theseus::...` for any public module
-(`agent`, `shell`, `input`, `common`, `commands`, `logging`) and is meant
-for one-off experiments, debug probes, and quick local checks during
-development.
 
 ## Shell usage
 

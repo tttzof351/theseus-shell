@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces the legacy shell history model.
 use std::{collections::HashSet, fs, io, path::Path};
 
 #[cfg(not(test))]

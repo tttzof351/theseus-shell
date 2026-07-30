@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces this direct-terminal renderer.
 use std::io::{self, Write};
 
 use crossterm::{

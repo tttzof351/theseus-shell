@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces these legacy shell/UI handlers.
 use std::{cell::Cell, env, io};
 
 use super::{

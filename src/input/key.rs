@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces the legacy editor event handling.
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 pub(crate) fn is_key_press(key: KeyEvent) -> bool {

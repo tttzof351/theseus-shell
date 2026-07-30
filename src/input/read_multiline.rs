@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces this direct-terminal multiline editor.
 use std::io::{self, BufRead, IsTerminal, Write};
 
 use crossterm::{

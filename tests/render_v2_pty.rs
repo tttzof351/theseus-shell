@@ -37,6 +37,7 @@ impl RenderV2Pty {
         let pair = native_pty_system()
             .openpty(SIZE)
             .map_err(|error| io::Error::other(error.to_string()))?;
+        //TODO: Depricated after `render_v2` becomes the `theseus` binary target.
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_render_v2"));
         command.cwd(cwd);
         command.env("HOME", &home);

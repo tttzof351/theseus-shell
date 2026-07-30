@@ -1,3 +1,4 @@
+//TODO: Depricated after `render_v2` replaces the legacy interactive config UI.
 use std::{fs, io, path::Path};
 
 use jsonc_parser::cst::{CstInputValue, CstObject, CstRootNode};
