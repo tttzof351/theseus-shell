@@ -3190,14 +3190,14 @@ fn pad_agent_answer(text: &str) -> String {
 }
 
 fn ansi_render_lines(text: &str) -> Vec<RenderLine> {
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    if normalized.is_empty() {
+    if text.is_empty() {
         return Vec::new();
     }
-    let mut chars = normalized.chars().peekable();
+    let mut chars = text.chars().peekable();
     let mut current_style = CellStyle::default();
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut styles = Vec::new();
+    let mut cursor = 0;
     let mut lines = Vec::new();
 
     while let Some(ch) = chars.next() {
@@ -3215,6 +3215,14 @@ fn ansi_render_lines(text: &str) -> Vec<RenderLine> {
                     }
                     if final_byte == Some('m') {
                         apply_sgr(&parameters, &mut current_style);
+                    } else if final_byte == Some('K') {
+                        apply_erase_in_line(
+                            &parameters,
+                            &mut line,
+                            &mut styles,
+                            cursor,
+                            current_style,
+                        );
                     }
                 }
                 Some(']') => {
@@ -3230,31 +3238,90 @@ fn ansi_render_lines(text: &str) -> Vec<RenderLine> {
                 }
                 _ => {}
             },
+            '\r' if chars.peek() == Some(&'\n') => {
+                chars.next();
+                push_ansi_render_line(&mut lines, &mut line, &mut styles);
+                cursor = 0;
+            }
+            '\r' => cursor = 0,
             '\n' => {
-                lines.push(RenderLine::styled(
-                    std::mem::take(&mut line),
-                    std::mem::take(&mut styles),
-                ));
+                push_ansi_render_line(&mut lines, &mut line, &mut styles);
+                cursor = 0;
             }
             '\t' => {
                 // Keep the control character in the logical scene. Expanding
                 // it here loses the current physical column and cannot match
                 // the terminal's native tab stops when streamed PTY output is
                 // later reconstructed by the diff renderer.
-                line.push('\t');
-                styles.push(current_style);
+                write_ansi_scalar(&mut line, &mut styles, &mut cursor, '\t', current_style);
             }
             ch if !ch.is_control() => {
-                line.push(ch);
-                styles.push(current_style);
+                write_ansi_scalar(&mut line, &mut styles, &mut cursor, ch, current_style);
             }
             _ => {}
         }
     }
-    if !line.is_empty() || !styles.is_empty() || !normalized.ends_with('\n') {
-        lines.push(RenderLine::styled(line, styles));
+    if !line.is_empty() {
+        push_ansi_render_line(&mut lines, &mut line, &mut styles);
     }
     lines
+}
+
+fn push_ansi_render_line(
+    lines: &mut Vec<RenderLine>,
+    line: &mut Vec<char>,
+    styles: &mut Vec<CellStyle>,
+) {
+    let text = std::mem::take(line).into_iter().collect::<String>();
+    lines.push(RenderLine::styled(text, std::mem::take(styles)));
+}
+
+fn write_ansi_scalar(
+    line: &mut Vec<char>,
+    styles: &mut Vec<CellStyle>,
+    cursor: &mut usize,
+    ch: char,
+    style: CellStyle,
+) {
+    if *cursor < line.len() {
+        line[*cursor] = ch;
+        styles[*cursor] = style;
+    } else {
+        while line.len() < *cursor {
+            line.push(' ');
+            styles.push(CellStyle::default());
+        }
+        line.push(ch);
+        styles.push(style);
+    }
+    *cursor += 1;
+}
+
+fn apply_erase_in_line(
+    parameters: &str,
+    line: &mut Vec<char>,
+    styles: &mut Vec<CellStyle>,
+    cursor: usize,
+    style: CellStyle,
+) {
+    match parameters.split(';').next().unwrap_or_default() {
+        "" | "0" => {
+            line.truncate(cursor.min(line.len()));
+            styles.truncate(line.len());
+        }
+        "1" => {
+            let end = cursor.saturating_add(1).min(line.len());
+            for index in 0..end {
+                line[index] = ' ';
+                styles[index] = style;
+            }
+        }
+        "2" => {
+            line.clear();
+            styles.clear();
+        }
+        _ => {}
+    }
 }
 
 fn apply_sgr(parameters: &str, style: &mut CellStyle) {
@@ -5190,6 +5257,27 @@ mod tests {
 
         assert_eq!(visible_row_text(&terminal.rows[0]), "X       TAB_RIGHT");
         assert_eq!(terminal.cursor.position.column, 17);
+    }
+
+    #[test]
+    fn ansi_carriage_return_and_erase_line_do_not_create_logical_rows() {
+        let lines = ansi_render_lines("\r\x1b[K* exps\r\n  master\r\n\r\x1b[K");
+
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["* exps", "  master"]
+        );
+    }
+
+    #[test]
+    fn ansi_carriage_return_overwrites_current_logical_line() {
+        let lines = ansi_render_lines("progress 10%\rprogress 20%");
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "progress 20%");
     }
 
     #[test]
