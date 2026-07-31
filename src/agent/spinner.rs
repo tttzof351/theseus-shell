@@ -31,13 +31,13 @@ impl Spinner {
 
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
-        let _ = terminal_output::with_stdout(|stdout| execute!(stdout, Hide));
+        let _ = terminal_output::with_transient_stdout(|stdout| execute!(stdout, Hide));
         let handle = thread::spawn(move || {
             let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let mut index = 0;
 
             while !thread_stop.load(Ordering::Relaxed) {
-                let _ = terminal_output::with_stdout(|stdout| {
+                let _ = terminal_output::with_transient_stdout(|stdout| {
                     write_spinner_frame(stdout, frames[index % frames.len()])
                 });
                 index += 1;
@@ -63,7 +63,7 @@ impl Drop for Spinner {
         }
 
         if self.stop.is_some() {
-            let _ = terminal_output::with_stdout(|stdout| {
+            let _ = terminal_output::with_transient_stdout(|stdout| {
                 clear_spinner(stdout)?;
                 execute!(stdout, Show)?;
                 stdout.flush()

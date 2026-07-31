@@ -17,7 +17,7 @@ pub(super) fn ansi_render_lines(text: &str) -> Vec<RenderLine> {
                 Some('[') => {
                     let mut parameters = String::new();
                     let mut final_byte = None;
-                    while let Some(next) = chars.next() {
+                    for next in chars.by_ref() {
                         if ('@'..='~').contains(&next) {
                             final_byte = Some(next);
                             break;
@@ -181,14 +181,12 @@ pub(super) fn apply_sgr(parameters: &str, style: &mut CellStyle) {
                     values.get(index + 2),
                     values.get(index + 3),
                     values.get(index + 4),
+                ) && let (Ok(red), Ok(green), Ok(blue)) = (
+                    u8::try_from(*red),
+                    u8::try_from(*green),
+                    u8::try_from(*blue),
                 ) {
-                    if let (Ok(red), Ok(green), Ok(blue)) = (
-                        u8::try_from(*red),
-                        u8::try_from(*green),
-                        u8::try_from(*blue),
-                    ) {
-                        style.foreground = Some(TerminalColor::Rgb(red, green, blue));
-                    }
+                    style.foreground = Some(TerminalColor::Rgb(red, green, blue));
                 }
                 index = (index + 4).min(values.len());
             }

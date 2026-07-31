@@ -406,6 +406,12 @@ impl Application {
                 Ok(true)
             }
             EditorOutcome::Redraw => {
+                // Ctrl+L is a logical screen clear, not merely a request to
+                // repaint the same scene. Drop the committed transcript while
+                // keeping the active editor (and its draft) intact. `screen`
+                // notices that the cached prefix is now longer than the
+                // transcript and rebuilds the VirtualScreen from line zero.
+                self.transcript.clear();
                 self.physical_invalidated = true;
                 Ok(true)
             }
@@ -725,23 +731,34 @@ impl Application {
     }
 
     fn run_agent(&mut self, prompt: &str) -> io::Result<()> {
-        let _external = ExternalTerminalGuard::enter()?;
+        let external = ExternalTerminalGuard::enter()?;
         self.physical_invalidated = true;
         let last_shell_command = self.last_shell_command.take();
         common::cancellation::clear_sigint_request();
-        let output = self.agent.run_with_context(
-            prompt,
-            AgentRunContext {
-                shell: self.shell_path.clone(),
-                shell_prompt: shell_prompt(self.working_dir.as_deref()),
-                shell_highlight: self.config.shell_settings.shell_highlight.clone(),
-                env_vars: self.shell_env.clone(),
-                working_dir: self.working_dir.clone(),
-                last_shell_command,
-                logger: Some(self.logger.clone()),
-                ..AgentRunContext::default()
-            },
-        );
+        let terminal_capture = external
+            .was_raw
+            .then(common::terminal_output::begin_stdout_capture)
+            .transpose()?;
+        let context = AgentRunContext {
+            shell: self.shell_path.clone(),
+            shell_prompt: shell_prompt(self.working_dir.as_deref()),
+            shell_highlight: self.config.shell_settings.shell_highlight.clone(),
+            env_vars: self.shell_env.clone(),
+            working_dir: self.working_dir.clone(),
+            last_shell_command,
+            logger: Some(self.logger.clone()),
+            ..AgentRunContext::default()
+        };
+        let cancellation = context.cancellation.clone();
+        let output = self.agent.run_with_context(prompt, context);
+        let interrupted = cancellation.is_cancelled();
+        let captured_output = terminal_capture
+            .map(common::terminal_output::StdoutCapture::finish)
+            .transpose()?
+            .unwrap_or_default();
+        if interrupted {
+            self.append_text(&String::from_utf8_lossy(&captured_output));
+        }
         match output {
             Ok(output) => {
                 self.last_command_status = 0;
@@ -1536,8 +1553,7 @@ fn resume_session_from_path(path: &Path) -> io::Result<ResumeSession> {
         .filter_map(|message| message.content.as_ref())
         .filter_map(content_value_to_string)
         .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty() && !text.starts_with("Last shell command:"))
-        .next_back()
+        .rfind(|text| !text.is_empty() && !text.starts_with("Last shell command:"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no user question"))?;
     let file = path
         .file_name()

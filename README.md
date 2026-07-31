@@ -18,14 +18,13 @@ curl -fsSL https://raw.githubusercontent.com/tttzof351/theseus-shell/master/inst
 
 ## Build from source
 
-The project ships one application binary with a dedicated rendering module:
+The project ships a single application binary:
 
-- `theseus` — the diff-rendered shell wrapper (entry point: `src/main.rs`);
-- `terminal_renderer` — the virtual-screen layout and physical terminal diff
-  engine (`src/terminal_renderer`).
+- `theseus` — the diff-rendered shell wrapper (entry point: `src/main.rs`).
 
-Both targets are declared explicitly in `Cargo.toml` under `[[bin]]` and
-end up in `target/<profile>/` after a build.
+The virtual-screen layout and physical terminal diff engine are part of the
+application as the `src/terminal_renderer` module; they are not a separate
+binary target. `Cargo.toml` declares only `theseus` under `[[bin]]`.
 
 Useful cargo invocations:
 

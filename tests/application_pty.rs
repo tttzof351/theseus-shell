@@ -1,9 +1,13 @@
 use std::{
     fs,
     io::{self, Read, Write},
+    net::TcpListener,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -18,6 +22,7 @@ const SIZE: PtySize = PtySize {
     pixel_width: 0,
     pixel_height: 0,
 };
+static TEMP_HOME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct ApplicationPty {
     child: Box<dyn Child + Send + Sync>,
@@ -91,7 +96,7 @@ impl ApplicationPty {
             transcript,
             home,
         };
-        shell.wait_until(|bytes| settled_prompt_is_visible(bytes))?;
+        shell.wait_until(settled_prompt_is_visible)?;
         Ok(shell)
     }
 
@@ -161,9 +166,10 @@ fn temp_home() -> io::Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
+    let sequence = TEMP_HOME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let home = std::env::temp_dir().join(format!(
-        "theseus-application-pty-{}-{nanos}",
-        std::process::id()
+        "theseus-application-pty-{}-{nanos}-{sequence}",
+        std::process::id(),
     ));
     fs::create_dir_all(&home)?;
     Ok(home)
@@ -276,6 +282,78 @@ fn git_branch_fixture() -> io::Result<(PathBuf, PathBuf)> {
     Ok((home, repo))
 }
 
+fn interrupted_agent_fixture() -> io::Result<(PathBuf, thread::JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 8192];
+        let _ = stream.read(&mut request).unwrap();
+        let body = serde_json::json!({
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [
+                            {
+                                "id": "call_interrupted",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": "{\"command\":\"printf 'AGENT_%s_BEFORE_INTERRUPT\\\\n' OUTPUT; exec sleep 30\"}"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    let home = temp_home()?;
+    let config_dir = home.join(".theseus");
+    fs::create_dir_all(&config_dir)?;
+    let config = serde_json::json!({
+        "llm_request_settings": {
+            "base_url": format!("http://{address}/chat"),
+            "retries": 1,
+            "request_timeout_seconds": 30,
+            "connect_timeout_seconds": 5,
+            "body": {
+                "model": "test/model",
+                "tool_choice": "auto"
+            },
+            "header": {
+                "Authorization": "Bearer test",
+                "Content-Type": "application/json"
+            }
+        },
+        "agent_settings": {
+            "max_turns": 2,
+            "max_tool_output_bytes": 32768,
+            "max_tool_bash_bytes": 8192,
+            "max_context_tokens": 200000,
+            "max_resume_traj": 100,
+            "build_in_tools": ["bash"],
+            "system_prompt": ["test"]
+        },
+        "mcp_servers": {}
+    });
+    fs::write(
+        config_dir.join("config.jsonc"),
+        serde_json::to_vec_pretty(&config)?,
+    )?;
+
+    Ok((home, server))
+}
+
 #[test]
 fn streamed_shell_output_does_not_move_when_diff_renderer_resumes() -> io::Result<()> {
     let mut shell = ApplicationPty::start()?;
@@ -306,6 +384,86 @@ fn streamed_shell_output_does_not_move_when_diff_renderer_resumes() -> io::Resul
     assert_eq!(
         settled_column, streamed_column,
         "shell output moved while control returned to the diff renderer; before={streamed_row:?}, after={settled_row:?}"
+    );
+
+    shell.exit()
+}
+
+#[test]
+fn interrupted_agent_preserves_output_written_before_ctrl_c() -> io::Result<()> {
+    const MARKER: &str = "AGENT_OUTPUT_BEFORE_INTERRUPT";
+
+    let (home, server) = interrupted_agent_fixture()?;
+    let mut shell =
+        ApplicationPty::start_with_home_and_cwd(home, Path::new(env!("CARGO_MANIFEST_DIR")))?;
+    let command_offset = shell.transcript_len();
+    shell.write("/ask run interruption fixture\r")?;
+    shell.wait_until(|bytes| {
+        bytes
+            .get(command_offset..)
+            .is_some_and(|tail| find_bytes(tail, MARKER.as_bytes()).is_some())
+    })?;
+
+    let interrupt_offset = shell.transcript_len();
+    shell.write("\x03")?;
+    let after_interrupt = shell.wait_until(|bytes| {
+        let tail = bytes.get(interrupt_offset..).unwrap_or_default();
+        find_bytes(tail, b"Agent tool execution interrupted.").is_some()
+            && find_bytes(tail, b"\x1b[2J").is_some()
+            && settled_prompt_is_visible(bytes)
+    })?;
+    let screen = screen_text(&after_interrupt);
+
+    assert!(
+        screen.contains(MARKER),
+        "the recovery diff discarded Agent output that was visible before Ctrl+C:\n{screen}"
+    );
+
+    server.join().unwrap();
+    shell.exit()
+}
+
+#[test]
+fn ctrl_l_clears_virtual_transcript_and_preserves_current_input() -> io::Result<()> {
+    const MARKER: &str = "VISIBLE_BEFORE_CTRL_L";
+    const DRAFT: &str = "kept-draft";
+
+    let mut shell = ApplicationPty::start()?;
+    let marker_offset = shell.transcript_len();
+    shell.write("printf 'VISIBLE_BEFORE_CTRL_L\\n'\r")?;
+    let before_clear = shell.wait_until(|bytes| {
+        bytes
+            .get(marker_offset..)
+            .is_some_and(|tail| find_bytes(tail, MARKER.as_bytes()).is_some())
+            && settled_prompt_is_visible(bytes)
+    })?;
+    assert!(
+        screen_text(&before_clear).contains(MARKER),
+        "test fixture did not place its marker on screen"
+    );
+
+    shell.write(DRAFT)?;
+    shell.wait_until(|bytes| {
+        screen_text(bytes).contains(&format!("tester theseus-shell> {DRAFT}"))
+    })?;
+
+    let clear_offset = shell.transcript_len();
+    shell.write("\x0c")?;
+    let after_clear = shell.wait_until(|bytes| {
+        bytes
+            .get(clear_offset..)
+            .is_some_and(|tail| find_bytes(tail, b"\x1b[2J").is_some())
+            && settled_prompt_is_visible(bytes)
+    })?;
+    let screen = screen_text(&after_clear);
+
+    assert!(
+        !screen.contains(MARKER),
+        "Ctrl+L cleared the physical terminal but the redraw restored the old VirtualScreen transcript:\n{screen}"
+    );
+    assert!(
+        screen.contains(&format!("tester theseus-shell> {DRAFT}")),
+        "Ctrl+L lost the current editor input:\n{screen}"
     );
 
     shell.exit()

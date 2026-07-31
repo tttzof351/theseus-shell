@@ -945,6 +945,7 @@ pub fn push_color_escape(output: &mut String, color: TerminalColor, foreground: 
     }
 }
 
+#[derive(Default)]
 pub struct DiffRenderer {
     pub previous: Option<PhysicalTerminal>,
     pub layout: IndexedPhysicalLayout,
