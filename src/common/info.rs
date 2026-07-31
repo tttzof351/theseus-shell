@@ -1,8 +1,6 @@
-//! Renders the info screen shown at shell startup and when the user runs
-//! `/help`. This is the single source of truth for that display: both the
-//! shell entry point (`run_shell_command` in `main.rs`) and the
-//! `SlashCommand::Help` handler in `src/shell/handlers.rs` delegate here so
-//! the two outputs can never drift apart.
+//! Renders the info screen shown at application startup and when the user runs
+//! `/help`. This is the single source of truth used by the diff-rendered
+//! application for both displays, so they cannot drift apart.
 
 use crate::commands::{VERSION, slash_commands};
 use crate::common::system_tools::{SearchToolAvailability, search_tool_availability};

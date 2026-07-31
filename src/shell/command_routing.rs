@@ -6,12 +6,12 @@ use std::os::unix::fs::PermissionsExt;
 use crate::feature_flags;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CommandRoute {
+pub(crate) enum CommandRoute {
     Agent,
     Shell,
 }
 
-pub(super) fn classify_command(command: &str, working_dir: Option<&Path>) -> CommandRoute {
+pub(crate) fn classify_command(command: &str, working_dir: Option<&Path>) -> CommandRoute {
     if is_agent_natural_language_with_cwd(command, working_dir) {
         CommandRoute::Agent
     } else {

@@ -4,17 +4,10 @@ use serde_json::{Map, Value, json};
 
 use crate::input::{ShellHighlightPalette, default_shell_highlight_palette};
 
-//TODO: Depricated after `render_v2` replaces the legacy interactive config UI.
-mod document;
-//TODO: Depricated after `render_v2` replaces the legacy interactive config UI.
-mod interactive;
 mod jsonc;
-mod model_catalog;
+pub(crate) mod model_catalog;
 pub(crate) mod models;
 mod store;
-
-//TODO: Depricated after `render_v2` stops exposing the legacy config handler helper.
-pub use store::default_config_path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {

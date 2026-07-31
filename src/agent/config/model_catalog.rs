@@ -14,14 +14,14 @@ const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct ModelOption {
+pub(crate) struct ModelOption {
     pub id: String,
     pub name: Option<String>,
     pub context_length: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ModelCatalogSource {
+pub(crate) enum ModelCatalogSource {
     Fresh,
     Cache,
     StaleCache,
@@ -29,7 +29,7 @@ pub(super) enum ModelCatalogSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ModelCatalog {
+pub(crate) struct ModelCatalog {
     pub models: Vec<ModelOption>,
     pub source: ModelCatalogSource,
 }
@@ -52,7 +52,7 @@ struct CachedModels {
     models: Vec<ModelOption>,
 }
 
-pub(super) fn load_openrouter_models() -> ModelCatalog {
+pub(crate) fn load_openrouter_models() -> ModelCatalog {
     load_openrouter_models_with_cache_path(default_cache_path().ok().as_deref())
 }
 

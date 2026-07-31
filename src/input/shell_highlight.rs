@@ -50,30 +50,6 @@ pub(crate) fn highlight_shell_command_with_palette(
         .collect()
 }
 
-//TODO: Depricated after `render_v2` renders multiline submit styles as physical cells.
-pub(crate) fn highlight_multiline_submit_command(
-    line: &str,
-    submit_command: &str,
-    palette: &ShellHighlightPalette,
-) -> String {
-    let trimmed = line.trim();
-    if trimmed != submit_command {
-        return line.to_string();
-    }
-
-    let Some(style) = palette.get("multiline_submit").and_then(Option::as_ref) else {
-        return line.to_string();
-    };
-
-    let start = line.find(submit_command).unwrap_or(0);
-    let end = start + submit_command.len();
-    let mut rendered = String::new();
-    rendered.push_str(&line[..start]);
-    rendered.push_str(&colorize_tags(style.tags_slice(), &line[start..end]));
-    rendered.push_str(&line[end..]);
-    rendered
-}
-
 fn spans_for_row(spans: &[ShellSpan], row: usize) -> Vec<&ShellSpan> {
     spans.iter().filter(|span| span.row == row).collect()
 }
@@ -276,7 +252,6 @@ pub fn default_shell_highlight_palette() -> ShellHighlightPalette {
 
 #[cfg(test)]
 mod tests {
-    use super::super::constants::MULTILINE_SUBMIT_COMMAND;
     use super::*;
     use crate::input::strip_ansi_codes;
 
@@ -350,41 +325,6 @@ mod tests {
             highlighted,
             vec!["\x1b[1m\x1b[32mecho\x1b[0m plain".to_string()]
         );
-    }
-
-    #[test]
-    //TODO: Depricated with `highlight_multiline_submit_command` after the renderer migration.
-    fn highlights_multiline_submit_command_with_dedicated_palette_key() {
-        let mut palette = default_shell_highlight_palette();
-        palette.insert(
-            "multiline_submit".to_string(),
-            Some(ShellHighlightStyle::single("yellow")),
-        );
-
-        let input = format!("  {MULTILINE_SUBMIT_COMMAND}  ");
-        let highlighted =
-            highlight_multiline_submit_command(&input, MULTILINE_SUBMIT_COMMAND, &palette);
-
-        assert_eq!(
-            highlighted,
-            format!("  \x1b[33m{MULTILINE_SUBMIT_COMMAND}\x1b[0m  ")
-        );
-        assert_eq!(strip_ansi_codes(&highlighted), input);
-    }
-
-    #[test]
-    //TODO: Depricated with `highlight_multiline_submit_command` after the renderer migration.
-    fn multiline_submit_highlight_can_be_disabled() {
-        let mut palette = default_shell_highlight_palette();
-        palette.insert("multiline_submit".to_string(), None);
-
-        let highlighted = highlight_multiline_submit_command(
-            MULTILINE_SUBMIT_COMMAND,
-            MULTILINE_SUBMIT_COMMAND,
-            &palette,
-        );
-
-        assert_eq!(highlighted, MULTILINE_SUBMIT_COMMAND);
     }
 
     #[test]

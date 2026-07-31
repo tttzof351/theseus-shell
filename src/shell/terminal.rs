@@ -40,7 +40,7 @@ impl Read for NonBlockingFileGuard {
 }
 
 #[cfg(unix)]
-pub(super) fn discard_pending_terminal_input() -> io::Result<()> {
+pub(crate) fn discard_pending_terminal_input() -> io::Result<()> {
     if !io::stdin().is_terminal() {
         return Ok(());
     }
@@ -60,6 +60,6 @@ pub(super) fn discard_pending_terminal_input() -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-pub(super) fn discard_pending_terminal_input() -> io::Result<()> {
+pub(crate) fn discard_pending_terminal_input() -> io::Result<()> {
     Ok(())
 }

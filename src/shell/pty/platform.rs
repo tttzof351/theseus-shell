@@ -43,30 +43,12 @@ pub(super) fn current_pty_size() -> PtySize {
 }
 
 #[cfg(unix)]
-//TODO: Depricated after `render_v2` removes the one-shot PTY command runner.
-pub(super) fn shell_command_args(shell: &Path, command: &str) -> Vec<String> {
-    let command_flag = if loads_interactive_startup_files(shell) {
-        "-ic"
-    } else {
-        "-c"
-    };
-
-    vec![command_flag.to_string(), command.to_string()]
-}
-
-#[cfg(unix)]
 pub(super) fn interactive_shell_args(shell: &Path) -> Vec<String> {
     if loads_interactive_startup_files(shell) {
         vec!["-i".to_string()]
     } else {
         Vec::new()
     }
-}
-
-#[cfg(windows)]
-//TODO: Depricated after `render_v2` removes the one-shot PTY command runner.
-pub(super) fn shell_command_args(_shell: &Path, command: &str) -> Vec<String> {
-    vec!["/C".to_string(), command.to_string()]
 }
 
 #[cfg(windows)]
@@ -121,36 +103,6 @@ impl Read for NonBlockingFileGuard {
 mod tests {
     use super::*;
     use std::path::Path;
-
-    #[cfg(unix)]
-    #[test]
-    //TODO: Depricated with the one-shot PTY command runner.
-    fn zsh_commands_run_as_interactive_shell_commands() {
-        assert_eq!(
-            shell_command_args(Path::new("/bin/zsh"), "ll"),
-            vec!["-ic".to_string(), "ll".to_string()]
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    //TODO: Depricated with the one-shot PTY command runner.
-    fn bash_commands_run_as_interactive_shell_commands() {
-        assert_eq!(
-            shell_command_args(Path::new("/bin/bash"), "ll"),
-            vec!["-ic".to_string(), "ll".to_string()]
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    //TODO: Depricated with the one-shot PTY command runner.
-    fn plain_sh_commands_stay_non_interactive() {
-        assert_eq!(
-            shell_command_args(Path::new("/bin/sh"), "ll"),
-            vec!["-c".to_string(), "ll".to_string()]
-        );
-    }
 
     #[cfg(unix)]
     #[test]

@@ -19,7 +19,7 @@ const SIZE: PtySize = PtySize {
     pixel_height: 0,
 };
 
-struct RenderV2Pty {
+struct ApplicationPty {
     child: Box<dyn Child + Send + Sync>,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -27,7 +27,7 @@ struct RenderV2Pty {
     home: PathBuf,
 }
 
-impl RenderV2Pty {
+impl ApplicationPty {
     fn start() -> io::Result<Self> {
         let home = temp_home()?;
         Self::start_with_home_and_cwd(home, Path::new(env!("CARGO_MANIFEST_DIR")))
@@ -37,8 +37,7 @@ impl RenderV2Pty {
         let pair = native_pty_system()
             .openpty(SIZE)
             .map_err(|error| io::Error::other(error.to_string()))?;
-        //TODO: Depricated after `render_v2` becomes the `theseus` binary target.
-        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_render_v2"));
+        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_theseus"));
         command.cwd(cwd);
         command.env("HOME", &home);
         command.env("USER", "tester");
@@ -120,7 +119,7 @@ impl RenderV2Pty {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
-                        "timed out waiting for render_v2 terminal output; tail was:\n{:?}",
+                        "timed out waiting for theseus terminal output; tail was:\n{:?}",
                         String::from_utf8_lossy(
                             transcript
                                 .get(transcript.len().saturating_sub(2_000)..)
@@ -149,7 +148,7 @@ impl RenderV2Pty {
     }
 }
 
-impl Drop for RenderV2Pty {
+impl Drop for ApplicationPty {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = fs::remove_dir_all(&self.home);
@@ -163,7 +162,7 @@ fn temp_home() -> io::Result<PathBuf> {
         .unwrap_or_default()
         .as_nanos();
     let home = std::env::temp_dir().join(format!(
-        "theseus-render-v2-pty-{}-{nanos}",
+        "theseus-application-pty-{}-{nanos}",
         std::process::id()
     ));
     fs::create_dir_all(&home)?;
@@ -265,8 +264,8 @@ fn git_branch_fixture() -> io::Result<(PathBuf, PathBuf)> {
         fs::set_permissions(&pager, fs::Permissions::from_mode(0o755))?;
     }
     run_git(&repo, &["init", "-q"])?;
-    run_git(&repo, &["config", "user.email", "render-v2@example.test"])?;
-    run_git(&repo, &["config", "user.name", "Render V2 Test"])?;
+    run_git(&repo, &["config", "user.email", "application@example.test"])?;
+    run_git(&repo, &["config", "user.name", "Application Test"])?;
     run_git(&repo, &["config", "color.ui", "always"])?;
     fs::write(repo.join("tracked.txt"), "fixture\n")?;
     run_git(&repo, &["add", "tracked.txt"])?;
@@ -279,11 +278,11 @@ fn git_branch_fixture() -> io::Result<(PathBuf, PathBuf)> {
 
 #[test]
 fn streamed_shell_output_does_not_move_when_diff_renderer_resumes() -> io::Result<()> {
-    let mut shell = RenderV2Pty::start()?;
+    let mut shell = ApplicationPty::start()?;
     let offset = shell.transcript_len();
 
     // The external terminal expands this tab using its native eight-column tab
-    // stops. Once the command finishes, render_v2 rebuilds the same visible
+    // stops. Once the command finishes, the application rebuilds the same visible
     // transcript from VirtualScreen. That hand-off must not move existing text.
     shell.write("printf 'X\\tTAB_RIGHT\\n'\r")?;
     let transcript = shell.wait_until(|bytes| {
@@ -316,7 +315,7 @@ fn streamed_shell_output_does_not_move_when_diff_renderer_resumes() -> io::Resul
 fn clear_removes_existing_virtual_transcript() -> io::Result<()> {
     const MARKER: &str = "VISIBLE_BEFORE_CLEAR";
 
-    let mut shell = RenderV2Pty::start()?;
+    let mut shell = ApplicationPty::start()?;
     let marker_offset = shell.transcript_len();
     shell.write("printf 'VISIBLE_BEFORE_CLEAR\\n'\r")?;
     let before_clear = shell.wait_until(|bytes| {
@@ -353,7 +352,7 @@ fn git_branch_output_has_no_extra_rows_around_streamed_output() -> io::Result<()
     const COMMAND: &str = "git branch";
 
     let (home, repo) = git_branch_fixture()?;
-    let mut shell = RenderV2Pty::start_with_home_and_cwd(home, &repo)?;
+    let mut shell = ApplicationPty::start_with_home_and_cwd(home, &repo)?;
     let fill_offset = shell.transcript_len();
     shell.write(
         "printf 'FILL01\\nFILL02\\nFILL03\\nFILL04\\nFILL05\\nFILL06\\nFILL07\\nFILL08\\n'\r",

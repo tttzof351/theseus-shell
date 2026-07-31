@@ -27,14 +27,9 @@ unicode-width = "0.2.2"
 [dev-dependencies]
 vt100 = "0.16.2"
 
-# Explicit binary targets. `src/main.rs` and `src/lib.rs` are auto-discovered
-# when both are present, but listing them explicitly makes the project layout
-# obvious and lets us add additional binaries next to them.
+# Explicit binary target. `src/main.rs` and `src/lib.rs` are auto-discovered
+# when both are present, but listing the application explicitly makes the
+# project layout obvious.
 [[bin]]
 name = "theseus"
 path = "src/main.rs"
-
-#TODO: Depricated after this implementation becomes the `theseus` binary.
-[[bin]]
-name = "render_v2"
-path = "src/bin/render_v2.rs"

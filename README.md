@@ -18,11 +18,11 @@ curl -fsSL https://raw.githubusercontent.com/tttzof351/theseus-shell/master/inst
 
 ## Build from source
 
-The project currently ships two application binaries:
+The project ships one application binary with a dedicated rendering module:
 
-- `theseus` — the production shell wrapper (entry point: `src/main.rs`).
-- `render_v2` — the prototype diff-rendered shell (entry point:
-  `src/bin/render_v2.rs`).
+- `theseus` — the diff-rendered shell wrapper (entry point: `src/main.rs`);
+- `terminal_renderer` — the virtual-screen layout and physical terminal diff
+  engine (`src/terminal_renderer`).
 
 Both targets are declared explicitly in `Cargo.toml` under `[[bin]]` and
 end up in `target/<profile>/` after a build.
@@ -30,22 +30,18 @@ end up in `target/<profile>/` after a build.
 Useful cargo invocations:
 
 ```sh
-# Build both binaries
-cargo build --bins
+# Build the complete workspace
+cargo build --workspace
 
 # Build only the production shell
 cargo build --bin theseus
 
-# Build only the diff-rendered prototype
-cargo build --bin render_v2
-
 # Run the production shell in the foreground
 cargo run --bin theseus
 
-# Build a release version of both binaries (optimized, stripped of debug info)
-cargo build --bins --release
+# Build a release version (optimized, stripped of debug info)
+cargo build --workspace --release
 # → target/release/theseus
-# → target/release/render_v2
 ```
 
 ## Shell usage

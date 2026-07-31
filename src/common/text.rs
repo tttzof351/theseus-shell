@@ -42,17 +42,6 @@ pub(crate) fn truncate_utf8_to_bytes(
     }
 }
 
-pub(crate) fn truncate_chars_end(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-
-    let take = max_chars.saturating_sub(3);
-    let mut truncated = text.chars().take(take).collect::<String>();
-    truncated.push_str("...");
-    truncated
-}
-
 fn truncate_marker(removed_bytes: usize) -> String {
     format!("[truncated {removed_bytes} bytes]")
 }
@@ -139,22 +128,5 @@ mod tests {
             truncate_utf8_to_bytes("hello", 0, TruncatePosition::End),
             "[truncated 5 bytes]".to_string()
         );
-    }
-
-    #[test]
-    fn truncates_chars_end_for_ui_preview() {
-        assert_eq!(truncate_chars_end("hello world", 8), "hello...");
-    }
-
-    #[test]
-    fn truncates_chars_end_without_splitting_unicode_scalar() {
-        assert_eq!(truncate_chars_end("abЖcd", 5), "abЖcd");
-        assert_eq!(truncate_chars_end("abЖcd", 4), "a...");
-    }
-
-    #[test]
-    fn truncates_chars_end_preserves_existing_small_width_behavior() {
-        assert_eq!(truncate_chars_end("hello", 2), "...");
-        assert_eq!(truncate_chars_end("hello", 0), "...");
     }
 }
