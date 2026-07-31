@@ -179,6 +179,7 @@ impl PersistentShellSession {
     fn initialize_shell(&mut self) -> io::Result<()> {
         let payload = self.command_payload(
             "stty -echo 2>/dev/null || true\n\
+             bind 'set enable-bracketed-paste off' 2>/dev/null || true\n\
              unsetopt zle prompt_cr prompt_sp 2>/dev/null || true\n\
              PROMPT=''\n\
              RPROMPT=''\n\
@@ -218,6 +219,7 @@ impl PersistentShellSession {
 
         let mut pending = Vec::new();
         let mut transcript = Vec::new();
+        let mut strip_initial_separator = true;
 
         loop {
             let chunk = self.recv_shell_chunk()?;
@@ -231,6 +233,9 @@ impl PersistentShellSession {
             pending.extend_from_slice(&chunk);
             if let Some(mut completed) = parse_completed_command(&pending, &self.nonce) {
                 strip_echoed_payload(&mut completed.transcript, payload);
+                if transcript.is_empty() && strip_initial_separator {
+                    let _ = strip_initial_shell_separators(&mut completed.transcript);
+                }
                 transcript.extend_from_slice(&completed.transcript);
                 completed.transcript = transcript;
                 self.drain_pending_output();
@@ -240,6 +245,17 @@ impl PersistentShellSession {
             strip_echoed_payload_prefix(&mut pending, payload);
             if is_partial_echoed_payload_prefix(&pending, payload) {
                 continue;
+            }
+            if transcript.is_empty() && strip_initial_separator && pending.is_empty() {
+                continue;
+            }
+            if transcript.is_empty() && strip_initial_separator {
+                match strip_initial_shell_separators(&mut pending) {
+                    StripInitialSeparator::Stripped | StripInitialSeparator::NotPresent => {
+                        strip_initial_separator = false;
+                    }
+                    StripInitialSeparator::Pending => continue,
+                }
             }
             if pending.len() > STREAM_HOLD_BACK_BYTES {
                 let safe_len = pending.len() - STREAM_HOLD_BACK_BYTES;
@@ -252,6 +268,7 @@ impl PersistentShellSession {
     fn read_until_sentinel_streaming(&mut self, payload: &str) -> io::Result<CompletedCommand> {
         let mut pending = Vec::new();
         let mut transcript = Vec::new();
+        let mut strip_initial_separator = true;
         loop {
             let chunk = self.recv_shell_chunk()?;
             if chunk.is_empty() {
@@ -264,6 +281,9 @@ impl PersistentShellSession {
             pending.extend_from_slice(&chunk);
             if let Some(mut completed) = parse_completed_command(&pending, &self.nonce) {
                 strip_echoed_payload(&mut completed.transcript, payload);
+                if transcript.is_empty() && strip_initial_separator {
+                    let _ = strip_initial_shell_separators(&mut completed.transcript);
+                }
                 let needs_prompt_separator =
                     output_ends_with_unfinished_visible_line(&transcript, &completed.transcript);
                 terminal_output::with_stdout(|stdout| {
@@ -282,6 +302,17 @@ impl PersistentShellSession {
             strip_echoed_payload_prefix(&mut pending, payload);
             if is_partial_echoed_payload_prefix(&pending, payload) {
                 continue;
+            }
+            if transcript.is_empty() && strip_initial_separator && pending.is_empty() {
+                continue;
+            }
+            if transcript.is_empty() && strip_initial_separator {
+                match strip_initial_shell_separators(&mut pending) {
+                    StripInitialSeparator::Stripped | StripInitialSeparator::NotPresent => {
+                        strip_initial_separator = false;
+                    }
+                    StripInitialSeparator::Pending => continue,
+                }
             }
             let safe_len = streamable_prefix_len(&pending, &self.nonce);
             if safe_len > 0 {
@@ -642,6 +673,96 @@ fn strip_sentinel_separator(transcript: &mut Vec<u8>) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StripInitialSeparator {
+    Stripped,
+    Pending,
+    NotPresent,
+}
+
+fn strip_initial_shell_separator(transcript: &mut Vec<u8>) -> StripInitialSeparator {
+    match initial_shell_separator_len(transcript) {
+        Some(0) => StripInitialSeparator::NotPresent,
+        Some(len) => {
+            transcript.drain(..len);
+            StripInitialSeparator::Stripped
+        }
+        None => StripInitialSeparator::Pending,
+    }
+}
+
+fn strip_initial_shell_separators(transcript: &mut Vec<u8>) -> StripInitialSeparator {
+    let mut stripped = false;
+    loop {
+        match strip_initial_shell_separator(transcript) {
+            StripInitialSeparator::Stripped => stripped = true,
+            StripInitialSeparator::Pending => return StripInitialSeparator::Pending,
+            StripInitialSeparator::NotPresent => {
+                return if stripped {
+                    StripInitialSeparator::Stripped
+                } else {
+                    StripInitialSeparator::NotPresent
+                };
+            }
+        }
+    }
+}
+
+fn initial_shell_separator_len(bytes: &[u8]) -> Option<usize> {
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != 0x1b {
+            break;
+        }
+
+        let consumed = initial_escape_sequence_len(&bytes[index..])?;
+        index += consumed;
+    }
+
+    if index >= bytes.len() {
+        return if index == 0 { Some(0) } else { None };
+    }
+
+    match bytes[index] {
+        b'\r'
+            if bytes.get(index + 1) == Some(&b'\r')
+                && bytes.get(index + 2) == Some(&b'\n') =>
+        {
+            Some(index + 3)
+        }
+        b'\r' if bytes.get(index + 1) == Some(&b'\r') && index + 2 >= bytes.len() => None,
+        b'\r' if bytes.get(index + 1) == Some(&b'\n') => Some(index + 2),
+        b'\r' if index + 1 >= bytes.len() => None,
+        b'\r' | b'\n' => Some(index + 1),
+        _ => Some(0),
+    }
+}
+
+fn initial_escape_sequence_len(bytes: &[u8]) -> Option<usize> {
+    debug_assert_eq!(bytes.first(), Some(&0x1b));
+    let introducer = *bytes.get(1)?;
+    match introducer {
+        b'[' => bytes
+            .iter()
+            .enumerate()
+            .skip(2)
+            .find_map(|(index, byte)| (0x40..=0x7e).contains(byte).then_some(index + 1)),
+        b']' => {
+            let mut index = 2;
+            while index < bytes.len() {
+                match bytes[index] {
+                    0x07 => return Some(index + 1),
+                    0x1b if bytes.get(index + 1) == Some(&b'\\') => return Some(index + 2),
+                    _ => index += 1,
+                }
+            }
+            None
+        }
+        0x40..=0x5f => Some(2),
+        _ => Some(2),
+    }
+}
+
 fn strip_echoed_payload(transcript: &mut Vec<u8>, payload: &str) {
     strip_echoed_payload_prefix(transcript, payload);
 
@@ -747,13 +868,13 @@ fn new_nonce() -> String {
 }
 
 fn shell_group_payload(command: &str, nonce: &str, uses_zsh_protocol: bool) -> String {
-    let command = shell_single_quote(command);
+    let command = shell_single_quote(&format!(" {command}"));
     if uses_zsh_protocol {
         return format!(
             "{{ \n\
              unset __theseus_status\n\
              {{ \n\
-             eval -- {command}\n\
+             eval {command}\n\
              __theseus_status=$?\n\
              }} always {{ \n\
              __theseus_status=${{__theseus_status:-$?}}\n\
@@ -766,7 +887,7 @@ fn shell_group_payload(command: &str, nonce: &str, uses_zsh_protocol: bool) -> S
 
     format!(
         "{{ \n\
-         eval -- {command}\n\
+         eval {command}\n\
          __theseus_status=$?\n\
          printf '\\n__THESEUS_DONE_{nonce}_%s__\\n' \"$__theseus_status\"\n\
          }}\n"
@@ -984,7 +1105,7 @@ mod tests {
 
         assert_eq!(
             payload,
-            "{ \neval -- 'vim'\n__theseus_status=$?\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\n}\n"
+            "{ \neval ' vim'\n__theseus_status=$?\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\n}\n"
         );
     }
 
@@ -994,7 +1115,7 @@ mod tests {
 
         assert_eq!(
             payload,
-            "{ \neval -- 'printf '\\''%s'\\'' '\\''a b'\\'''\n__theseus_status=$?\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\n}\n"
+            "{ \neval ' printf '\\''%s'\\'' '\\''a b'\\'''\n__theseus_status=$?\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\n}\n"
         );
     }
 
@@ -1003,8 +1124,41 @@ mod tests {
         let payload = shell_group_payload("sleep 100", "nonce", true);
 
         assert!(payload.contains("} always {"));
-        assert!(payload.contains("eval -- 'sleep 100'"));
+        assert!(payload.contains("eval ' sleep 100'"));
         assert!(payload.contains("__THESEUS_DONE_nonce_%s__"));
+    }
+
+    #[test]
+    fn strips_initial_shell_separator_after_prompt_control_sequence() {
+        let mut transcript = b"\x1b[?2004l\r\r\nCargo.toml".to_vec();
+
+        assert_eq!(
+            strip_initial_shell_separator(&mut transcript),
+            StripInitialSeparator::Stripped
+        );
+        assert_eq!(transcript, b"Cargo.toml");
+    }
+
+    #[test]
+    fn waits_for_partial_initial_shell_separator() {
+        let mut transcript = b"\x1b[?2004l\r".to_vec();
+
+        assert_eq!(
+            strip_initial_shell_separator(&mut transcript),
+            StripInitialSeparator::Pending
+        );
+        assert_eq!(transcript, b"\x1b[?2004l\r");
+    }
+
+    #[test]
+    fn preserves_user_leading_blank_line_after_shell_separator() {
+        let mut transcript = b"\x1b[?2004l\r\r\n\r\nhello".to_vec();
+
+        assert_eq!(
+            strip_initial_shell_separator(&mut transcript),
+            StripInitialSeparator::Stripped
+        );
+        assert_eq!(transcript, b"\r\nhello");
     }
 
     #[test]
