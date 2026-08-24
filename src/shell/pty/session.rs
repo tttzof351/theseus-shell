@@ -724,10 +724,7 @@ fn initial_shell_separator_len(bytes: &[u8]) -> Option<usize> {
     }
 
     match bytes[index] {
-        b'\r'
-            if bytes.get(index + 1) == Some(&b'\r')
-                && bytes.get(index + 2) == Some(&b'\n') =>
-        {
+        b'\r' if bytes.get(index + 1) == Some(&b'\r') && bytes.get(index + 2) == Some(&b'\n') => {
             Some(index + 3)
         }
         b'\r' if bytes.get(index + 1) == Some(&b'\r') && index + 2 >= bytes.len() => None,

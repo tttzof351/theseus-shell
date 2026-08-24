@@ -37,7 +37,8 @@ impl Agent {
         purpose: &str,
         cancellation: &crate::common::cancellation::CancellationEvent,
     ) -> io::Result<TrajectoryMessage> {
-        let request = self.build_completion_request_with_tools(messages.clone(), include_tools)?;
+        let message_count = messages.len();
+        let request = self.build_completion_request_with_tools(messages, include_tools)?;
 
         let _progress = Spinner::start();
         let mut last_error = None;
@@ -53,33 +54,37 @@ impl Agent {
             }
 
             match self.request_completion_once_cancellable(
-                messages.len(),
+                message_count,
                 &request,
                 attempt,
                 purpose,
                 cancellation,
             ) {
                 Ok(message) => return Ok(message),
-                Err(err) if is_retryable_llm_error(&err) && attempt < self.llm_request_retries => {
-                    self.log_event(
-                        "warn",
-                        "llm_request_retry",
-                        json!({
-                            "attempt": attempt,
-                            "next_attempt": attempt + 1,
-                            "error": err.to_string(),
-                        }),
-                    );
-                    last_error = Some(err);
-                    if sleep_cancellable(Duration::from_millis(500 * attempt as u64), cancellation)
-                    {
+                Err(err) if is_retryable_llm_error(&err) => {
+                    if attempt < self.llm_request_retries {
                         self.log_event(
-                            "info",
-                            "llm_request_interrupted",
-                            json!({ "attempt": attempt }),
+                            "warn",
+                            "llm_request_retry",
+                            json!({
+                                "attempt": attempt,
+                                "next_attempt": attempt + 1,
+                                "error": err.to_string(),
+                            }),
                         );
-                        return Err(interrupted_error());
+                        if sleep_cancellable(
+                            Duration::from_millis(500 * attempt as u64),
+                            cancellation,
+                        ) {
+                            self.log_event(
+                                "info",
+                                "llm_request_interrupted",
+                                json!({ "attempt": attempt }),
+                            );
+                            return Err(interrupted_error());
+                        }
                     }
+                    last_error = Some(err);
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => return Err(err),
                 Err(err) => return Err(err),
@@ -216,12 +221,25 @@ impl Agent {
         })?;
         let usage = response.usage.clone();
         let choices_len = response.choices.len();
-        let trajectory_message = response
+        let choice = response
             .choices
             .into_iter()
             .next()
-            .map(|choice| TrajectoryMessage::with_usage(choice.message, usage.clone()))
             .ok_or_else(|| io::Error::other("LLM response has no choices"))?;
+        validate_provider_finish_reason(&choice).inspect_err(|err| {
+            self.log_event(
+                "error",
+                "llm_response_invalid",
+                json!({
+                    "error": err.to_string(),
+                    "choices": choices_len,
+                    "finish_reason": choice.finish_reason.as_deref(),
+                    "native_finish_reason": choice.native_finish_reason.as_deref(),
+                    "usage": usage,
+                }),
+            );
+        })?;
+        let trajectory_message = TrajectoryMessage::with_usage(choice.message, usage.clone());
         validate_trajectory_message(&trajectory_message).inspect_err(|err| {
             self.log_event(
                 "error",
@@ -345,6 +363,20 @@ fn is_retryable_llm_error(err: &io::Error) -> bool {
         || err.to_string().contains("decoding response body")
 }
 
+fn validate_provider_finish_reason(choice: &super::messages::ChatChoice) -> io::Result<()> {
+    if choice.native_finish_reason.as_deref() != Some("network_error") {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        format!(
+            "LLM provider returned native_finish_reason `network_error` (finish_reason: {})",
+            choice.finish_reason.as_deref().unwrap_or("unknown")
+        ),
+    ))
+}
+
 fn validate_trajectory_message(message: &TrajectoryMessage) -> io::Result<()> {
     let Some(message) = message.message() else {
         return Err(io::Error::new(
@@ -441,6 +473,13 @@ mod tests {
     use super::super::messages::ChatMessage;
     use super::*;
     use crate::agent::AgentConfig;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{Arc, Mutex},
+        thread,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn completion_request_preserves_configured_body_and_overlays_runtime_fields() {
@@ -593,5 +632,139 @@ mod tests {
 
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         assert!(is_retryable_llm_error(&err));
+    }
+
+    #[test]
+    fn preserves_tools_when_retrying_provider_network_error() {
+        let (base_url, requests, server) = tool_network_error_chat_server();
+        let mut config = AgentConfig::default_empty();
+        config.llm_request_settings.base_url = base_url;
+        config.llm_request_settings.retries = 2;
+        config
+            .llm_request_settings
+            .header
+            .insert("Authorization".to_string(), "Bearer test".to_string());
+        config.agent_settings.build_in_tools = vec!["read_file".to_string()];
+        let agent = Agent::new(config);
+
+        let err = agent
+            .request_completion(&crate::common::cancellation::CancellationEvent::new())
+            .unwrap_err();
+        server.join().unwrap();
+        let requests = requests.lock().unwrap();
+
+        assert_eq!(
+            err.to_string(),
+            "LLM provider returned native_finish_reason `network_error` (finish_reason: stop)"
+        );
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].get("tools").is_some());
+        assert!(requests[1].get("tools").is_some());
+    }
+
+    #[test]
+    fn reports_ox_provider_network_error_from_native_finish_reason() {
+        let response = parse_chat_response_body(
+            r#"
+            {
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "native_finish_reason": "network_error",
+                  "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": null
+                  }
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let err = validate_provider_finish_reason(&response.choices[0]).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(
+            err.to_string(),
+            "LLM provider returned native_finish_reason `network_error` (finish_reason: stop)"
+        );
+        assert!(is_retryable_llm_error(&err));
+    }
+
+    fn tool_network_error_chat_server() -> (String, Arc<Mutex<Vec<Value>>>, thread::JoinHandle<()>)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&requests);
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("mock server accept failed: {error}"),
+                };
+                let request = read_http_json_request(&mut stream);
+                server_requests.lock().unwrap().push(request);
+                let body = json!({
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "native_finish_reason": "network_error",
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "reasoning": null
+                            }
+                        }
+                    ]
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                if server_requests.lock().unwrap().len() == 2 {
+                    return;
+                }
+            }
+        });
+
+        (format!("http://{address}/chat"), requests, server)
+    }
+
+    fn read_http_json_request(stream: &mut impl Read) -> Value {
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 8192];
+        loop {
+            let count = stream.read(&mut buffer).unwrap();
+            assert!(count > 0, "HTTP request ended before its JSON body");
+            bytes.extend_from_slice(&buffer[..count]);
+            let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let body_start = header_end + 4;
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            if bytes.len() >= body_start + content_length {
+                return serde_json::from_slice(&bytes[body_start..body_start + content_length])
+                    .unwrap();
+            }
+        }
     }
 }

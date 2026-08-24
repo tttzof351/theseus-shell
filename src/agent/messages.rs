@@ -116,6 +116,8 @@ pub(super) struct ChatResponse {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct ChatChoice {
+    pub(super) finish_reason: Option<String>,
+    pub(super) native_finish_reason: Option<String>,
     pub(super) message: ChatMessage,
 }
 
@@ -434,6 +436,55 @@ mod tests {
             response.choices[0].message.reasoning.as_deref(),
             Some("I should inspect the file before answering.")
         );
+    }
+
+    #[test]
+    fn decodes_ox_alpha_success_response() {
+        let text = r#"
+        {
+          "id": "gen-ox",
+          "object": "chat.completion",
+          "model": "stealth/ox-alpha",
+          "choices": [
+            {
+              "index": 0,
+              "finish_reason": "stop",
+              "native_finish_reason": "stop",
+              "message": {
+                "role": "assistant",
+                "content": "There are 3 r's in strawberry.",
+                "refusal": null,
+                "reasoning": "I counted the letters.",
+                "reasoning_details": [
+                  {
+                    "type": "reasoning.text",
+                    "text": "I counted the letters.",
+                    "format": "unknown",
+                    "index": 0
+                  }
+                ]
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 101,
+            "completion_tokens": 152,
+            "total_tokens": 253,
+            "cost": 0,
+            "is_byok": false
+          }
+        }
+        "#;
+
+        let response = serde_json::from_str::<ChatResponse>(text).unwrap();
+        let message = &response.choices[0].message;
+
+        assert_eq!(
+            message.content_text().as_deref(),
+            Some("There are 3 r's in strawberry.")
+        );
+        assert_eq!(message.reasoning.as_deref(), Some("I counted the letters."));
+        assert_eq!(response.usage.unwrap().total_tokens, Some(253));
     }
 
     #[test]
