@@ -3,10 +3,8 @@ use std::{fs, io, path::Path};
 use serde_json::{Value, json};
 
 use super::{
-    AgentTool, ToolOutput,
-    args::string_arg,
-    format_tool_call_name,
-    paths::{expanded_path_arg, expanded_path_arg_with_home},
+    AgentTool, ToolOutput, args::string_arg, format_tool_call_name,
+    paths::expanded_path_arg_with_home,
 };
 use crate::agent::AgentRunContext;
 
@@ -36,7 +34,7 @@ impl AgentTool for WriteFileTool {
         })
     }
 
-    fn display(&self, arguments: &Value) -> String {
+    fn display(&self, arguments: &Value, _context: &AgentRunContext) -> String {
         let Some(path) = arguments.get("path").and_then(Value::as_str) else {
             return format_tool_call_name(self.name());
         };
@@ -44,20 +42,21 @@ impl AgentTool for WriteFileTool {
         format!("{} {path}", format_tool_call_name(self.name()))
     }
 
-    fn execute(&self, arguments: &Value, _context: &AgentRunContext) -> io::Result<ToolOutput> {
-        write_file(arguments).map(ToolOutput::text)
+    fn execute(&self, arguments: &Value, context: &AgentRunContext) -> io::Result<ToolOutput> {
+        write_file(arguments, context.working_dir.as_deref()).map(ToolOutput::text)
     }
 }
 
-fn write_file(arguments: &Value) -> io::Result<String> {
-    write_file_with_home(arguments, None)
+fn write_file(arguments: &Value, working_dir: Option<&Path>) -> io::Result<String> {
+    write_file_with_home(arguments, None, working_dir)
 }
 
-fn write_file_with_home(arguments: &Value, home_dir: Option<&Path>) -> io::Result<String> {
-    let path = match home_dir {
-        Some(home_dir) => expanded_path_arg_with_home(arguments, "path", Some(home_dir))?,
-        None => expanded_path_arg(arguments, "path")?,
-    };
+fn write_file_with_home(
+    arguments: &Value,
+    home_dir: Option<&Path>,
+    working_dir: Option<&Path>,
+) -> io::Result<String> {
+    let path = expanded_path_arg_with_home(arguments, "path", home_dir, working_dir)?;
     let content = string_arg(arguments, "content")?;
 
     if let Some(parent) = path.parent()
@@ -102,6 +101,23 @@ mod tests {
     }
 
     #[test]
+    fn write_file_tool_resolves_relative_path_against_working_dir() {
+        let base =
+            std::env::temp_dir().join(format!("theseus-agent-write-cwd-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        let arguments = json!({ "path": "nested/out.txt", "content": "hello" });
+
+        let output = write_file_with_home(&arguments, None, Some(&base)).unwrap();
+
+        assert!(output.contains("Wrote 5 bytes"));
+        assert_eq!(
+            fs::read_to_string(base.join("nested/out.txt")).unwrap(),
+            "hello"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn write_file_tool_expands_home_prefix() {
         let home =
             std::env::temp_dir().join(format!("theseus-agent-write-home-{}", std::process::id()));
@@ -110,7 +126,7 @@ mod tests {
             "content": "{\"model\":\"test\"}\n",
         });
 
-        let output = write_file_with_home(&arguments, Some(&home)).unwrap();
+        let output = write_file_with_home(&arguments, Some(&home), None).unwrap();
 
         assert!(output.contains("Wrote 17 bytes"));
         assert_eq!(
@@ -122,7 +138,10 @@ mod tests {
 
     #[test]
     fn formats_write_file_tool_call_with_path() {
-        let display = WriteFileTool.display(&json!({ "path": "src/input/mod.rs" }));
+        let display = WriteFileTool.display(
+            &json!({ "path": "src/input/mod.rs" }),
+            &AgentRunContext::default(),
+        );
 
         assert_eq!(display, "• \x1b[1mwrite_file\x1b[0m src/input/mod.rs");
     }

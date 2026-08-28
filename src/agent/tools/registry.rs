@@ -73,7 +73,7 @@ fn execute_tool(
             }),
         );
     }
-    log_tool_call(&**tool, arguments)?;
+    log_tool_call(&**tool, arguments, context)?;
 
     let result = tool.execute(arguments, context);
 
@@ -124,7 +124,11 @@ fn execute_tool(
     Ok(output)
 }
 
-fn log_tool_call(tool: &dyn AgentTool, arguments: &serde_json::Value) -> io::Result<()> {
+fn log_tool_call(
+    tool: &dyn AgentTool,
+    arguments: &serde_json::Value,
+    context: &AgentRunContext,
+) -> io::Result<()> {
     if tool.name() == "bash" {
         return Ok(());
     }
@@ -132,7 +136,7 @@ fn log_tool_call(tool: &dyn AgentTool, arguments: &serde_json::Value) -> io::Res
     terminal_output::with_stdout(|stdout| {
         use std::io::Write;
 
-        writeln!(stdout, "{}", tool.display(arguments))?;
+        writeln!(stdout, "{}", tool.display(arguments, context))?;
         stdout.flush()
     })
 }

@@ -21,7 +21,7 @@ trait AgentTool {
 
     fn schema(&self) -> Value;
 
-    fn display(&self, _arguments: &Value) -> String {
+    fn display(&self, _arguments: &Value, _context: &AgentRunContext) -> String {
         format_tool_call_name(self.name())
     }
 

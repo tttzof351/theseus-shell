@@ -3,11 +3,8 @@ use std::{fs, io, path::Path};
 use serde_json::{Value, json};
 
 use super::{
-    AgentTool, ToolOutput,
-    args::string_arg,
-    diff::unified_edit_preview,
-    format_tool_call_name,
-    paths::{expand_home_path_default, expanded_path_arg, expanded_path_arg_with_home},
+    AgentTool, ToolOutput, args::string_arg, diff::unified_edit_preview, format_tool_call_name,
+    paths::expanded_path_arg_with_home,
 };
 use crate::agent::AgentRunContext;
 
@@ -44,7 +41,7 @@ impl AgentTool for EditFileTool {
         })
     }
 
-    fn display(&self, arguments: &Value) -> String {
+    fn display(&self, arguments: &Value, context: &AgentRunContext) -> String {
         let Some(path) = arguments.get("path").and_then(Value::as_str) else {
             return format_tool_call_name(self.name());
         };
@@ -55,9 +52,11 @@ impl AgentTool for EditFileTool {
             return format!("{} {path}", format_tool_call_name(self.name()));
         };
 
-        let expanded_path = expand_home_path_default(path);
-        let diff = fs::read_to_string(expanded_path)
+        let expanded_path =
+            expanded_path_arg_with_home(arguments, "path", None, context.working_dir.as_deref());
+        let diff = expanded_path
             .ok()
+            .and_then(|path| fs::read_to_string(path).ok())
             .and_then(|content| unified_edit_preview(&content, old_string, new_string));
 
         match diff {
@@ -68,21 +67,22 @@ impl AgentTool for EditFileTool {
         }
     }
 
-    fn execute(&self, arguments: &Value, _context: &AgentRunContext) -> io::Result<ToolOutput> {
-        edit_file(arguments).map(ToolOutput::text)
+    fn execute(&self, arguments: &Value, context: &AgentRunContext) -> io::Result<ToolOutput> {
+        edit_file(arguments, context.working_dir.as_deref()).map(ToolOutput::text)
     }
 }
 
-fn edit_file(arguments: &Value) -> io::Result<String> {
-    edit_file_with_home(arguments, None)
+fn edit_file(arguments: &Value, working_dir: Option<&Path>) -> io::Result<String> {
+    edit_file_with_home(arguments, None, working_dir)
 }
 
-fn edit_file_with_home(arguments: &Value, home_dir: Option<&Path>) -> io::Result<String> {
+fn edit_file_with_home(
+    arguments: &Value,
+    home_dir: Option<&Path>,
+    working_dir: Option<&Path>,
+) -> io::Result<String> {
     let requested_path = string_arg(arguments, "path")?;
-    let path = match home_dir {
-        Some(home_dir) => expanded_path_arg_with_home(arguments, "path", Some(home_dir))?,
-        None => expanded_path_arg(arguments, "path")?,
-    };
+    let path = expanded_path_arg_with_home(arguments, "path", home_dir, working_dir)?;
     let old_string = string_arg(arguments, "oldString")?;
     let new_string = string_arg(arguments, "newString")?;
 
@@ -159,7 +159,7 @@ mod tests {
             "newString": "new",
         });
 
-        let output = edit_file_with_home(&arguments, Some(&home)).unwrap();
+        let output = edit_file_with_home(&arguments, Some(&home), None).unwrap();
 
         assert_eq!(output, "Edited ~/.theseus/config.jsonc");
         assert_eq!(
@@ -167,6 +167,28 @@ mod tests {
             "{\"model\":\"new\"}\n"
         );
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn edit_file_tool_resolves_relative_path_against_working_dir() {
+        let base =
+            std::env::temp_dir().join(format!("theseus-agent-edit-cwd-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("notes.txt"), "hello old world").unwrap();
+        let arguments = json!({
+            "path": "notes.txt",
+            "oldString": "old",
+            "newString": "new",
+        });
+
+        let output = edit_file_with_home(&arguments, None, Some(&base)).unwrap();
+
+        assert_eq!(output, "Edited notes.txt");
+        assert_eq!(
+            fs::read_to_string(base.join("notes.txt")).unwrap(),
+            "hello new world"
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -230,7 +252,7 @@ mod tests {
             "newString": "new",
         });
 
-        let display = EditFileTool.display(&arguments);
+        let display = EditFileTool.display(&arguments, &AgentRunContext::default());
 
         assert!(display.contains("• \x1b[1medit_file\x1b[0m"));
         assert!(display.contains("@@ -1,3 +1,3 @@"));
@@ -240,5 +262,30 @@ mod tests {
         assert!(display.contains(" omega"));
 
         let _ = fs::remove_file(string_arg(&arguments, "path").unwrap());
+    }
+
+    #[test]
+    fn edit_file_tool_preview_resolves_relative_path_against_working_dir() {
+        let base = std::env::temp_dir().join(format!(
+            "theseus-agent-edit-preview-cwd-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("notes.txt"), "alpha\nold\nomega\n").unwrap();
+        let arguments = json!({
+            "path": "notes.txt",
+            "oldString": "old",
+            "newString": "new",
+        });
+        let context = AgentRunContext {
+            working_dir: Some(base.clone()),
+            ..AgentRunContext::default()
+        };
+
+        let display = EditFileTool.display(&arguments, &context);
+
+        assert!(display.contains("\x1b[31m-old\x1b[0m"));
+        assert!(display.contains("\x1b[32m+new\x1b[0m"));
+        fs::remove_dir_all(base).unwrap();
     }
 }

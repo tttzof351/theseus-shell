@@ -57,6 +57,7 @@ pub struct AgentRunContext {
     pub logger: Option<AppLogger>,
     pub(crate) cancellation: CancellationEvent,
     pub(crate) image_input: ImageInputSettings,
+    pub(crate) max_tool_output_bytes: usize,
     pub(crate) max_tool_bash_bytes: usize,
     #[cfg(test)]
     pub(crate) tmp_dir: Option<PathBuf>,
@@ -229,6 +230,7 @@ impl Default for AgentRunContext {
             logger: None,
             cancellation: CancellationEvent::new(),
             image_input: ImageInputSettings::default(),
+            max_tool_output_bytes: super::config::models::DEFAULT_MAX_TOOL_OUTPUT_BYTES,
             max_tool_bash_bytes: super::config::models::DEFAULT_MAX_TOOL_BASH_BYTES,
             #[cfg(test)]
             tmp_dir: None,

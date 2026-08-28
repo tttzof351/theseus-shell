@@ -28,6 +28,7 @@ impl Agent {
         mut context: AgentRunContext,
     ) -> io::Result<String> {
         context.image_input = self.image_input.clone();
+        context.max_tool_output_bytes = self.max_tool_output_bytes;
         context.max_tool_bash_bytes = self.max_tool_bash_bytes;
 
         if !has_authorization_header_value(self.header.get("Authorization").map(String::as_str)) {
