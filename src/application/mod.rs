@@ -324,6 +324,11 @@ impl Application {
         match outcome {
             EditorOutcome::Submit(submission) => {
                 let submission_kind = submission.kind;
+                if matches!(submission_kind, SubmissionKind::Ask | SubmissionKind::Shell) {
+                    // Enter may have removed /end without producing a Changed
+                    // outcome. Replace the draft before storing the submission.
+                    self.sync_multiline_draft();
+                }
                 self.commit_submission(&submission);
                 self.execute_submission(submission)?;
                 if submission_kind != SubmissionKind::Command {
@@ -1052,7 +1057,7 @@ impl Application {
             Interaction::Editor(editor)
                 if matches!(editor.mode, EditorMode::Ask | EditorMode::Shell) =>
             {
-                editor.buffer.text().trim().to_string()
+                multiline_history_text(&editor.buffer.text()).to_string()
             }
             _ => return,
         };
@@ -1492,11 +1497,26 @@ fn load_history(path: &Path) -> io::Result<Vec<HistoryEntry>> {
     Ok(normalize_history(history))
 }
 
+fn multiline_history_text(text: &str) -> &str {
+    let text = text.trim();
+    let (body, last_line) = text.rsplit_once('\n').unwrap_or(("", text));
+    if last_line.trim() == input::MULTILINE_SUBMIT_COMMAND {
+        body.trim()
+    } else {
+        text
+    }
+}
+
 fn normalize_history(history: Vec<HistoryEntry>) -> Vec<HistoryEntry> {
     let mut history = history
         .into_iter()
         .filter_map(|mut entry| {
-            entry.text = entry.text.trim().to_string();
+            entry.text = match entry.mode {
+                HistoryMode::MultiLineAsk | HistoryMode::MultiLineShell => {
+                    multiline_history_text(&entry.text).to_string()
+                }
+                _ => entry.text.trim().to_string(),
+            };
             (!entry.text.is_empty()).then_some(entry)
         })
         .collect::<Vec<_>>();
@@ -2122,6 +2142,43 @@ mod tests {
         ]);
 
         assert_eq!(normalized, vec![shell("second"), shell("first")]);
+    }
+
+    #[test]
+    fn multiline_history_normalization_removes_legacy_submit_markers_and_duplicates() {
+        for (kind, mode) in [
+            (HistoryKind::Agent, HistoryMode::MultiLineAsk),
+            (HistoryKind::Shell, HistoryMode::MultiLineShell),
+        ] {
+            let entry = |text: &str| HistoryEntry {
+                text: text.into(),
+                kind,
+                mode,
+            };
+            assert_eq!(
+                normalize_history(vec![
+                    entry("first\n\nsecond\n /end \n"),
+                    entry("another"),
+                    entry("first\n\nsecond"),
+                    entry("/end"),
+                ]),
+                vec![entry("another"), entry("first\n\nsecond")]
+            );
+            for text in [
+                "explain /end",
+                "/end\nmore text",
+                "echo /end",
+                "question\n/en",
+            ] {
+                assert_eq!(normalize_history(vec![entry(text)]), vec![entry(text)]);
+            }
+        }
+        let entry = HistoryEntry {
+            text: "/end".into(),
+            kind: HistoryKind::Agent,
+            mode: HistoryMode::SingleLineAsk,
+        };
+        assert_eq!(normalize_history(vec![entry.clone()]), vec![entry]);
     }
 
     #[test]

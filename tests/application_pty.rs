@@ -400,6 +400,54 @@ fn shell_is_ready_before_first_prompt_and_reused_for_commands() -> io::Result<()
 }
 
 #[test]
+fn multiline_history_keeps_one_prompt_without_end_on_submit_or_cancel() -> io::Result<()> {
+    for (command, kind, mode, text) in [
+        ("/ask", "agent", "multi_line_ask", "Explain FIRST\n\nSECOND"),
+        (
+            "/shell",
+            "shell",
+            "multi_line_shell",
+            "printf FIRST\n\nfalse",
+        ),
+    ] {
+        for finish in ["\r", "\x03"] {
+            let mut shell = ApplicationPty::start()?;
+            let history_path = shell.home.join(".theseus/persist/history_command_v2.json");
+            let expected = serde_json::json!([{"text": text, "kind": kind, "mode": mode}]);
+            shell.write(&format!("{command}\r"))?;
+            shell.write(&format!("\x1b[200~{text}\n/end\x1b[201~"))?;
+            shell.wait_until(|bytes| {
+                screen_rows(bytes)
+                    .iter()
+                    .rfind(|row| !row.is_empty())
+                    .is_some_and(|row| row.trim() == "· /end")
+            })?;
+            let history: serde_json::Value = serde_json::from_slice(&fs::read(&history_path)?)?;
+            assert_eq!(history, expected, "draft for {command}");
+
+            shell.write(finish)?;
+            shell.wait_until(settled_prompt_is_visible)?;
+            let history: serde_json::Value = serde_json::from_slice(&fs::read(&history_path)?)?;
+            assert_eq!(history, expected, "finished history for {command}");
+
+            // Up restores the prompt body; Down returns to the empty input.
+            shell.write("\x1b[A")?;
+            let last_line = format!("· {}", text.lines().last().unwrap());
+            shell.wait_until(|bytes| {
+                screen_rows(bytes)
+                    .iter()
+                    .rfind(|row| !row.is_empty())
+                    .is_some_and(|row| row.trim() == last_line)
+            })?;
+            shell.write("\x1b[B")?;
+            shell.wait_until(settled_prompt_is_visible)?;
+            shell.exit()?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn streamed_shell_output_does_not_move_when_diff_renderer_resumes() -> io::Result<()> {
     let mut shell = ApplicationPty::start()?;
     let offset = shell.transcript_len();
