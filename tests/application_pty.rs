@@ -39,6 +39,10 @@ impl ApplicationPty {
     }
 
     fn start_with_home_and_cwd(home: PathBuf, cwd: &Path) -> io::Result<Self> {
+        Self::start_with_shell(home, cwd, None)
+    }
+
+    fn start_with_shell(home: PathBuf, cwd: &Path, shell: Option<&Path>) -> io::Result<Self> {
         let pair = native_pty_system()
             .openpty(SIZE)
             .map_err(|error| io::Error::other(error.to_string()))?;
@@ -48,6 +52,9 @@ impl ApplicationPty {
         command.env("USER", "tester");
         command.env("TERM", "xterm-256color");
         command.env("NO_COLOR", "1");
+        if let Some(shell) = shell {
+            command.env("SHELL", shell);
+        }
         let git_pager = home.join("git-branch-pager.sh");
         command.env(
             "GIT_PAGER",
@@ -352,6 +359,44 @@ fn interrupted_agent_fixture() -> io::Result<(PathBuf, thread::JoinHandle<()>)> 
     )?;
 
     Ok((home, server))
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_is_ready_before_first_prompt_and_reused_for_commands() -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = temp_home()?;
+    let startup_log = home.join("shell-starts");
+    let wrapper = home.join("test-shell");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\nsleep 0.2\nprintf 'started\\n' >> \"$HOME/shell-starts\"\nexec /bin/sh -i\n",
+    )?;
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))?;
+    let mut shell = ApplicationPty::start_with_shell(
+        home,
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        Some(&wrapper),
+    )?;
+
+    // start_with_shell returns as soon as the initial prompt is visible.
+    // Check readiness directly instead of asserting a machine-dependent latency.
+    assert_eq!(fs::read_to_string(&startup_log)?, "started\n");
+    for marker in ["FIRST_READY", "SECOND_READY"] {
+        let offset = shell.transcript_len();
+        shell.write(&format!(
+            "printf '%s%s\\n' '{}' '{}'\r",
+            &marker[..5],
+            &marker[5..]
+        ))?;
+        shell.wait_until(|bytes| {
+            find_bytes(bytes.get(offset..).unwrap_or_default(), marker.as_bytes()).is_some()
+                && settled_prompt_is_visible(bytes)
+        })?;
+    }
+    assert_eq!(fs::read_to_string(&startup_log)?, "started\n");
+    shell.exit()
 }
 
 #[test]

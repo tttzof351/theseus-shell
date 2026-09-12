@@ -682,7 +682,7 @@ impl Application {
         Ok(())
     }
 
-    fn run_shell(&mut self, command: &str) -> io::Result<()> {
+    fn ensure_shell_session(&mut self) -> io::Result<()> {
         if self.shell_session.is_none() {
             self.shell_session = Some(PersistentShellSession::start(PersistentShellConfig {
                 shell: self.shell_path.clone(),
@@ -690,6 +690,11 @@ impl Application {
                 working_dir: self.working_dir.clone(),
             })?);
         }
+        Ok(())
+    }
+
+    fn run_shell(&mut self, command: &str) -> io::Result<()> {
+        self.ensure_shell_session()?;
         let _external = ExternalTerminalGuard::enter()?;
         self.physical_invalidated = true;
         let session = self.shell_session.as_mut().expect("shell initialized");
@@ -1208,6 +1213,9 @@ fn run_interactive_application(
     mut app: Application,
     exit_when_command_editor_returns: bool,
 ) -> io::Result<i32> {
+    // Finish shell startup before offering input so the first command does not
+    // pay for loading interactive startup files and initializing the PTY.
+    app.ensure_shell_session()?;
     enable_raw_mode()?;
     let _guard = TerminalGuard;
     let mut stdout = io::stdout();
