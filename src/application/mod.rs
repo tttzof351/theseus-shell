@@ -8,14 +8,13 @@ use std::{
 };
 
 use crossterm::{
-    cursor::{MoveTo, Show},
+    cursor::Show,
     event::{
         DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, read,
+        KeyModifiers,
     },
     execute,
-    style::Print,
-    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size},
+    terminal::{disable_raw_mode, enable_raw_mode, size},
 };
 use jsonc_parser::{
     ParseOptions,
@@ -26,7 +25,7 @@ use serde_json::{Value, json};
 
 use crate::agent::config::model_catalog;
 use crate::{
-    agent::{Agent, AgentConfig, AgentRunContext, CompactOutcome, ShellCommandContext},
+    agent::{AgentConfig, AgentRunContext, ShellCommandContext},
     commands::{self, SlashCommand, parse_slash_command},
     common::{self, tmp_files::cleanup_expired_tmp_files_async},
     input,
@@ -36,7 +35,6 @@ use crate::{
         command_routing::{CommandRoute, classify_command},
         markdown_preprocessor,
         pty::{PersistentShellConfig, PersistentShellSession},
-        terminal as shell_terminal,
     },
 };
 
@@ -125,21 +123,19 @@ fn is_key_action(kind: KeyEventKind) -> bool {
     matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
-struct TerminalGuard;
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let mut stdout = io::stdout();
-        let _ = execute!(stdout, DisableBracketedPaste, Print("\x1b[0m"), Show);
-        let _ = disable_raw_mode();
-        let _ = write!(stdout, "\r\n");
-        let _ = stdout.flush();
-    }
-}
-
 use crate::terminal_renderer::*;
 
+mod document_layout;
 mod editor;
+mod event_loop;
+use event_loop::run_interactive_application;
+mod markdown_references;
+mod markdown_source;
+mod state;
+use state::ExecutionState;
+mod plain;
+mod terminal;
+mod terminal_motion;
 use editor::*;
 
 #[derive(Debug, Clone)]
@@ -164,7 +160,17 @@ struct CommandRecord {
     status_code: Option<i32>,
 }
 
+struct ShellPresentation {
+    display: terminal::ShellDisplay,
+    published: Option<crate::terminal_renderer::managed::PublicationAnchor>,
+}
+
 struct Application {
+    document: output_document::OutputDocument,
+    rendered_stable_lines: usize,
+    publication: Vec<crate::terminal_renderer::managed::PublicationUnit>,
+    active_operation: Option<crate::agent::worker::ActiveOperation>,
+    pending_shell: Option<String>,
     transcript: Vec<RenderLine>,
     screen_cache: VirtualScreen,
     cached_transcript_lines: usize,
@@ -174,7 +180,7 @@ struct Application {
     command_records: Vec<CommandRecord>,
     config: AgentConfig,
     config_path: PathBuf,
-    agent: Agent,
+    agent: crate::agent::worker::AgentWorker,
     logger: AppLogger,
     shell_path: PathBuf,
     shell_env: Vec<(String, String)>,
@@ -187,6 +193,14 @@ struct Application {
     last_output_streamed: bool,
     last_command_status: i32,
     pending_command_log: Option<String>,
+    terminal: Option<terminal::TerminalController>,
+    plain: Option<plain::PlainFrontend>,
+    pending_models: Option<std::sync::mpsc::Receiver<model_catalog::ModelCatalog>>,
+    saved_model_draft: Option<UnifiedEditor>,
+    pending_config_confirmation: Option<String>,
+    layout_worker: Option<document_layout::Worker>,
+    prepared_layout: Option<IndexedPhysicalLayout>,
+    layout_feedback: Option<(u64, common::events::Outcome)>,
 }
 
 impl Application {
@@ -194,7 +208,7 @@ impl Application {
         let init = AgentConfig::load_or_create_default()?;
         cleanup_expired_tmp_files_async(init.config.agent_settings.tmp_files_ttl_min);
         let logger = AppLogger::start_session()?;
-        let agent = Agent::new(init.config.clone()).with_logger(logger.clone());
+        let agent = crate::agent::worker::AgentWorker::new(init.config.clone(), logger.clone())?;
         let working_dir = env::current_dir().ok();
         let history_path = home_dir().map(|home| {
             home.join(".theseus")
@@ -209,6 +223,11 @@ impl Application {
         let interaction = Interaction::Editor(UnifiedEditor::command(prompt, &history));
         let shell_path = default_shell_path();
         let mut app = Self {
+            document: output_document::OutputDocument::default(),
+            rendered_stable_lines: 0,
+            publication: Vec::new(),
+            active_operation: None,
+            pending_shell: None,
             transcript: Vec::new(),
             screen_cache: VirtualScreen::new(SHELL_PROMPT),
             cached_transcript_lines: 0,
@@ -231,25 +250,66 @@ impl Application {
             last_output_streamed: false,
             last_command_status: 0,
             pending_command_log: None,
+            terminal: None,
+            plain: None,
+            pending_models: None,
+            saved_model_draft: None,
+            pending_config_confirmation: None,
+            layout_worker: None,
+            prepared_layout: None,
+            layout_feedback: None,
         };
         app.append_text(&common::info::render_info());
         Ok(app)
     }
 
     fn screen(&mut self, terminal_size: TerminalSize) -> &VirtualScreen {
-        let mut dirty_from = self.cached_transcript_lines.min(self.transcript.len());
-        if self.cached_transcript_lines > self.transcript.len() {
-            self.screen_cache.truncate(0);
-            self.cached_transcript_lines = 0;
-            dirty_from = 0;
-        } else {
-            self.screen_cache.truncate(self.cached_transcript_lines);
-        }
-        for line in &self.transcript[self.cached_transcript_lines..] {
+        let dirty_from = self
+            .transcript
+            .iter()
+            .enumerate()
+            .position(|(index, line)| {
+                self.screen_cache.lines.get(index) != Some(&line.text)
+                    || self.screen_cache.prefixes.get(index) != Some(&line.prefix)
+                    || self.screen_cache.line_styles.get(index) != Some(&line.styles)
+                    || self.screen_cache.prefix_styles.get(index) != Some(&line.prefix_styles)
+            })
+            .unwrap_or(self.transcript.len());
+        // Preserve stable text/styles in the virtual screen; replace only the
+        // changed suffix, including the status and editor from the last frame.
+        self.screen_cache.truncate(dirty_from);
+        for line in &self.transcript[dirty_from..] {
             self.screen_cache.push_render_line(line);
         }
         self.cached_transcript_lines = self.transcript.len();
-        let base = self.cached_transcript_lines;
+        if let Some((_, outcome)) = &self.layout_feedback {
+            let text = match outcome {
+                common::events::Outcome::Cancelled => "[interrupted]".into(),
+                common::events::Outcome::Failed(error) => {
+                    format!("[failed: {}]", terminal_label(error))
+                }
+                common::events::Outcome::Completed => String::new(),
+            };
+            self.screen_cache.push_render_line(&RenderLine::plain(text));
+        }
+        if let Some(active) = &self.active_operation {
+            let (phase, detail) = self
+                .document
+                .activity
+                .clone()
+                .unwrap_or_else(|| ("Working".into(), String::new()));
+            let phase = if self.execution_state() == ExecutionState::Cancelling {
+                "Cancelling"
+            } else {
+                &phase
+            };
+            self.screen_cache
+                .push_render_line(&RenderLine::plain(format!(
+                    "{phase} · {}s {detail}",
+                    active.started.elapsed().as_secs()
+                )));
+        }
+        let base = self.screen_cache.lines.len();
         let (mut active_lines, cursor, cursor_visible) = match &mut self.interaction {
             Interaction::Editor(editor) => {
                 let (lines, cursor) = editor.render_lines();
@@ -283,6 +343,45 @@ impl Application {
     }
 
     fn handle_event(&mut self, event: Event) -> io::Result<bool> {
+        if matches!(
+            self.execution_state(),
+            ExecutionState::Stopping | ExecutionState::ShellPassthrough
+        ) {
+            return Ok(false);
+        }
+        if let Some(active) = &self.active_operation {
+            if let Event::Key(key) = &event {
+                if is_key_action(key.kind)
+                    && key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    active.cancellation.cancel();
+                    return Ok(true);
+                }
+                if is_key_action(key.kind)
+                    && (key.code == KeyCode::Enter
+                        || (key.code == KeyCode::Char('d')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)))
+                    && let Interaction::Editor(editor) = &mut self.interaction
+                    && (!editor.history_is_browsing() || key.code != KeyCode::Enter)
+                {
+                    if matches!(editor.mode, EditorMode::Ask | EditorMode::Shell)
+                        && key.code == KeyCode::Enter
+                    {
+                        editor.buffer.split_line();
+                    }
+                    self.sync_multiline_draft();
+                    return Ok(true);
+                }
+            }
+            if let Event::Paste(text) = &event {
+                if let Interaction::Editor(editor) = &mut self.interaction {
+                    let outcome = editor.handle_draft_paste(text);
+                    return self.finish_editor_outcome(outcome);
+                }
+                return Ok(true);
+            }
+        }
         if matches!(event, Event::Resize(_, _)) {
             return Ok(true);
         }
@@ -331,7 +430,10 @@ impl Application {
                 }
                 self.commit_submission(&submission);
                 self.execute_submission(submission)?;
-                if submission_kind != SubmissionKind::Command {
+                if submission_kind != SubmissionKind::Command
+                    && self.active_operation.is_none()
+                    && self.pending_shell.is_none()
+                {
                     self.finish_pending_command_log();
                 }
                 Ok(true)
@@ -416,7 +518,7 @@ impl Application {
                 // keeping the active editor (and its draft) intact. `screen`
                 // notices that the cached prefix is now longer than the
                 // transcript and rebuilds the VirtualScreen from line zero.
-                self.transcript.clear();
+                self.clear_output();
                 self.physical_invalidated = true;
                 Ok(true)
             }
@@ -470,7 +572,7 @@ impl Application {
         for line in &mut committed {
             style_prompt(line);
         }
-        self.transcript.extend(committed);
+        self.document.append_lines(committed);
     }
 
     fn execute_submission(&mut self, submission: EditorSubmission) -> io::Result<()> {
@@ -510,7 +612,6 @@ impl Application {
                     format!("Bearer {key}")
                 };
                 self.save_config_patch(ConfigPatch::SetAuthorization(authorization), false)?;
-                self.append_text(&format!("Config saved to {}\n", self.config_path.display()));
                 self.return_to_command_editor();
                 Ok(())
             }
@@ -527,7 +628,11 @@ impl Application {
             }),
         );
         let result = self.execute_command_inner(input);
-        if result.is_ok() && interaction_needs_input(&self.interaction) {
+        if result.is_ok()
+            && (interaction_needs_input(&self.interaction)
+                || self.active_operation.is_some()
+                || self.pending_shell.is_some())
+        {
             self.pending_command_log = Some(input.to_string());
         } else {
             self.log_command_finish(input, result.as_ref().err());
@@ -578,12 +683,7 @@ impl Application {
             }
             Some(SlashCommand::Mcp) => {
                 self.last_shell_command = None;
-                let status = self.agent.mcp_status_text();
-                if status.is_empty() {
-                    self.append_text("No MCP servers configured.\n");
-                } else {
-                    self.append_markdown(&status);
-                }
+                self.start_operation(crate::agent::worker::Operation::Mcp, "/mcp".into())?;
             }
             Some(SlashCommand::Reset) => {
                 self.last_shell_command = None;
@@ -626,7 +726,6 @@ impl Application {
                     mode: HistoryMode::SingleLineAsk,
                 });
                 self.run_agent(rest)?;
-                shell_terminal::discard_pending_terminal_input()?;
             }
             Some(SlashCommand::Shell) => {
                 let rest = trimmed.strip_prefix("/shell").unwrap_or_default().trim();
@@ -699,11 +798,35 @@ impl Application {
     }
 
     fn run_shell(&mut self, command: &str) -> io::Result<()> {
+        if self.terminal.is_some() {
+            self.pending_shell = Some(command.into());
+            return Ok(());
+        }
+        self.run_shell_now(command).map(|_| ())
+    }
+
+    fn run_shell_now(&mut self, command: &str) -> io::Result<Option<ShellPresentation>> {
         self.ensure_shell_session()?;
-        let _external = ExternalTerminalGuard::enter()?;
+        let mut lease = self
+            .terminal
+            .as_ref()
+            .map(terminal::TerminalController::lease_shell)
+            .transpose()?;
+        let _external = if lease.is_none() {
+            Some(ExternalTerminalGuard::enter()?)
+        } else {
+            None
+        };
         self.physical_invalidated = true;
         let session = self.shell_session.as_mut().expect("shell initialized");
-        let output = session.run_command(command)?;
+        let output = match lease.as_mut() {
+            Some(lease) => session.run_command_with_terminal(
+                command,
+                lease.input.clone(),
+                &mut lease.writer,
+            )?,
+            None => session.run_command(command)?,
+        };
         self.last_output_streamed = output.streamed;
         self.last_command_status = output.status_code.unwrap_or(1);
         if let Ok(working_dir) = session.current_working_dir()
@@ -712,18 +835,33 @@ impl Application {
             self.working_dir = Some(working_dir);
         }
         let text = output.transcript_lossy();
-        if !output.streamed || !uses_alternate_screen(&text) {
-            if let Some(visible_suffix) = suffix_after_last_display_clear(&text) {
-                // The streamed terminal has already discarded everything that
-                // preceded ED 2. Mirror that state transition in the
-                // persistent virtual scene so the recovery frame cannot bring
-                // the old transcript back.
-                self.transcript.clear();
-                self.append_text(visible_suffix);
-            } else {
-                self.append_text(&text);
-            }
-        }
+        let primary = primary_screen_output(&text);
+        let display = lease.as_ref().map(|lease| lease.display());
+        let visible = if let Some(visible_suffix) = suffix_after_last_display_clear(&primary) {
+            // The streamed terminal has already discarded everything that
+            // preceded ED 2. Mirror that state transition in the
+            // persistent virtual scene so the recovery frame cannot bring
+            // the old transcript back.
+            self.clear_output();
+            visible_suffix
+        } else {
+            &primary
+        };
+        let shell_block = self.document.append_lines(ansi_render_lines(visible));
+        let published = shell_block.and_then(|block| {
+            let end = display?.published_byte?.min(output.transcript.len());
+            let prefix = primary_screen_output(&String::from_utf8_lossy(&output.transcript[..end]));
+            let prefix = suffix_after_last_display_clear(&prefix).unwrap_or(&prefix);
+            let lines = ansi_render_lines(prefix);
+            let last = lines.last()?;
+            Some(crate::terminal_renderer::managed::PublicationAnchor {
+                id: crate::terminal_renderer::managed::RowIdentity {
+                    block,
+                    group: lines.len() - 1,
+                },
+                characters: last.text.chars().count(),
+            })
+        });
         self.last_shell_command = Some(ShellCommandContext {
             command: command.to_string(),
             output: common::text::truncate_utf8_to_bytes(
@@ -737,59 +875,201 @@ impl Application {
             output: text,
             status_code: output.status_code,
         });
-        Ok(())
+        Ok(display.map(|display| ShellPresentation { display, published }))
     }
 
     fn run_agent(&mut self, prompt: &str) -> io::Result<()> {
-        let external = ExternalTerminalGuard::enter()?;
-        self.physical_invalidated = true;
-        let last_shell_command = self.last_shell_command.take();
         common::cancellation::clear_sigint_request();
-        let terminal_capture = external
-            .was_raw
-            .then(common::terminal_output::begin_stdout_capture)
-            .transpose()?;
         let context = AgentRunContext {
             shell: self.shell_path.clone(),
             shell_prompt: shell_prompt(self.working_dir.as_deref()),
             shell_highlight: self.config.shell_settings.shell_highlight.clone(),
             env_vars: self.shell_env.clone(),
             working_dir: self.working_dir.clone(),
-            last_shell_command,
+            last_shell_command: self.last_shell_command.take(),
             logger: Some(self.logger.clone()),
             ..AgentRunContext::default()
         };
-        let cancellation = context.cancellation.clone();
-        let output = self.agent.run_with_context(prompt, context);
-        let interrupted = cancellation.is_cancelled();
-        let captured_output = terminal_capture
-            .map(common::terminal_output::StdoutCapture::finish)
-            .transpose()?
-            .unwrap_or_default();
-        if interrupted {
-            self.append_text(&String::from_utf8_lossy(&captured_output));
+        self.start_operation(
+            crate::agent::worker::Operation::Run {
+                prompt: prompt.into(),
+                context: Box::new(context),
+            },
+            prompt.into(),
+        )
+    }
+
+    fn start_operation(
+        &mut self,
+        operation: crate::agent::worker::Operation,
+        input: String,
+    ) -> io::Result<()> {
+        if self.active_operation.is_some() {
+            return Err(io::Error::other("an operation is already running"));
         }
-        match output {
-            Ok(output) => {
-                self.last_command_status = 0;
-                let rendered = render_markdown(&output);
-                self.append_text(&pad_agent_answer(&rendered));
-                self.command_records.push(CommandRecord {
-                    input: prompt.to_string(),
-                    output,
-                    status_code: Some(0),
-                });
+        let active = self.agent.start(operation, input)?;
+        self.document.start_operation(active.id);
+        self.active_operation = Some(active);
+        Ok(())
+    }
+
+    fn poll_operation(&mut self) -> io::Result<bool> {
+        let Some(active) = &mut self.active_operation else {
+            return Ok(false);
+        };
+        if common::cancellation::take_sigint_request() {
+            active.cancellation.cancel();
+        }
+        let mut changed = false;
+        let mut output_bytes = 0;
+        for _ in 0..64 {
+            match active.events.try_recv() {
+                Ok(event) => {
+                    output_bytes += event.event.payload_bytes();
+                    let terminal =
+                        matches!(event.event, common::events::OutputEvent::Finished { .. });
+                    let operation = event.operation;
+                    let sequence = event.sequence;
+                    let (kind, block) = event.event.identity();
+                    let accepted = if operation != active.id {
+                        false
+                    } else if let Some(plain) = &mut self.plain {
+                        let rejected = plain.rejected_events;
+                        plain.apply(event, &mut io::stdout(), &mut io::stderr())?;
+                        plain.rejected_events == rejected
+                    } else {
+                        self.document.apply(event)
+                    };
+                    if accepted {
+                        active.finished |= terminal;
+                        changed = true;
+                    } else {
+                        log_rejected_backend_event(
+                            &self.logger,
+                            active.id,
+                            operation,
+                            sequence,
+                            kind,
+                            block,
+                        );
+                    }
+                    if output_bytes >= 32 * 1024 && !active.cancellation.is_cancelled() {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if let Some(outcome) = active.output_disconnected() {
+                        log_output_disconnect(&self.logger, active.id);
+                        if let Some(plain) = &mut self.plain {
+                            plain.finish(&mut io::stdout(), &mut io::stderr())?;
+                        } else {
+                            self.document.finish_operation(active.id, outcome);
+                        }
+                        changed = true;
+                    }
+                    break;
+                }
+            }
+        }
+        if !active.finished {
+            return Ok(changed);
+        }
+        let completion = match active.completion.try_recv() {
+            Ok(completion) => completion,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(changed),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => crate::agent::worker::Completion {
+                result: Err(io::Error::other("agent worker stopped")),
+                outcome: common::events::Outcome::Failed("agent worker stopped".into()),
+                logger: None,
+            },
+        };
+        let mut completion = active.checked_completion(completion);
+        let catalog = self.pending_models.take().and_then(|models| {
+            if completion.result.is_err()
+                || completion.outcome != common::events::Outcome::Completed
+            {
+                return None;
+            }
+            match models.try_recv() {
+                Ok(catalog) => Some(catalog),
+                Err(_) => {
+                    let error = "model catalog task finished without a result";
+                    completion.result = Err(io::Error::other(error));
+                    completion.outcome = common::events::Outcome::Failed(error.into());
+                    None
+                }
+            }
+        });
+        let active = self.active_operation.take().unwrap();
+        if let Some(logger) = completion.logger {
+            self.logger = logger;
+        }
+        if let Some(confirmation) = self.pending_config_confirmation.take()
+            && completion.result.is_ok()
+        {
+            if self.plain.is_some() {
+                plain::write_diagnostic(&mut io::stdout(), &confirmation)?;
+            } else {
+                self.append_text(&confirmation);
+            }
+            completion.result = Ok(confirmation);
+        }
+        let outcome = completion.outcome.clone();
+        let interrupted = outcome == common::events::Outcome::Cancelled;
+        let (output, status_code) = match completion.result {
+            Ok(text) => {
+                if interrupted {
+                    if self.plain.is_some() {
+                        plain::write_diagnostic(&mut io::stderr(), text.trim_end())?;
+                    } else {
+                        self.append_text(&text);
+                    }
+                }
+                (text, if interrupted { 130 } else { 0 })
             }
             Err(error) => {
-                self.last_command_status = 1;
-                self.append_text(&pad_agent_answer(&format!("agent: {error}\n")));
-                self.command_records.push(CommandRecord {
-                    input: prompt.to_string(),
-                    output: error.to_string(),
-                    status_code: Some(1),
-                });
+                let text = format!("agent: {error}\n");
+                if self.plain.is_some() {
+                    plain::write_diagnostic(&mut io::stderr(), &text)?;
+                } else {
+                    self.append_text(&text);
+                }
+                (text, if interrupted { 130 } else { 1 })
+            }
+        };
+        self.last_command_status = status_code;
+        if self.layout_worker.is_some() && outcome != common::events::Outcome::Completed {
+            self.layout_feedback = Some((self.document.version(), outcome));
+        }
+        self.command_records.push(CommandRecord {
+            input: active.input.clone(),
+            output,
+            status_code: Some(status_code),
+        });
+        if let Some(catalog) = catalog {
+            if let Interaction::Editor(editor) = &self.interaction {
+                self.saved_model_draft = Some(editor.clone());
+            }
+            self.show_model_catalog(catalog);
+            // /config completes when the picker is submitted or cancelled.
+            return Ok(true);
+        }
+        self.finish_pending_command_log();
+        Ok(true)
+    }
+
+    fn wait_for_operation(&mut self) -> io::Result<()> {
+        if self.terminal.is_none() && (!io::stdin().is_terminal() || !io::stdout().is_terminal()) {
+            self.plain.get_or_insert_with(plain::PlainFrontend::default);
+        }
+        while self.active_operation.is_some() {
+            self.poll_operation()?;
+            if self.active_operation.is_some() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
+        self.prepare_document(80)?;
         Ok(())
     }
 
@@ -797,50 +1077,12 @@ impl Application {
         let init = AgentConfig::load_or_create_at(self.config_path.clone())?;
         self.config = init.config;
         self.logger = AppLogger::start_session()?;
-        self.agent = Agent::new(self.config.clone()).with_logger(self.logger.clone());
-        self.append_text("Agent context has been reset.\n");
+        self.apply_configuration("Agent context has been reset.\n".into(), "/reset")?;
         Ok(())
     }
 
     fn compact_agent(&mut self) -> io::Result<()> {
-        let _external = ExternalTerminalGuard::enter()?;
-        self.physical_invalidated = true;
-        let message = match self.agent.compact_context() {
-            Ok(CompactOutcome::AlreadyMinimal) => "Agent context is already minimal.\n".to_string(),
-            Ok(CompactOutcome::MissingAuthorization) => {
-                "LLM Authorization header is empty. Run /config first.\n".to_string()
-            }
-            Ok(CompactOutcome::Compacted(result)) => {
-                self.logger = AppLogger::start_session()?;
-                self.agent.set_logger(self.logger.clone());
-                self.agent.log_event(
-                    "info",
-                    "agent_compact_finish",
-                    json!({
-                        "previous_log_path": result.previous_log_path,
-                        "previous_trajectory_path": result.previous_trajectory_path,
-                        "new_log_path": self.logger.log_path(),
-                        "new_trajectory_path": self.logger.trajectory_path(),
-                        "messages_before": result.before_messages,
-                        "messages_after": result.after_messages,
-                        "compact_trim_retries": result.compact_trim_retries,
-                        "recent_user_messages": result.recent_user_messages,
-                    }),
-                );
-                format!(
-                    "Agent context compacted: {} -> {} messages. New trajectory: {}.\n",
-                    result.before_messages,
-                    result.after_messages,
-                    self.logger.trajectory_path().display()
-                )
-            }
-            Err(error) => {
-                self.last_command_status = 1;
-                format!("agent: {error}\n")
-            }
-        };
-        self.append_text(&message);
-        Ok(())
+        self.start_operation(crate::agent::worker::Operation::Compact, "/compact".into())
     }
 
     fn open_config(&mut self) {
@@ -876,44 +1118,13 @@ impl Application {
     fn finish_config_picker(&mut self, outcome: PickerOutcome) -> io::Result<bool> {
         match outcome {
             PickerOutcome::Submit(id) if id == "model" => {
-                let catalog = model_catalog::load_openrouter_models();
-                let title = format!(
-                    "Select model {}",
-                    model_catalog_source_label(&catalog.source)
-                );
-                let current = self
-                    .config
-                    .llm_request_settings
-                    .body
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                let items = catalog
-                    .models
-                    .into_iter()
-                    .map(|model| {
-                        let is_current = current.as_deref() == Some(model.id.as_str());
-                        let context = model
-                            .context_length
-                            .map(format_context_length)
-                            .unwrap_or_else(|| "n/a".to_string());
-                        PickerItem {
-                            label: format!(
-                                "{}{}",
-                                model.id,
-                                if is_current { " (current)" } else { "" }
-                            ),
-                            id: model.id,
-                            detail: model.name.map_or_else(
-                                || format!("ctx: {context}"),
-                                |name| format!("ctx: {context}  {name}"),
-                            ),
-                        }
-                    })
-                    .collect();
-                self.interaction = Interaction::Models(
-                    PickerState::new(title, items, true).with_selected_id(current.as_deref()),
-                );
+                let (reply, models) = std::sync::mpsc::channel();
+                self.start_operation(
+                    crate::agent::worker::Operation::ModelCatalog { reply },
+                    "/config".into(),
+                )?;
+                self.pending_models = Some(models);
+                self.return_to_command_editor();
                 Ok(true)
             }
             PickerOutcome::Submit(id) if id == "api_key" => {
@@ -931,6 +1142,42 @@ impl Application {
         }
     }
 
+    fn show_model_catalog(&mut self, catalog: model_catalog::ModelCatalog) {
+        let title = format!(
+            "Select model {}",
+            model_catalog_source_label(&catalog.source)
+        );
+        let current = self
+            .config
+            .llm_request_settings
+            .body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let items = catalog
+            .models
+            .into_iter()
+            .map(|model| {
+                let is_current = current.as_deref() == Some(model.id.as_str());
+                let context = model
+                    .context_length
+                    .map(format_context_length)
+                    .unwrap_or_else(|| "n/a".to_string());
+                PickerItem {
+                    label: format!("{}{}", model.id, if is_current { " (current)" } else { "" }),
+                    id: model.id,
+                    detail: model.name.map_or_else(
+                        || format!("ctx: {context}"),
+                        |name| format!("ctx: {context}  {name}"),
+                    ),
+                }
+            })
+            .collect();
+        self.interaction = Interaction::Models(
+            PickerState::new(title, items, true).with_selected_id(current.as_deref()),
+        );
+    }
+
     fn finish_model_picker(&mut self, outcome: PickerOutcome) -> io::Result<bool> {
         match outcome {
             PickerOutcome::Submit(model) => {
@@ -942,9 +1189,7 @@ impl Application {
                     .and_then(Value::as_str)
                     != Some(model.as_str());
                 self.save_config_patch(ConfigPatch::SetModel(model), model_changed)?;
-                self.append_text(&format!("Config saved to {}\n", self.config_path.display()));
                 self.return_to_command_editor();
-                self.finish_pending_command_log();
                 Ok(true)
             }
             PickerOutcome::Cancel => {
@@ -981,12 +1226,27 @@ impl Application {
         if model_changed {
             self.logger = AppLogger::start_session()?;
         }
-        self.agent = Agent::new(self.config.clone()).with_logger(self.logger.clone());
+        self.apply_configuration(
+            format!("Config saved to {}\n", self.config_path.display()),
+            "/config",
+        )?;
+        Ok(())
+    }
+
+    fn apply_configuration(&mut self, confirmation: String, command: &str) -> io::Result<()> {
+        self.start_operation(
+            crate::agent::worker::Operation::Configure {
+                config: Box::new(self.config.clone()),
+                logger: self.logger.clone(),
+            },
+            command.into(),
+        )?;
+        self.pending_config_confirmation = Some(confirmation);
         Ok(())
     }
 
     fn open_resume(&mut self) -> io::Result<()> {
-        let sessions = resume_sessions(self.agent.max_resume_traj())?;
+        let sessions = resume_sessions(self.config.agent_settings.max_resume_traj)?;
         if sessions.is_empty() {
             self.append_text("No resumable sessions found.\n");
             self.return_to_command_editor();
@@ -1022,11 +1282,10 @@ impl Application {
                     _ => None,
                 };
                 if let Some(session) = session {
-                    let count = self.agent.resume_trajectory_from_path(&session.path)?;
-                    self.append_text(&format!(
-                        "Resumed session from {} ({count} messages).\n",
-                        session.path.display()
-                    ));
+                    self.start_operation(
+                        crate::agent::worker::Operation::Resume(session.path),
+                        "/resume".into(),
+                    )?;
                 }
                 self.return_to_command_editor();
                 self.finish_pending_command_log();
@@ -1046,7 +1305,11 @@ impl Application {
     fn return_to_command_editor(&mut self) {
         self.active_draft = None;
         let prompt = shell_prompt(self.working_dir.as_deref());
-        self.interaction = Interaction::Editor(UnifiedEditor::command(prompt, &self.history));
+        self.interaction = Interaction::Editor(
+            self.saved_model_draft
+                .take()
+                .unwrap_or_else(|| UnifiedEditor::command(prompt, &self.history)),
+        );
     }
 
     fn sync_multiline_draft(&mut self) {
@@ -1081,13 +1344,73 @@ impl Application {
         }
     }
 
+    fn refresh_document(&mut self, width: usize) -> io::Result<()> {
+        if self.terminal.is_some()
+            && (self.layout_worker.is_some() || self.document.source_bytes() >= 128 * 1024)
+        {
+            if self.layout_worker.is_none() {
+                self.layout_worker = Some(document_layout::Worker::new()?);
+            }
+            let worker = self.layout_worker.as_mut().unwrap();
+            let key = document_layout::Key::of(&self.document, width);
+            if let Some(prepared) = worker.take(key)? {
+                self.rendered_stable_lines = prepared.rendered.stable_lines;
+                self.publication = prepared.rendered.publication;
+                self.transcript = prepared.rendered.lines;
+                self.screen_cache = prepared.screen;
+                self.prepared_layout = Some(prepared.layout);
+                if self
+                    .layout_feedback
+                    .as_ref()
+                    .is_some_and(|(version, _)| *version <= prepared.key.version)
+                {
+                    self.layout_feedback = None;
+                }
+            }
+            worker.request(key, &self.document);
+            return Ok(());
+        }
+        if !self.document.needs_render(width) {
+            return Ok(());
+        }
+        let rendered = self.document.render(width);
+        self.rendered_stable_lines = rendered.stable_lines;
+        self.publication = rendered.publication;
+        self.transcript = rendered.lines;
+        Ok(())
+    }
+
+    fn layout_pending(&self, width: usize) -> bool {
+        self.layout_worker
+            .as_ref()
+            .is_some_and(|worker| worker.pending(document_layout::Key::of(&self.document, width)))
+    }
+
+    fn prepare_document(&mut self, width: usize) -> io::Result<()> {
+        loop {
+            self.refresh_document(width)?;
+            if !self.layout_pending(width) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn clear_output(&mut self) {
+        self.document.clear_visible();
+        self.transcript.clear();
+        self.cached_transcript_lines = 0;
+        self.prepared_layout = None;
+        self.layout_feedback = None;
+    }
+
     fn append_text(&mut self, text: &str) {
-        self.transcript.extend(ansi_render_lines(text));
+        self.document.append_lines(ansi_render_lines(text));
     }
 
     fn append_markdown(&mut self, text: &str) {
-        self.transcript
-            .extend(ansi_render_lines(&render_markdown(text)));
+        self.document
+            .append_lines(ansi_render_lines(&render_markdown(text)));
     }
 
     fn store_special_history_if_needed(&mut self, input: &str) {
@@ -1184,26 +1507,32 @@ fn run_application(args: Vec<String>) -> io::Result<i32> {
     let mut app = Application::new()?;
     if !args.is_empty() {
         let command = args.join(" ");
-        print!("{}", common::info::render_info());
-        io::stdout().flush()?;
-        app.transcript.clear();
+        print_plain_transcript(&ansi_render_lines(&common::info::render_info()), false)?;
+        app.clear_output();
         app.execute_command(&command)?;
+        if app.active_operation.is_some() && io::stdin().is_terminal() && io::stdout().is_terminal()
+        {
+            return run_interactive_application(app, true);
+        }
+        app.wait_for_operation()?;
         if interaction_needs_input(&app.interaction) {
             if io::stdin().is_terminal() && io::stdout().is_terminal() {
                 let mut transcript = ansi_render_lines(&common::info::render_info());
+                app.refresh_document(80)?;
                 transcript.append(&mut app.transcript);
-                app.transcript = transcript;
+                app.document = output_document::OutputDocument::default();
+                app.document.append_lines(transcript);
                 return run_interactive_application(app, true);
             }
-            print_plain_transcript(&app.transcript, true);
+            print_plain_transcript(&app.transcript, true)?;
             io::stdout().flush()?;
-            app.transcript.clear();
+            app.clear_output();
             let stdin = io::stdin();
             let mut input = stdin.lock();
             finish_plain_interactions(&mut app, &mut input)?;
         }
         if !app.last_output_streamed {
-            print_plain_transcript(&app.transcript, true);
+            print_plain_transcript(&app.transcript, true)?;
         }
         return Ok(app.last_command_status);
     }
@@ -1214,50 +1543,11 @@ fn run_application(args: Vec<String>) -> io::Result<i32> {
     run_interactive_application(app, false)
 }
 
-fn run_interactive_application(
-    mut app: Application,
-    exit_when_command_editor_returns: bool,
-) -> io::Result<i32> {
-    // Finish shell startup before offering input so the first command does not
-    // pay for loading interactive startup files and initializing the PTY.
-    app.ensure_shell_session()?;
-    enable_raw_mode()?;
-    let _guard = TerminalGuard;
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnableBracketedPaste,
-        Clear(ClearType::All),
-        MoveTo(0, 0)
-    )?;
-    let mut renderer = DiffRenderer::new();
-    let mut handled_event = false;
-
-    loop {
-        if app.exit_requested {
-            return Ok(app.last_command_status);
-        }
-        let (width, height) = size()?;
-        let terminal_size = TerminalSize::new(width, height);
-        renderer.render(&mut stdout, app.screen(terminal_size), terminal_size)?;
-        if exit_when_command_editor_returns
-            && handled_event
-            && !interaction_needs_input(&app.interaction)
-        {
-            return Ok(app.last_command_status);
-        }
-        let event = read()?;
-        handled_event = true;
-        if app.handle_event(event)? && app.take_physical_invalidation() {
-            renderer.invalidate();
-        }
-    }
-}
-
 fn run_plain_application(mut app: Application) -> io::Result<i32> {
-    print_plain_transcript(&app.transcript, false);
+    app.wait_for_operation()?;
+    print_plain_transcript(&app.transcript, false)?;
     io::stdout().flush()?;
-    app.transcript.clear();
+    app.clear_output();
     let stdin = io::stdin();
     let mut input = stdin.lock();
     loop {
@@ -1273,6 +1563,7 @@ fn run_plain_application(mut app: Application) -> io::Result<i32> {
             continue;
         }
         app.execute_command(&line)?;
+        app.wait_for_operation()?;
         flush_plain_application_transcript(&mut app)?;
         if app.exit_requested {
             break;
@@ -1282,9 +1573,10 @@ fn run_plain_application(mut app: Application) -> io::Result<i32> {
 }
 
 fn flush_plain_application_transcript(app: &mut Application) -> io::Result<()> {
-    print_plain_transcript(&app.transcript, false);
+    app.wait_for_operation()?;
+    print_plain_transcript(&app.transcript, false)?;
     io::stdout().flush()?;
-    app.transcript.clear();
+    app.clear_output();
     Ok(())
 }
 
@@ -1397,20 +1689,27 @@ fn read_plain_line(input: &mut impl BufRead) -> io::Result<Option<String>> {
     Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
 }
 
-fn print_plain_transcript(lines: &[RenderLine], only_unprefixed: bool) {
+fn print_plain_transcript(lines: &[RenderLine], only_unprefixed: bool) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    let terminal = stdout.is_terminal();
     for line in lines {
         if !only_unprefixed || line.prefix.is_empty() {
-            println!(
-                "{}{}",
-                if only_unprefixed {
-                    String::new()
-                } else {
-                    terminal_styled_text(&line.prefix, &line.prefix_styles)
-                },
+            let prefix = if only_unprefixed {
+                String::new()
+            } else if terminal {
+                terminal_styled_text(&line.prefix, &line.prefix_styles)
+            } else {
+                line.prefix.clone()
+            };
+            let text = if terminal {
                 terminal_styled_text(&line.text, &line.styles)
-            );
+            } else {
+                line.text.clone()
+            };
+            writeln!(stdout, "{prefix}{text}")?;
         }
     }
+    stdout.flush()
 }
 
 fn terminal_styled_text(text: &str, styles: &[CellStyle]) -> String {
@@ -1431,27 +1730,108 @@ fn terminal_styled_text(text: &str, styles: &[CellStyle]) -> String {
 }
 
 fn run_headless(prompt: &str) -> io::Result<i32> {
+    common::cancellation::install_sigint_handler();
     let init = AgentConfig::load_or_create_default()?;
     cleanup_expired_tmp_files_async(init.config.agent_settings.tmp_files_ttl_min);
     let logger = AppLogger::start_session()?;
-    let mut agent = Agent::new(init.config).with_logger(logger.clone());
-    match agent.run_with_context(
-        prompt,
-        AgentRunContext {
-            logger: Some(logger),
-            ..AgentRunContext::default()
+    let worker = crate::agent::worker::AgentWorker::new(init.config, logger.clone())?;
+    // Declared after worker: consumer drops (and cancels) before the worker joins.
+    let mut active = worker.start(
+        crate::agent::worker::Operation::Run {
+            prompt: prompt.into(),
+            context: Box::new(AgentRunContext {
+                logger: Some(logger.clone()),
+                ..AgentRunContext::default()
+            }),
         },
-    ) {
-        Ok(output) => {
-            print!("{output}");
-            io::stdout().flush()?;
-            Ok(0)
-        }
-        Err(error) => {
-            eprintln!("theseus: agent run failed: {error}");
-            Ok(1)
+        prompt.into(),
+    )?;
+    let mut plain = plain::PlainFrontend::default();
+    while !active.finished {
+        active.cancellation.cancel_if_interrupted();
+        match active
+            .events
+            .recv_timeout(std::time::Duration::from_millis(10))
+        {
+            Ok(event) => {
+                let terminal = matches!(event.event, common::events::OutputEvent::Finished { .. });
+                let operation = event.operation;
+                let sequence = event.sequence;
+                let (kind, block) = event.event.identity();
+                let rejected = plain.rejected_events;
+                if operation == active.id {
+                    plain.apply(event, &mut io::stdout(), &mut io::stderr())?;
+                }
+                if operation == active.id && rejected == plain.rejected_events {
+                    active.finished |= terminal;
+                } else {
+                    log_rejected_backend_event(
+                        &logger, active.id, operation, sequence, kind, block,
+                    );
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if active.output_disconnected().is_some() {
+                    log_output_disconnect(&logger, active.id);
+                    plain.finish(&mut io::stdout(), &mut io::stderr())?;
+                }
+            }
         }
     }
+    let completion = active
+        .completion
+        .recv()
+        .map_err(|_| io::Error::other("agent worker stopped"))?;
+    let completion = active.checked_completion(completion);
+    let cancelled = completion.outcome == common::events::Outcome::Cancelled;
+    match completion.result {
+        Ok(text) => {
+            if cancelled {
+                plain::write_diagnostic(&mut io::stderr(), text.trim_end())?;
+            }
+            Ok(if cancelled { 130 } else { 0 })
+        }
+        Err(error) => {
+            plain::write_diagnostic(
+                &mut io::stderr(),
+                &format!("theseus: agent run failed: {error}"),
+            )?;
+            Ok(if cancelled { 130 } else { 1 })
+        }
+    }
+}
+
+fn log_rejected_backend_event(
+    logger: &AppLogger,
+    active: common::events::OperationId,
+    operation: common::events::OperationId,
+    sequence: u64,
+    kind: &str,
+    block: Option<common::events::BlockId>,
+) {
+    let _ = logger.event(
+        "warn",
+        "backend_event_rejected",
+        json!({
+            "active_operation_id": active.0,
+            "operation_id": operation.0,
+            "sequence": sequence,
+            "kind": kind,
+            "block_id": block.map(|id| id.0),
+        }),
+    );
+}
+
+fn log_output_disconnect(logger: &AppLogger, operation: common::events::OperationId) {
+    let _ = logger.event(
+        "error",
+        "backend_output_disconnected",
+        json!({
+            "operation_id": operation.0,
+            "reason": "event channel closed before Finished",
+        }),
+    );
 }
 
 fn default_shell_path() -> PathBuf {
@@ -1542,6 +1922,10 @@ fn save_history(path: &Path, history: &[HistoryEntry]) -> io::Result<()> {
 
 fn resume_sessions(limit: usize) -> io::Result<Vec<ResumeSession>> {
     let directory = default_logs_dir()?;
+    resume_sessions_in(&directory, limit)
+}
+
+fn resume_sessions_in(directory: &Path, limit: usize) -> io::Result<Vec<ResumeSession>> {
     if !directory.exists() {
         return Ok(Vec::new());
     }
@@ -1554,12 +1938,24 @@ fn resume_sessions(limit: usize) -> io::Result<Vec<ResumeSession>> {
                 .is_some_and(|name| name.ends_with("_trajectory.json"))
         })
         .collect::<Vec<_>>();
-    paths.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+    paths.sort_by_cached_key(|path| std::cmp::Reverse(resume_sort_key(path)));
     Ok(paths
         .into_iter()
         .take(limit)
         .filter_map(|path| resume_session_from_path(&path).ok())
         .collect())
+}
+
+fn resume_sort_key(path: &Path) -> (String, u64) {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let timestamp = name.strip_suffix("_trajectory.json").unwrap_or(&name);
+    if let Some((base, suffix)) = timestamp.rsplit_once('-')
+        && base.split('-').count() == 6
+        && let Ok(sequence) = suffix.parse()
+    {
+        return (base.into(), sequence);
+    }
+    (timestamp.into(), 0)
 }
 
 fn resume_session_from_path(path: &Path) -> io::Result<ResumeSession> {
@@ -1589,7 +1985,7 @@ fn resume_session_from_path(path: &Path) -> io::Result<ResumeSession> {
         .unwrap_or("unknown-date");
     let timestamp = file.strip_suffix("_trajectory.json").unwrap_or(file);
     let parts = timestamp.split('-').collect::<Vec<_>>();
-    let date = if parts.len() == 6 {
+    let date = if parts.len() >= 6 {
         format!(
             "{}-{}-{} {}:{}:{}",
             parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
@@ -1624,20 +2020,10 @@ fn content_value_to_string(value: &Value) -> Option<String> {
     }
 }
 
-fn pad_agent_answer(text: &str) -> String {
-    let mut output = String::with_capacity(text.len() + 2);
-    if !text.starts_with('\n') {
-        output.push('\n');
-    }
-    output.push_str(text);
-    if !text.ends_with('\n') {
-        output.push('\n');
-    }
-    output
-}
-
 mod ansi;
 use ansi::*;
+mod ansi_decoder;
+mod output_document;
 
 #[cfg(test)]
 mod tests {
@@ -1662,6 +2048,34 @@ mod tests {
                 .unwrap_or_default()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn resume_orders_same_second_sessions_numerically_and_keeps_legacy_names() {
+        let directory = temporary_test_path("resume-order");
+        fs::create_dir_all(&directory).unwrap();
+        for (suffix, question) in [("", "legacy"), ("-000002", "second"), ("-000010", "tenth")] {
+            fs::write(
+                directory.join(format!("2026-09-13-01-02-03{suffix}_trajectory.json")),
+                serde_json::to_vec(&json!({"messages":[{"role":"user","content":question}]}))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        let sessions = resume_sessions_in(&directory, 3).unwrap();
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|s| s.question.as_str())
+                .collect::<Vec<_>>(),
+            ["tenth", "second", "legacy"]
+        );
+        assert!(sessions.iter().all(|s| s.date == "2026-09-13 01:02:03"));
+        assert_eq!(
+            resume_sessions_in(&directory, 1).unwrap()[0].question,
+            "tenth"
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -2528,3 +2942,6 @@ mod tests {
         assert!(!visible);
     }
 }
+
+#[cfg(test)]
+mod managed_ui_tests;

@@ -1,11 +1,12 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::{self, BufReader, Read},
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -19,6 +20,7 @@ use super::{
     messages::TrajectoryMessage,
 };
 use crate::common::cancellation::CancellationEvent;
+use crate::common::events::EventSink;
 
 #[derive(Debug, Clone)]
 pub struct Agent {
@@ -32,7 +34,6 @@ pub struct Agent {
     pub(super) compact_token_overdraft: usize,
     pub(super) compact_recent_user_messages_max_bytes: usize,
     pub(super) compact_trim_retry_limit: usize,
-    pub(super) max_resume_traj: usize,
     pub(super) image_input: ImageInputSettings,
     pub(super) llm_request_retries: usize,
     pub(super) llm_request_timeout: Duration,
@@ -44,6 +45,7 @@ pub struct Agent {
     pub(super) client: Client,
     pub(super) trajectory: Vec<TrajectoryMessage>,
     pub(super) logger: Option<AppLogger>,
+    pub(super) output: Option<EventSink>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +58,7 @@ pub struct AgentRunContext {
     pub last_shell_command: Option<ShellCommandContext>,
     pub logger: Option<AppLogger>,
     pub(crate) cancellation: CancellationEvent,
+    pub(crate) output: Option<EventSink>,
     pub(crate) image_input: ImageInputSettings,
     pub(crate) max_tool_output_bytes: usize,
     pub(crate) max_tool_bash_bytes: usize,
@@ -102,7 +105,6 @@ impl Agent {
                 .agent_settings
                 .compact_recent_user_messages_max_bytes,
             compact_trim_retry_limit: config.agent_settings.compact_trim_retry_limit,
-            max_resume_traj: config.agent_settings.max_resume_traj,
             image_input: config.agent_settings.image_input,
             llm_request_retries,
             llm_request_timeout,
@@ -114,6 +116,7 @@ impl Agent {
             client: super::llm::llm_client(llm_request_timeout, llm_connect_timeout),
             trajectory,
             logger: None,
+            output: None,
         }
     }
 
@@ -135,33 +138,35 @@ impl Agent {
             .count()
     }
 
-    pub(crate) fn max_resume_traj(&self) -> usize {
-        self.max_resume_traj
-    }
-
     pub(super) fn compact_context_token_limit(&self) -> usize {
         self.max_context_tokens
             .saturating_add(self.compact_token_overdraft)
     }
 
-    pub(crate) fn resume_trajectory_from_path(&mut self, path: &Path) -> std::io::Result<usize> {
-        #[derive(Deserialize)]
-        struct TrajectorySnapshot {
-            messages: Vec<TrajectoryMessage>,
+    pub(crate) fn resume_trajectory_from_path(
+        &mut self,
+        path: &Path,
+        cancellation: &CancellationEvent,
+    ) -> io::Result<usize> {
+        if cancellation.cancel_if_interrupted() {
+            return Err(io::ErrorKind::Interrupted.into());
         }
+        self.resume_trajectory_from_reader(fs::File::open(path)?, path, cancellation)
+    }
 
-        let text = fs::read_to_string(path)?;
-        let snapshot =
-            serde_json::from_str::<TrajectorySnapshot>(&text).map_err(std::io::Error::other)?;
-
-        if snapshot.messages.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "trajectory has no messages",
-            ));
+    fn resume_trajectory_from_reader(
+        &mut self,
+        reader: impl Read,
+        path: &Path,
+        cancellation: &CancellationEvent,
+    ) -> io::Result<usize> {
+        let messages = read_trajectory(reader, cancellation)?;
+        // Commit only a complete, validated snapshot. No file/log/context change
+        // occurs during loading, including cancellation at the end of JSON.
+        if cancellation.cancel_if_interrupted() {
+            return Err(io::ErrorKind::Interrupted.into());
         }
-
-        self.trajectory = snapshot.messages;
+        self.trajectory = messages;
         self.log_event(
             "info",
             "agent_trajectory_resumed",
@@ -208,6 +213,51 @@ impl Agent {
     }
 }
 
+fn read_trajectory(
+    reader: impl Read,
+    cancellation: &CancellationEvent,
+) -> io::Result<Vec<TrajectoryMessage>> {
+    #[derive(Deserialize)]
+    struct TrajectorySnapshot {
+        messages: Vec<TrajectoryMessage>,
+    }
+    struct CancellableReader<'a, R> {
+        inner: R,
+        cancellation: &'a CancellationEvent,
+    }
+    impl<R: Read> Read for CancellableReader<'_, R> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            if self.cancellation.cancel_if_interrupted() {
+                // Interrupted is retried by Read/serde_json. Stop parsing with
+                // another kind and translate back at the operation boundary.
+                return Err(io::Error::other("trajectory loading cancelled"));
+            }
+            self.inner.read(bytes)
+        }
+    }
+    // Check cancellation at each bounded refill, also inside a single large
+    // JSON string. Avoid retaining a second full copy of the snapshot source.
+    let reader = BufReader::with_capacity(
+        8192,
+        CancellableReader {
+            inner: reader,
+            cancellation,
+        },
+    );
+    let snapshot = serde_json::from_reader::<_, TrajectorySnapshot>(reader);
+    if cancellation.cancel_if_interrupted() {
+        return Err(io::ErrorKind::Interrupted.into());
+    }
+    let snapshot = snapshot.map_err(io::Error::other)?;
+    if snapshot.messages.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trajectory has no messages",
+        ));
+    }
+    Ok(snapshot.messages)
+}
+
 pub(super) fn initial_trajectory(
     model: Option<String>,
     system_prompt: String,
@@ -229,6 +279,7 @@ impl Default for AgentRunContext {
             last_shell_command: None,
             logger: None,
             cancellation: CancellationEvent::new(),
+            output: None,
             image_input: ImageInputSettings::default(),
             max_tool_output_bytes: super::config::models::DEFAULT_MAX_TOOL_OUTPUT_BYTES,
             max_tool_bash_bytes: super::config::models::DEFAULT_MAX_TOOL_BASH_BYTES,
@@ -262,6 +313,78 @@ pub(super) fn ensure_trailing_newline(mut text: String) -> String {
 mod tests {
     use super::super::config::models;
     use super::*;
+
+    #[test]
+    fn resume_cancel_during_large_string_or_final_read_preserves_context() {
+        struct CancelOnRead<'a> {
+            source: io::Cursor<&'a [u8]>,
+            cancellation: &'a CancellationEvent,
+            cancel_at: u64,
+        }
+        impl Read for CancelOnRead<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                let count = self.source.read(bytes)?;
+                if self.source.position() >= self.cancel_at {
+                    self.cancellation.cancel();
+                }
+                Ok(count)
+            }
+        }
+        let source = serde_json::to_vec(&serde_json::json!({
+            "messages": [{"role": "user", "content": "界".repeat(700_000)}]
+        }))
+        .unwrap();
+        for cancel_at in [16_384, source.len() as u64] {
+            let mut agent = Agent::new(AgentConfig::default_empty());
+            let previous = serde_json::to_value(&agent.trajectory).unwrap();
+            let cancellation = CancellationEvent::new();
+            let mut reader = CancelOnRead {
+                source: io::Cursor::new(source.as_slice()),
+                cancellation: &cancellation,
+                cancel_at,
+            };
+            let error = agent
+                .resume_trajectory_from_reader(
+                    &mut reader,
+                    Path::new("cancelled.trajectory.json"),
+                    &cancellation,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert_eq!(serde_json::to_value(&agent.trajectory).unwrap(), previous);
+            assert!(reader.source.position() <= cancel_at + 8192);
+        }
+    }
+
+    #[test]
+    fn resume_validates_complete_snapshot_before_committing_context() {
+        let mut agent = Agent::new(AgentConfig::default_empty());
+        let previous = serde_json::to_value(&agent.trajectory).unwrap();
+        for source in [
+            r#"{"messages":[]}"#,
+            r#"{"messages":[{"role":"user","content":"new"}]} trailing"#,
+        ] {
+            assert!(
+                agent
+                    .resume_trajectory_from_reader(
+                        source.as_bytes(),
+                        Path::new("invalid.trajectory.json"),
+                        &CancellationEvent::new(),
+                    )
+                    .is_err()
+            );
+            assert_eq!(serde_json::to_value(&agent.trajectory).unwrap(), previous);
+        }
+        let count = agent
+            .resume_trajectory_from_reader(
+                br#"{"messages":[{"role":"user","content":"new"}]}"#.as_slice(),
+                Path::new("valid.trajectory.json"),
+                &CancellationEvent::new(),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(agent.trajectory[0].message().unwrap().role, "user");
+    }
 
     #[test]
     fn returns_config_hint_when_key_is_empty() {
@@ -320,7 +443,6 @@ mod tests {
             agent.compact_context_token_limit(),
             models::DEFAULT_MAX_CONTEXT_TOKENS + models::DEFAULT_COMPACT_TOKEN_OVERDRAFT
         );
-        assert_eq!(agent.max_resume_traj, models::DEFAULT_MAX_RESUME_TRAJ);
         assert_eq!(
             agent.llm_request_retries,
             models::DEFAULT_LLM_REQUEST_RETRIES

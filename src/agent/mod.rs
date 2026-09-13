@@ -8,6 +8,7 @@ mod messages;
 mod spinner;
 mod status;
 mod tools;
+pub(crate) mod worker;
 
 pub(crate) use compact::CompactOutcome;
 pub use config::{AgentConfig, ConfigInit, McpServerConfig, McpTransport};

@@ -27,6 +27,9 @@ impl Agent {
         prompt: &str,
         mut context: AgentRunContext,
     ) -> io::Result<String> {
+        self.output = context.output.clone();
+        self.mcp.set_output(context.output.clone());
+        self.mcp.set_cancellation(context.cancellation.clone());
         context.image_input = self.image_input.clone();
         context.max_tool_output_bytes = self.max_tool_output_bytes;
         context.max_tool_bash_bytes = self.max_tool_bash_bytes;
@@ -81,11 +84,26 @@ impl Agent {
                 return Ok(error);
             }
 
+            if let Some(output) = &context.output {
+                if let Some(reasoning) = message
+                    .reasoning
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    output.message(crate::common::events::BlockKind::Reasoning, reasoning)?;
+                }
+                if !tool_calls.is_empty() && !content.trim().is_empty() {
+                    output.message(crate::common::events::BlockKind::Markdown, &content)?;
+                }
+            }
+
             if tool_calls.is_empty() {
                 return Ok(ensure_trailing_newline(content));
             }
 
-            log_assistant_tool_message(&tool_message)?;
+            if context.output.is_none() {
+                log_assistant_tool_message(&tool_message)?;
+            }
 
             let mut tool_calls = tool_calls.into_iter();
             while let Some(tool_call) = tool_calls.next() {
@@ -275,6 +293,137 @@ mod tests {
         assert_eq!(
             format_assistant_tool_message("Reading <src> before calling a tool."),
             "\x1b[90m\x1b[3mReading <src> before calling a tool.\x1b[0m\x1b[0m"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_json_turns_preserve_reasoning_content_and_real_tool_output() {
+        use crate::common::{
+            cancellation::CancellationEvent,
+            events::{BlockKind, EventSink, OperationId, OutputEvent},
+        };
+        use std::{
+            io::{BufRead, BufReader},
+            time::{Duration, Instant},
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/chat", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            let messages = [
+                json!({"role":"assistant", "reasoning":"REASON_BEFORE", "content":"**CONTENT_BEFORE**",
+                    "tool_calls":[{"id":"call_mixed", "type":"function", "function":{
+                        "name":"bash", "arguments":"{\"command\":\"printf 'REAL_TOOL_OUTPUT\\\\n'\"}"}}]}),
+                json!({"role":"assistant", "reasoning":"REASON_AFTER", "content":"**CONTENT_AFTER**"}),
+            ];
+            for message in messages {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "agent did not request next turn");
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let mut body = vec![0; length.unwrap()];
+                reader.read_exact(&mut body).unwrap();
+                requests.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+                let body = json!({"choices":[{"message":message}]}).to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let mut config = AgentConfig::default_empty();
+        config.llm_request_settings.base_url = url;
+        config.llm_request_settings.retries = 1;
+        config.llm_request_settings.request_timeout_seconds = 2;
+        config
+            .llm_request_settings
+            .header
+            .insert("Authorization".into(), "Bearer fixture".into());
+        let mut agent = Agent::new(config);
+        let directory = std::env::temp_dir().join(format!(
+            "theseus-mixed-json-{}-{}",
+            std::process::id(),
+            OperationId::next().0
+        ));
+        let (output, events) = EventSink::channel(CancellationEvent::new());
+        let context = AgentRunContext {
+            output: Some(output),
+            tmp_dir: Some(directory.clone()),
+            ..AgentRunContext::default()
+        };
+        let result = agent.run_with_context("run mixed output", context);
+        let requests = server.join().unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+        assert_eq!(result.unwrap(), "**CONTENT_AFTER**\n");
+        assert!(requests[1]["messages"].as_array().unwrap().iter().any(|message|
+            message["role"] == "tool" && message["tool_call_id"] == "call_mixed"));
+        let mut blocks = Vec::new();
+        for envelope in events.try_iter() {
+            match envelope.event {
+                OutputEvent::BlockStarted { id, kind } => blocks.push((id, kind, String::new())),
+                OutputEvent::TextAppended { id, text } => blocks
+                    .iter_mut()
+                    .find(|block| block.0 == id)
+                    .unwrap()
+                    .2
+                    .push_str(&text),
+                OutputEvent::BytesAppended { id, bytes, .. } => blocks
+                    .iter_mut()
+                    .find(|block| block.0 == id)
+                    .unwrap()
+                    .2
+                    .push_str(&String::from_utf8(bytes).unwrap()),
+                _ => {}
+            }
+        }
+        let visible = blocks
+            .iter()
+            .filter(|(_, kind, _)| *kind != BlockKind::ToolPreview)
+            .map(|(_, kind, text)| (*kind, text.trim()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible,
+            [
+                (BlockKind::Reasoning, "REASON_BEFORE"),
+                (BlockKind::Markdown, "**CONTENT_BEFORE**"),
+                (BlockKind::ToolOutput, "REAL_TOOL_OUTPUT"),
+                (BlockKind::Reasoning, "REASON_AFTER"),
+            ]
+        );
+        // The final content is returned to AgentWorker for one Markdown event;
+        // it must not also have been emitted by the loop.
+        assert!(
+            !blocks
+                .iter()
+                .any(|(_, _, text)| text.contains("CONTENT_AFTER"))
         );
     }
 

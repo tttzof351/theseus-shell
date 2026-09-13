@@ -133,6 +133,13 @@ fn log_tool_call(
         return Ok(());
     }
 
+    if let Some(output) = &context.output {
+        return output.message(
+            crate::common::events::BlockKind::ToolPreview,
+            &tool.display(arguments, context),
+        );
+    }
+
     terminal_output::with_stdout(|stdout| {
         use std::io::Write;
 

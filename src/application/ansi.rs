@@ -1,81 +1,19 @@
 use super::*;
 
 pub(super) fn ansi_render_lines(text: &str) -> Vec<RenderLine> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let mut chars = text.chars().peekable();
-    let mut current_style = CellStyle::default();
-    let mut line = Vec::new();
-    let mut styles = Vec::new();
-    let mut cursor = 0;
-    let mut lines = Vec::new();
+    let mut decoder = super::ansi_decoder::AnsiDecoder::default();
+    decoder.push(text.as_bytes());
+    decoder.finish();
+    decoder.lines()
+}
 
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\x1b' => match chars.next() {
-                Some('[') => {
-                    let mut parameters = String::new();
-                    let mut final_byte = None;
-                    for next in chars.by_ref() {
-                        if ('@'..='~').contains(&next) {
-                            final_byte = Some(next);
-                            break;
-                        }
-                        parameters.push(next);
-                    }
-                    if final_byte == Some('m') {
-                        apply_sgr(&parameters, &mut current_style);
-                    } else if final_byte == Some('K') {
-                        apply_erase_in_line(
-                            &parameters,
-                            &mut line,
-                            &mut styles,
-                            cursor,
-                            current_style,
-                        );
-                    }
-                }
-                Some(']') => {
-                    while let Some(next) = chars.next() {
-                        if next == '\x07' {
-                            break;
-                        }
-                        if next == '\x1b' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            },
-            '\r' if chars.peek() == Some(&'\n') => {
-                chars.next();
-                push_ansi_render_line(&mut lines, &mut line, &mut styles);
-                cursor = 0;
-            }
-            '\r' => cursor = 0,
-            '\n' => {
-                push_ansi_render_line(&mut lines, &mut line, &mut styles);
-                cursor = 0;
-            }
-            '\t' => {
-                // Keep the control character in the logical scene. Expanding
-                // it here loses the current physical column and cannot match
-                // the terminal's native tab stops when streamed PTY output is
-                // later reconstructed by the diff renderer.
-                write_ansi_scalar(&mut line, &mut styles, &mut cursor, '\t', current_style);
-            }
-            ch if !ch.is_control() => {
-                write_ansi_scalar(&mut line, &mut styles, &mut cursor, ch, current_style);
-            }
-            _ => {}
-        }
-    }
-    if !line.is_empty() {
-        push_ansi_render_line(&mut lines, &mut line, &mut styles);
-    }
-    lines
+/// Backend labels occupy one logical row and cannot control the terminal.
+pub(super) fn terminal_label(text: &str) -> String {
+    ansi_render_lines(text)
+        .into_iter()
+        .map(|line| line.text.replace('\t', " "))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub(super) fn push_ansi_render_line(
@@ -216,10 +154,60 @@ pub(super) fn apply_sgr(parameters: &str, style: &mut CellStyle) {
     }
 }
 
-pub(super) fn uses_alternate_screen(text: &str) -> bool {
-    ["\x1b[?1049h", "\x1b[?47h", "\x1b[?1047h"]
-        .iter()
-        .any(|sequence| text.contains(sequence))
+/// Retain main-screen bytes around a TUI rather than dropping the entire shell
+/// command. Parsing the mode changes also avoids matching CSI-looking text in
+/// OSC/DCS payloads. The retained bytes keep their original ANSI/UTF-8 encoding.
+pub(super) fn primary_screen_output(text: &str) -> String {
+    #[derive(Default)]
+    struct Mode {
+        alternate: bool,
+        changed: bool,
+    }
+    impl vte::Perform for Mode {
+        fn csi_dispatch(
+            &mut self,
+            params: &vte::Params,
+            intermediates: &[u8],
+            ignore: bool,
+            action: char,
+        ) {
+            if !ignore
+                && intermediates == b"?"
+                && matches!(action, 'h' | 'l')
+                && params.iter().any(|p| matches!(p, [47] | [1047] | [1049]))
+            {
+                let alternate = action == 'h';
+                self.changed = self.alternate != alternate;
+                self.alternate = alternate;
+            }
+        }
+        fn terminated(&self) -> bool {
+            self.changed
+        }
+    }
+    let mut parser = vte::Parser::new();
+    let mut mode = Mode::default();
+    let mut remaining = text.as_bytes();
+    let mut primary = Vec::new();
+    while !remaining.is_empty() {
+        let was_alternate = mode.alternate;
+        mode.changed = false;
+        let consumed = parser.advance_until_terminated(&mut mode, remaining);
+        let segment = &remaining[..consumed];
+        if !was_alternate {
+            let end = if mode.changed {
+                segment
+                    .iter()
+                    .rposition(|byte| *byte == 0x1b)
+                    .expect("mode CSI starts with ESC")
+            } else {
+                segment.len()
+            };
+            primary.extend_from_slice(&segment[..end]);
+        }
+        remaining = &remaining[consumed..];
+    }
+    String::from_utf8(primary).expect("retained slices of valid UTF-8")
 }
 
 pub(super) fn suffix_after_last_display_clear(text: &str) -> Option<&str> {
@@ -531,15 +519,115 @@ pub(super) fn palette_style(
 }
 
 pub(super) fn render_markdown(text: &str) -> String {
-    let text = markdown_preprocessor::preprocess_markdown(text);
+    render_markdown_at_width(text, None)
+}
+
+pub(super) fn render_markdown_at_width(text: &str, width: Option<usize>) -> String {
+    let text =
+        super::markdown_references::resolve(text, 0, &|| Ok(())).expect("uncancelled Markdown");
+    let text = markdown_preprocessor::preprocess_markdown(&text);
     let mut skin = termimad::MadSkin::default();
     skin.inline_code.object_style.background_color = None;
     skin.code_block.compound_style.object_style.background_color = None;
-    let mut rendered = skin.term_text(&text).to_string();
+    let mut rendered = match width {
+        Some(width) => skin.text(&text, Some(width.max(1))).to_string(),
+        None => skin.term_text(&text).to_string(),
+    };
     if !rendered.ends_with('\n') {
         rendered.push('\n');
     }
     rendered
+}
+
+/// Render with stable source-line identities. Termimad's wrapped rows retain
+/// slices into the preprocessed source, so width changes do not rename a row's
+/// source group. Synthetic rules/blank rows stay with the preceding group.
+pub(super) fn markdown_lines_with_groups(
+    text: &str,
+    visible_from: usize,
+    width: usize,
+    track_origins: bool,
+    check: &impl Fn() -> io::Result<()>,
+) -> io::Result<(
+    Vec<RenderLine>,
+    Vec<usize>,
+    Vec<crate::terminal_renderer::managed::LineOrigins>,
+)> {
+    use std::fmt::Write as _;
+    check()?;
+    let resolved = super::markdown_references::resolve(text, visible_from, check)?;
+    let source = markdown_preprocessor::preprocess_markdown(&resolved);
+    check()?;
+    let mut skin = termimad::MadSkin::default();
+    skin.inline_code.object_style.background_color = None;
+    skin.code_block.compound_style.object_style.background_color = None;
+    let formatted = skin.text(&source, Some(width.max(1)));
+    check()?;
+    let line_ends = source
+        .match_indices('\n')
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    let base = source.as_ptr() as usize;
+    let source_group = |part: &str| {
+        let offset = (part.as_ptr() as usize).checked_sub(base)?;
+        (offset <= source.len()).then(|| line_ends.partition_point(|end| *end < offset) + 1)
+    };
+    struct DisplayLine<'a, 's>(&'a termimad::MadSkin, &'a termimad::FmtLine<'s>, usize);
+    impl std::fmt::Display for DisplayLine<'_, '_> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0
+                .write_fmt_line(formatter, self.1, Some(self.2), false)
+        }
+    }
+    let mut lines = Vec::new();
+    let mut groups = Vec::new();
+    let mut origins = Vec::new();
+    let mut group = 0;
+    for line in &formatted.lines {
+        check()?;
+        let origin = match line {
+            termimad::FmtLine::Normal(composite) => composite
+                .compounds
+                .iter()
+                .filter_map(|part| source_group(part.src))
+                .min(),
+            termimad::FmtLine::TableRow(row) => row
+                .cells
+                .iter()
+                .flat_map(|cell| &cell.compounds)
+                .filter_map(|part| source_group(part.src))
+                .min(),
+            _ => None,
+        };
+        group = group.max(origin.unwrap_or(group));
+        let (rendered, source_rows) = if track_origins {
+            let mut writer = super::markdown_source::SourceWriter::new(&source);
+            writeln!(&mut writer, "{}", DisplayLine(&skin, line, width))
+                .expect("String formatting cannot fail");
+            (ansi_render_lines(&writer.text), writer.character_rows())
+        } else {
+            (
+                ansi_render_lines(&format!("{}\n", DisplayLine(&skin, line, width))),
+                Vec::new(),
+            )
+        };
+        debug_assert!(!track_origins || source_rows.len() == rendered.len());
+        origins.extend(
+            source_rows
+                .into_iter()
+                .zip(&rendered)
+                .map(|(characters, row)| {
+                    debug_assert_eq!(characters.len(), row.text.chars().count());
+                    crate::terminal_renderer::managed::LineOrigins {
+                        characters: characters.into(),
+                        preserve_columns: matches!(line, termimad::FmtLine::TableRow(_)),
+                    }
+                }),
+        );
+        groups.extend(std::iter::repeat_n(group, rendered.len()));
+        lines.extend(rendered);
+    }
+    Ok((lines, groups, origins))
 }
 
 pub(super) fn char_len(text: &str) -> usize {
@@ -561,4 +649,23 @@ pub(super) fn byte_offset(text: &str, char_offset: usize) -> usize {
         .nth(char_offset)
         .map(|(offset, _)| offset)
         .unwrap_or(text.len())
+}
+
+#[cfg(test)]
+mod primary_tests {
+    use super::primary_screen_output;
+
+    #[test]
+    fn primary_slices_keep_styles_unicode_and_combined_private_modes() {
+        let text = "\x1b[32mдо\x1b[0m\r\n\x1b[?25;1049hTUI\x1b[2J\x1b[?1049lпосле\r\n\x1b[?47hsecond\x1b[?47lend";
+        assert_eq!(
+            primary_screen_output(text),
+            "\x1b[32mдо\x1b[0m\r\nпосле\r\nend"
+        );
+        assert_eq!(
+            primary_screen_output("prefix\x1b[?1047hunfinished TUI"),
+            "prefix"
+        );
+        assert_eq!(primary_screen_output("plain\x1b[?1049"), "plain\x1b[?1049");
+    }
 }

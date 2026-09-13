@@ -29,6 +29,13 @@ impl CancellationEvent {
         self.cancelled.load(Ordering::SeqCst)
     }
 
+    /// Usable by a scoped network future without a detached watcher thread.
+    pub(crate) async fn cancelled(&self) {
+        while !self.cancel_if_interrupted() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     pub(crate) fn cancel_if_interrupted(&self) -> bool {
         if take_sigint_request() {
             self.cancel();

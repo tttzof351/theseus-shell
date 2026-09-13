@@ -14,7 +14,7 @@ pub(super) struct RawModeGuard {
 
 impl RawModeGuard {
     pub(super) fn enable_if_terminal() -> io::Result<Self> {
-        if std::io::stdin().is_terminal() {
+        if std::io::stdin().is_terminal() && !crossterm::terminal::is_raw_mode_enabled()? {
             enable_raw_mode()?;
             Ok(Self { enabled: true })
         } else {

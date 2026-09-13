@@ -1,7 +1,7 @@
-use std::{error::Error, io, sync::mpsc, thread, time::Duration};
+use std::{error::Error, io, thread, time::Duration};
 
 use reqwest::{
-    blocking::{Client, RequestBuilder},
+    Client, RequestBuilder,
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use serde_json::{Value, json};
@@ -40,10 +40,16 @@ impl Agent {
         let message_count = messages.len();
         let request = self.build_completion_request_with_tools(messages, include_tools)?;
 
-        let _progress = Spinner::start();
+        let _progress = self.output.is_none().then(Spinner::start);
         let mut last_error = None;
 
         for attempt in 1..=self.llm_request_retries {
+            if let Some(output) = &self.output {
+                output.activity(
+                    "Waiting for response",
+                    &format!("attempt {attempt}/{}", self.llm_request_retries),
+                )?;
+            }
             if cancellation.cancel_if_interrupted() {
                 self.log_event(
                     "info",
@@ -102,37 +108,24 @@ impl Agent {
         purpose: &str,
         cancellation: &crate::common::cancellation::CancellationEvent,
     ) -> io::Result<TrajectoryMessage> {
-        let agent = self.clone();
-        let request = request.clone();
-        let purpose = purpose.to_string();
-        let (tx, rx) = mpsc::channel();
-
-        thread::spawn(move || {
-            let _ =
-                tx.send(agent.request_completion_once(message_count, &request, attempt, &purpose));
-        });
-
-        loop {
-            if cancellation.cancel_if_interrupted() {
-                self.log_event(
-                    "info",
-                    "llm_request_interrupted",
-                    json!({ "attempt": attempt }),
-                );
-                return Err(interrupted_error());
-            }
-
-            match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(result) => return result,
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(io::Error::other("LLM request worker stopped unexpectedly"));
+        // The request future and its runtime are owned by this call. Dropping the
+        // losing branch closes the response before the worker acknowledges cancel.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    self.log_event("info", "llm_request_interrupted", json!({ "attempt": attempt }));
+                    Err(interrupted_error())
                 }
+                result = self.request_completion_once(message_count, request, attempt, purpose) => result,
             }
-        }
+        })
     }
 
-    fn request_completion_once(
+    async fn request_completion_once(
         &self,
         message_count: usize,
         request: &Value,
@@ -156,6 +149,7 @@ impl Agent {
             .apply_headers(self.client.post(&self.base_url))?
             .json(&request)
             .send()
+            .await
             .map_err(io_other)?;
 
         let status = response.status();
@@ -169,7 +163,7 @@ impl Agent {
             }),
         );
 
-        let body_bytes = response.bytes().map_err(|err| {
+        let body_bytes = response.bytes().await.map_err(|err| {
             self.log_event(
                 "error",
                 "llm_response_body_read_failed",
@@ -663,6 +657,93 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_interrupts_an_in_progress_retry_backoff() {
+        use crate::common::cancellation::CancellationEvent;
+        use std::sync::mpsc;
+        let cancellation = CancellationEvent::new();
+        let worker_cancel = cancellation.clone();
+        let (started_tx, started) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let interrupted = sleep_cancellable(Duration::from_secs(5), &worker_cancel);
+            let _ = done_tx.send(interrupted);
+        });
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let pending = done.recv_timeout(Duration::from_millis(50));
+        let at_cancel = Instant::now();
+        cancellation.cancel();
+        let interrupted = done.recv_timeout(Duration::from_millis(250));
+        worker.join().unwrap();
+        assert_eq!(
+            pending,
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "backoff did not wait"
+        );
+        assert!(interrupted.unwrap());
+        assert!(at_cancel.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn cancellation_closes_http_before_headers_and_during_body() {
+        for send_headers in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let cancellation = crate::common::cancellation::CancellationEvent::new();
+            let server_cancel = cancellation.clone();
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "request never arrived");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(err) => panic!("accept: {err}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                read_http_json_request(&mut stream);
+                if send_headers {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 99999\r\n\r\n{\"choices\": [").unwrap();
+                }
+                server_cancel.cancel();
+                let started = Instant::now();
+                // Success requires the actual socket to close, not just the
+                // caller abandoning a detached blocking request.
+                match stream.read(&mut [0; 1]) {
+                    Ok(0) => {}
+                    Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
+                    other => panic!("request survived cancellation: {other:?}"),
+                }
+                assert!(started.elapsed() < Duration::from_secs(1));
+            });
+            let mut config = AgentConfig::default_empty();
+            config.llm_request_settings.base_url = format!("http://{address}/chat");
+            let agent = Agent::new(config);
+            let error = agent
+                .request_completion_once_cancellable(
+                    0,
+                    &json!({"messages": []}),
+                    1,
+                    "test",
+                    &cancellation,
+                )
+                .unwrap_err();
+            server.join().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        }
+    }
+
+    #[test]
     fn reports_ox_provider_network_error_from_native_finish_reason() {
         let response = parse_chat_response_body(
             r#"
@@ -711,6 +792,12 @@ mod tests {
                     }
                     Err(error) => panic!("mock server accept failed: {error}"),
                 };
+                // Accepted sockets inherit O_NONBLOCK on macOS. The fixture
+                // reads a complete request, so use a bounded blocking read.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
                 let request = read_http_json_request(&mut stream);
                 server_requests.lock().unwrap().push(request);
                 let body = json!({

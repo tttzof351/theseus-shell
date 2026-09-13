@@ -610,6 +610,14 @@ impl UnifiedEditor {
     }
 
     pub(super) fn handle_paste(&mut self, text: &str) -> EditorOutcome {
+        self.paste(text, true)
+    }
+
+    pub(super) fn handle_draft_paste(&mut self, text: &str) -> EditorOutcome {
+        self.paste(text, false)
+    }
+
+    fn paste(&mut self, text: &str, allow_submit: bool) -> EditorOutcome {
         if self.history_is_browsing() {
             return EditorOutcome::Changed;
         }
@@ -625,7 +633,8 @@ impl UnifiedEditor {
         self.buffer.insert_text(text);
         self.completion = None;
         let ended_with_newline = text.ends_with(['\r', '\n']);
-        if self.mode == EditorMode::Command
+        if allow_submit
+            && self.mode == EditorMode::Command
             && ended_with_newline
             && !shell::input_syntax::should_read_shell_continuation(&self.buffer.text())
         {

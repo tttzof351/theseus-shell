@@ -1,5 +1,8 @@
 //! Virtual-screen layout and physical terminal diff engine.
 
+pub(crate) mod managed;
+mod publication;
+
 use std::io::{self, Write};
 
 use crossterm::{
@@ -255,6 +258,9 @@ pub struct CachedLogicalLayout {
     pub styles: Vec<CellStyle>,
     pub cursor_offset: Option<usize>,
     pub rows: Vec<PhysicalRow>,
+    pub text_characters: Vec<char>,
+    pub row_text_ranges: Vec<std::ops::Range<usize>>,
+    pub prefix_width: usize,
     pub cursor: Option<PhysicalPosition>,
 }
 
@@ -269,6 +275,7 @@ impl CachedLogicalLayout {
     ) -> Self {
         let mut builder = LayoutBuilder::new(width);
         builder.write_prompt(prefix, prefix_styles);
+        let prefix_width = builder.column;
         builder.write_line(text, cursor_offset, styles);
         Self {
             prefix: prefix.to_string(),
@@ -277,6 +284,9 @@ impl CachedLogicalLayout {
             styles: styles.to_vec(),
             cursor_offset,
             rows: builder.rows,
+            text_characters: text.chars().collect(),
+            row_text_ranges: builder.row_text_ranges,
+            prefix_width,
             cursor: builder.cursor,
         }
     }
@@ -376,6 +386,18 @@ pub struct IndexedPhysicalLayout {
 
 impl IndexedPhysicalLayout {
     pub fn layout(&mut self, screen: &VirtualScreen, size: TerminalSize) -> PhysicalTerminal {
+        self.layout_checked(screen, size, &|| Ok(()))
+            .expect("uncancelled physical layout")
+    }
+
+    /// Cancellation may leave this cache incomplete; discard it on error.
+    pub(crate) fn layout_checked(
+        &mut self,
+        screen: &VirtualScreen,
+        size: TerminalSize,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<PhysicalTerminal> {
+        check()?;
         debug_assert_eq!(screen.lines.len(), screen.prefixes.len());
         let geometry_changed = self.width != size.width;
         if geometry_changed {
@@ -395,6 +417,7 @@ impl IndexedPhysicalLayout {
         let length_changed = old_length != new_length;
 
         for index in dirty_from..common_length {
+            check()?;
             let cursor_offset = (screen.cursor.line == index).then_some(screen.cursor.char_offset);
             if self.logical_lines[index].matches(
                 &screen.prefixes[index],
@@ -422,6 +445,7 @@ impl IndexedPhysicalLayout {
 
         self.logical_lines.truncate(new_length);
         for index in common_length..new_length {
+            check()?;
             self.logical_lines.push(CachedLogicalLayout::build(
                 &screen.prefixes[index],
                 &screen.lines[index],
@@ -438,6 +462,7 @@ impl IndexedPhysicalLayout {
                 .rebuild(self.logical_lines.iter().map(|line| line.rows.len()));
         }
 
+        check()?;
         let cursor_line = &self.logical_lines[screen.cursor.line];
         let relative_cursor = cursor_line
             .cursor
@@ -459,7 +484,7 @@ impl IndexedPhysicalLayout {
             })
             .collect();
 
-        PhysicalTerminal {
+        Ok(PhysicalTerminal {
             size,
             rows,
             cursor: PhysicalCursor {
@@ -470,7 +495,7 @@ impl IndexedPhysicalLayout {
                 visible: screen.cursor_visible,
             },
             viewport_top,
-        }
+        })
     }
 }
 
@@ -531,6 +556,7 @@ pub struct LayoutBuilder {
     pub row: usize,
     pub column: usize,
     pub cursor: Option<PhysicalPosition>,
+    pub row_text_ranges: Vec<std::ops::Range<usize>>,
 }
 
 impl LayoutBuilder {
@@ -541,11 +567,13 @@ impl LayoutBuilder {
             row: 0,
             column: 0,
             cursor: None,
+            row_text_ranges: std::iter::once(0..0).collect(),
         }
     }
 
     pub fn start_row(&mut self) {
         self.rows.push(PhysicalRow::empty(self.width));
+        self.row_text_ranges.push(0..0);
         self.row = self.rows.len() - 1;
         self.column = 0;
     }
@@ -600,6 +628,11 @@ impl LayoutBuilder {
                 });
             }
 
+            if self.row_text_ranges[self.row].is_empty() {
+                self.row_text_ranges[self.row].start = char_offset;
+            }
+            self.row_text_ranges[self.row].end = char_offset + 1;
+
             if width == 0 {
                 self.append_zero_width(rendered);
             } else if rendered == '\t' {
@@ -621,6 +654,7 @@ impl LayoutBuilder {
         if cursor_offset == Some(char_offset) {
             if self.column == self.width {
                 self.start_row();
+                self.row_text_ranges[self.row] = char_offset..char_offset;
             }
             self.cursor = Some(PhysicalPosition {
                 row: self.row,

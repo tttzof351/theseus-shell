@@ -15,6 +15,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, native_pty_system};
 #[cfg(unix)]
 use std::fs::OpenOptions;
 
+use super::output::{LegacyOutput, PtyOutput};
 #[cfg(unix)]
 use super::platform::NonBlockingFileGuard;
 use super::platform::{RawModeGuard, current_pty_size, interactive_shell_args};
@@ -108,20 +109,40 @@ impl PersistentShellSession {
     }
 
     pub fn run_command(&mut self, command: &str) -> io::Result<CommandOutput> {
+        self.run_command_inner(command, None, None)
+    }
+
+    pub(crate) fn run_command_with_terminal(
+        &mut self,
+        command: &str,
+        input: crate::common::terminal_input::SharedInput,
+        output: &mut dyn PtyOutput,
+    ) -> io::Result<CommandOutput> {
+        self.run_command_inner(command, Some(input), Some(output))
+    }
+
+    fn run_command_inner(
+        &mut self,
+        command: &str,
+        input: Option<crate::common::terminal_input::SharedInput>,
+        output: Option<&mut dyn PtyOutput>,
+    ) -> io::Result<CommandOutput> {
         self.ensure_shell_is_running()?;
         self.resize_to_current_terminal()?;
 
         let payload = self.command_payload(command);
         self.write_to_shell(payload.as_bytes())?;
 
-        let stream_output = io::stdout().is_terminal();
+        let stream_output = output.is_some() || io::stdout().is_terminal();
         let _raw_mode = RawModeGuard::enable_if_terminal()?;
-        let stop_input = Arc::new(AtomicBool::new(false));
-        let input_thread =
-            spawn_input_forwarder(Arc::clone(&self.writer), Arc::clone(&stop_input))?;
-        let completed = self.read_until_sentinel(&payload, stream_output);
-        stop_input.store(true, Ordering::Relaxed);
-        let _ = input_thread.map(|thread| thread.join());
+        let mut input_forwarder = InputForwarder::start(Arc::clone(&self.writer), input)?;
+        let completed = match output {
+            Some(output) => {
+                self.read_until_sentinel_streaming(&payload, output, Some(&mut input_forwarder))
+            }
+            None => self.read_until_sentinel(&payload, stream_output, Some(&mut input_forwarder)),
+        };
+        input_forwarder.stop()?;
         let completed = completed?;
 
         Ok(CommandOutput {
@@ -167,7 +188,7 @@ impl PersistentShellSession {
         self.resize_to_current_terminal()?;
         let payload = self.command_payload(command);
         self.write_to_shell(payload.as_bytes())?;
-        let completed = self.read_until_sentinel(&payload, false)?;
+        let completed = self.read_until_sentinel(&payload, false, None)?;
 
         Ok(CommandOutput {
             transcript: completed.transcript,
@@ -187,7 +208,7 @@ impl PersistentShellSession {
              PS2=''",
         );
         self.write_to_shell(payload.as_bytes())?;
-        let _ = self.read_until_sentinel(&payload, false)?;
+        let _ = self.read_until_sentinel(&payload, false, None)?;
         self.drain_pending_output();
 
         Ok(())
@@ -212,9 +233,12 @@ impl PersistentShellSession {
         &mut self,
         payload: &str,
         stream_output: bool,
+        input: Option<&mut InputForwarder>,
     ) -> io::Result<CompletedCommand> {
         if stream_output {
-            return self.read_until_sentinel_streaming(payload);
+            return terminal_output::with_stdout(|output| {
+                self.read_until_sentinel_streaming(payload, &mut LegacyOutput(output), input)
+            });
         }
 
         let mut pending = Vec::new();
@@ -232,6 +256,9 @@ impl PersistentShellSession {
 
             pending.extend_from_slice(&chunk);
             if let Some(mut completed) = parse_completed_command(&pending, &self.nonce) {
+                if let Some(input) = input {
+                    input.stop()?;
+                }
                 strip_echoed_payload(&mut completed.transcript, payload);
                 if transcript.is_empty() && strip_initial_separator {
                     let _ = strip_initial_shell_separators(&mut completed.transcript);
@@ -265,12 +292,18 @@ impl PersistentShellSession {
         }
     }
 
-    fn read_until_sentinel_streaming(&mut self, payload: &str) -> io::Result<CompletedCommand> {
+    fn read_until_sentinel_streaming(
+        &mut self,
+        payload: &str,
+        output: &mut dyn PtyOutput,
+        input: Option<&mut InputForwarder>,
+    ) -> io::Result<CompletedCommand> {
         let mut pending = Vec::new();
         let mut transcript = Vec::new();
         let mut strip_initial_separator = true;
         loop {
-            let chunk = self.recv_shell_chunk()?;
+            let chunk =
+                self.recv_shell_chunk_notifying_resize(|| output.resized(current_pty_size()))?;
             if chunk.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -280,19 +313,22 @@ impl PersistentShellSession {
 
             pending.extend_from_slice(&chunk);
             if let Some(mut completed) = parse_completed_command(&pending, &self.nonce) {
+                // Stop stdin before final rendering/draining. Bytes typed once
+                // completion is known belong to the returning managed editor.
+                if let Some(input) = input {
+                    input.stop()?;
+                }
                 strip_echoed_payload(&mut completed.transcript, payload);
                 if transcript.is_empty() && strip_initial_separator {
                     let _ = strip_initial_shell_separators(&mut completed.transcript);
                 }
                 let needs_prompt_separator =
                     output_ends_with_unfinished_visible_line(&transcript, &completed.transcript);
-                terminal_output::with_stdout(|stdout| {
-                    stdout.write_all(&completed.transcript)?;
-                    if needs_prompt_separator {
-                        stdout.write_all(b"\r\n")?;
-                    }
-                    stdout.flush()
-                })?;
+                output.write_all(&completed.transcript)?;
+                if needs_prompt_separator {
+                    output.write_all(b"\r\n")?;
+                }
+                output.flush()?;
                 transcript.extend_from_slice(&completed.transcript);
                 completed.transcript = transcript;
                 self.drain_pending_output();
@@ -316,10 +352,8 @@ impl PersistentShellSession {
             }
             let safe_len = streamable_prefix_len(&pending, &self.nonce);
             if safe_len > 0 {
-                terminal_output::with_stdout(|stdout| {
-                    stdout.write_all(&pending[..safe_len])?;
-                    stdout.flush()
-                })?;
+                output.write_all(&pending[..safe_len])?;
+                output.flush()?;
                 transcript.extend_from_slice(&pending[..safe_len]);
                 pending.drain(..safe_len);
             }
@@ -327,12 +361,20 @@ impl PersistentShellSession {
     }
 
     fn recv_shell_chunk(&mut self) -> io::Result<Vec<u8>> {
+        self.recv_shell_chunk_notifying_resize(|| Ok(()))
+    }
+
+    fn recv_shell_chunk_notifying_resize(
+        &mut self,
+        mut resized: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Vec<u8>> {
         loop {
             match self.event_rx.recv() {
                 Ok(event) => {
-                    if let Some(chunk) =
-                        handle_shell_event(event, || self.resize_to_current_terminal())?
-                    {
+                    if let Some(chunk) = handle_shell_event(event, || {
+                        self.resize_to_current_terminal()?;
+                        resized()
+                    })? {
                         return Ok(chunk);
                     }
                 }
@@ -468,11 +510,46 @@ fn spawn_resize_thread(
 fn spawn_input_forwarder(
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     stop: Arc<AtomicBool>,
+    input: Option<crate::common::terminal_input::SharedInput>,
 ) -> io::Result<Option<thread::JoinHandle<()>>> {
+    if let Some(input) = input {
+        return Ok(Some(thread::spawn(move || {
+            let mut buffer = [0; 8192];
+            while !stop.load(Ordering::Acquire) {
+                let Ok(mut input) = input.lock() else {
+                    break;
+                };
+                let count = match input.read_raw(&mut buffer, Duration::from_millis(5)) {
+                    Ok(count) => count,
+                    Err(_) => break,
+                };
+                if stop.load(Ordering::Acquire) {
+                    input.return_raw(&buffer[..count]);
+                    break;
+                }
+                if count > 0 {
+                    let Ok(mut writer) = writer.lock() else {
+                        input.return_raw(&buffer[..count]);
+                        break;
+                    };
+                    if stop.load(Ordering::Acquire) {
+                        input.return_raw(&buffer[..count]);
+                        break;
+                    }
+                    if writer
+                        .write_all(&buffer[..count])
+                        .and_then(|()| writer.flush())
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        })));
+    }
     if !io::stdin().is_terminal() {
         return Ok(None);
     }
-
     let tty = OpenOptions::new().read(true).open("/dev/tty")?;
     let mut tty = NonBlockingFileGuard::enable(tty)?;
 
@@ -503,10 +580,43 @@ fn spawn_input_forwarder(
     })))
 }
 
+struct InputForwarder {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl InputForwarder {
+    fn start(
+        writer: Arc<Mutex<Box<dyn Write + Send>>>,
+        input: Option<crate::common::terminal_input::SharedInput>,
+    ) -> io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = spawn_input_forwarder(writer, Arc::clone(&stop), input)?;
+        Ok(Self { stop, thread })
+    }
+
+    fn stop(&mut self) -> io::Result<()> {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| io::Error::other("shell input forwarder panicked"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for InputForwarder {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
 #[cfg(not(unix))]
 fn spawn_input_forwarder(
     _writer: Arc<Mutex<Box<dyn Write + Send>>>,
     _stop: Arc<AtomicBool>,
+    _input: Option<crate::common::terminal_input::SharedInput>,
 ) -> io::Result<Option<thread::JoinHandle<()>>> {
     Ok(None)
 }
@@ -1217,6 +1327,105 @@ mod tests {
         strip_echoed_payload(&mut transcript, payload);
 
         assert_eq!(transcript, b"* dev\r\n  master");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sentinel_stops_input_before_final_output_and_preserves_next_paste() {
+        use crate::common::terminal_input::TerminalInput;
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
+        struct BoundaryOutput {
+            stop: Arc<AtomicBool>,
+            sender: UnixStream,
+            sent: bool,
+            paste: Vec<u8>,
+        }
+        impl Write for BoundaryOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes == b"\r\n" && !self.sent {
+                    assert!(
+                        self.stop.load(Ordering::Acquire),
+                        "stdin still forwarded after sentinel"
+                    );
+                    self.sender.write_all(&self.paste)?;
+                    self.sent = true;
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl PtyOutput for BoundaryOutput {
+            fn resized(&mut self, _: portable_pty::PtySize) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for shell in available_shells() {
+            let (mut session, _home) = start_clean_test_session(&shell);
+            let (reader, sender) = UnixStream::pair().unwrap();
+            reader.set_nonblocking(true).unwrap();
+            let input = TerminalInput::from_test_file(OwnedFd::from(reader).into());
+            let mut forwarding =
+                InputForwarder::start(Arc::clone(&session.writer), Some(Arc::clone(&input)))
+                    .unwrap();
+            let paste = "\x1b[200~NEXT_DRAFT\r\nПривет\x03\x1b[201~Z"
+                .as_bytes()
+                .to_vec();
+            let mut output = BoundaryOutput {
+                stop: Arc::clone(&forwarding.stop),
+                sender,
+                sent: false,
+                paste: paste.clone(),
+            };
+            let payload = session.command_payload("printf EDGE");
+            session.write_to_shell(payload.as_bytes()).unwrap();
+            let completed = session
+                .read_until_sentinel_streaming(&payload, &mut output, Some(&mut forwarding))
+                .unwrap();
+            assert_eq!(completed.status_code, 0, "{shell}");
+            assert!(
+                output.sent,
+                "fixture did not reach the post-sentinel separator: {shell}"
+            );
+            assert!(
+                forwarding.thread.is_none(),
+                "forwarder not joined at sentinel"
+            );
+            let mut bytes = vec![0; paste.len()];
+            let count = input
+                .lock()
+                .unwrap()
+                .read_raw(&mut bytes, Duration::ZERO)
+                .unwrap();
+            assert_eq!(
+                &bytes[..count],
+                paste,
+                "next editor input was lost to {shell}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_forwarder_is_stopped_and_joined_during_unwind() {
+        let (tx, rx) = mpsc::channel();
+        let result = crate::common::panic_boundary::catch(|| {
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let worker = thread::spawn(move || {
+                while !worker_stop.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                tx.send(()).unwrap();
+            });
+            let _forwarding = InputForwarder {
+                stop,
+                thread: Some(worker),
+            };
+            panic!("injected terminal writer panic");
+        });
+        assert!(result.is_err());
+        assert_eq!(rx.try_recv(), Ok(()));
     }
 
     #[cfg(unix)]

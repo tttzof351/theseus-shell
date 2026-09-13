@@ -24,19 +24,44 @@ struct LoggerInner {
 impl AppLogger {
     pub fn start_session() -> io::Result<Self> {
         let logs_dir = default_logs_dir()?;
-        fs::create_dir_all(&logs_dir)?;
+        Self::start_session_in(&logs_dir, &session_timestamp())
+    }
 
-        let timestamp = session_timestamp();
-        let logger = Self {
-            inner: Arc::new(LoggerInner {
-                log_path: logs_dir.join(format!("{timestamp}_log.jsonl")),
-                trajectory_path: logs_dir.join(format!("{timestamp}_trajectory.json")),
-                lock: Mutex::new(()),
-            }),
-        };
-
-        logger.event("info", "session_start", json!({}))?;
-        Ok(logger)
+    fn start_session_in(logs_dir: &Path, timestamp: &str) -> io::Result<Self> {
+        fs::create_dir_all(logs_dir)?;
+        // Reserve the name atomically, including across Theseus processes.
+        // Reset/compact/model changes may start several sessions in one second.
+        for sequence in 0u64.. {
+            let name = if sequence == 0 {
+                timestamp.to_string()
+            } else {
+                format!("{timestamp}-{sequence:06}")
+            };
+            let log_path = logs_dir.join(format!("{name}_log.jsonl"));
+            let trajectory_path = logs_dir.join(format!("{name}_trajectory.json"));
+            if trajectory_path.try_exists()? {
+                continue;
+            }
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&log_path)
+            {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+            let logger = Self {
+                inner: Arc::new(LoggerInner {
+                    log_path,
+                    trajectory_path,
+                    lock: Mutex::new(()),
+                }),
+            };
+            logger.event("info", "session_start", json!({}))?;
+            return Ok(logger);
+        }
+        Err(io::Error::other("session name space exhausted"))
     }
 
     pub fn log_path(&self) -> &Path {
@@ -117,6 +142,52 @@ fn event_timestamp() -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn sessions_with_the_same_timestamp_reserve_distinct_files_and_preserve_old_trajectories() {
+        let temp = env::temp_dir().join(format!(
+            "theseus-log-reservation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let timestamp = "2026-09-13-01-02-03";
+        let old = temp.join(format!("{timestamp}_trajectory.json"));
+        fs::write(&old, "existing trajectory without a log").unwrap();
+        let workers = (0..8)
+            .map(|index| {
+                let path = temp.clone();
+                std::thread::spawn(move || {
+                    let logger = AppLogger::start_session_in(&path, timestamp).unwrap();
+                    logger
+                        .write_trajectory(&json!([{"role":"user", "content":index}]))
+                        .unwrap();
+                    (
+                        logger.log_path().to_path_buf(),
+                        logger.trajectory_path().to_path_buf(),
+                        index,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut paths = std::collections::HashSet::new();
+        for worker in workers {
+            let (log, trajectory, index) = worker.join().unwrap();
+            assert!(paths.insert(log.clone()));
+            let snapshot: Value =
+                serde_json::from_str(&fs::read_to_string(trajectory).unwrap()).unwrap();
+            assert_eq!(snapshot["messages"][0]["content"], index);
+            assert_eq!(fs::read_to_string(log).unwrap().lines().count(), 1);
+        }
+        assert_eq!(
+            fs::read_to_string(old).unwrap(),
+            "existing trajectory without a log"
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
 
     #[test]
     fn session_timestamp_is_file_name_safe() {

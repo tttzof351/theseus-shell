@@ -43,7 +43,15 @@ struct RemovedCompactItem {
 }
 
 impl Agent {
+    #[cfg(test)]
     pub(crate) fn compact_context(&mut self) -> io::Result<CompactOutcome> {
+        self.compact_context_cancellable(&CancellationEvent::new())
+    }
+
+    pub(crate) fn compact_context_cancellable(
+        &mut self,
+        cancellation: &CancellationEvent,
+    ) -> io::Result<CompactOutcome> {
         if self.chat_message_count() <= 2 {
             return Ok(CompactOutcome::AlreadyMinimal);
         }
@@ -71,11 +79,17 @@ impl Agent {
         );
 
         let old_trajectory = self.trajectory.clone();
-        let summary_result = self.request_compaction_summary()?;
+        let summary_result = self.request_compaction_summary(cancellation)?;
         let recent_user_messages = collect_recent_user_messages(
             &old_trajectory,
             self.compact_recent_user_messages_max_bytes,
         );
+        if cancellation.cancel_if_interrupted() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "interrupted by user",
+            ));
+        }
         self.trajectory = compacted_trajectory(
             self.model_name(),
             self.system_prompt.clone(),
@@ -107,7 +121,10 @@ impl Agent {
             .unwrap_or((None, None))
     }
 
-    fn request_compaction_summary(&self) -> io::Result<CompactionSummaryResult> {
+    fn request_compaction_summary(
+        &self,
+        cancellation: &CancellationEvent,
+    ) -> io::Result<CompactionSummaryResult> {
         let mut messages = self
             .trajectory
             .iter()
@@ -121,7 +138,7 @@ impl Agent {
                 messages.clone(),
                 false,
                 "compact",
-                &CancellationEvent::new(),
+                cancellation,
             ) {
                 Ok(message) => break message,
                 Err(err)

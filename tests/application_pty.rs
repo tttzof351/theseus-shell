@@ -216,6 +216,19 @@ fn screen_text(bytes: &[u8]) -> String {
     screen_rows(bytes).join("\n")
 }
 
+#[test]
+fn shell_handoff_preserves_input_sent_in_same_write_as_command_enter() -> io::Result<()> {
+    let mut app = ApplicationPty::start()?;
+    app.write("read value; printf 'RECEIVED=%s\\n' \"$value\"\rimmediate-stdin\r")?;
+    app.wait_until(|bytes| {
+        screen_rows(bytes)
+            .iter()
+            .any(|row| row == "RECEIVED=immediate-stdin")
+            && settled_prompt_is_visible(bytes)
+    })?;
+    app.exit()
+}
+
 fn screen_rows(bytes: &[u8]) -> Vec<String> {
     let mut parser = vt100::Parser::new(SIZE.rows, SIZE.cols, 0);
     parser.process(bytes);
@@ -359,6 +372,333 @@ fn interrupted_agent_fixture() -> io::Result<(PathBuf, thread::JoinHandle<()>)> 
     )?;
 
     Ok((home, server))
+}
+
+struct HeldJsonResponse {
+    ready: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+    server: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for HeldJsonResponse {
+    fn drop(&mut self) {
+        let _ = self.release.send(());
+        if let Some(server) = self.server.take() {
+            let _ = server.join();
+        }
+    }
+}
+
+fn held_json_fixture() -> io::Result<(PathBuf, HeldJsonResponse)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let address = listener.local_addr()?;
+    let (ready_tx, ready) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return,
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(WAIT_TIMEOUT)).unwrap();
+        stream.set_write_timeout(Some(WAIT_TIMEOUT)).unwrap();
+        let mut request = [0; 8192];
+        if stream.read(&mut request).unwrap_or(0) == 0 {
+            return;
+        }
+        let _ = ready_tx.send(());
+        let _ = release_rx.recv_timeout(WAIT_TIMEOUT);
+        let body = serde_json::json!({"choices":[{"message":{"role":"assistant","content":"**HELD_ANSWER**"},"finish_reason":"stop"}]}).to_string();
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+    });
+    let home = temp_home()?;
+    fs::create_dir_all(home.join(".theseus"))?;
+    fs::write(
+        home.join(".theseus/config.jsonc"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "llm_request_settings": {
+                "base_url": format!("http://{address}/chat"), "retries": 1,
+                "request_timeout_seconds": 30, "connect_timeout_seconds": 5,
+                "body": {"model": "test/model"}, "header": {"Authorization": "Bearer test"}
+            },
+            "agent_settings": {"max_turns": 2, "max_tool_output_bytes": 32768, "max_tool_bash_bytes": 8192, "max_context_tokens": 200000, "max_resume_traj": 100, "build_in_tools": [], "system_prompt": ["test"]},
+            "mcp_servers": {}
+        }))?,
+    )?;
+    Ok((
+        home,
+        HeldJsonResponse {
+            ready,
+            release,
+            server: Some(server),
+        },
+    ))
+}
+
+#[test]
+fn managed_mcp_startup_and_discovery_keep_resize_draft_and_cancel_responsive() -> io::Result<()> {
+    for phase in ["initialize", "tools/list"] {
+        let home = temp_home()?;
+        fs::create_dir_all(home.join(".theseus"))?;
+        let marker = home.join("mcp-phase");
+        fs::write(
+            home.join(".theseus/config.jsonc"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "llm_request_settings": {
+                "base_url": "http://127.0.0.1:1/chat", "retries": 1,
+                "request_timeout_seconds": 30, "connect_timeout_seconds": 5,
+                "body": {"model": "test/model"}, "header": {"Authorization": "Bearer fixture"}
+            },
+            "agent_settings": {"max_turns": 2, "max_tool_output_bytes": 32768, "max_tool_bash_bytes": 8192, "max_context_tokens": 200000, "max_resume_traj": 100, "build_in_tools": [], "system_prompt": ["test"]},
+                "mcp_servers": {"held": {
+                "command": "python3",
+                    "args": [format!("{}/tests/fixtures/stalled_mcp.py", env!("CARGO_MANIFEST_DIR")), phase, marker],
+                "tools": ["*"], "timeout": 60000
+                }}
+            }))?,
+        )?;
+        let mut app =
+            ApplicationPty::start_with_home_and_cwd(home, Path::new(env!("CARGO_MANIFEST_DIR")))?;
+        app.write("/ask held discovery\r")?;
+        app.wait_until(|bytes| {
+            marker.exists() && screen_text(bytes).contains("Discovering MCP tools")
+        })?;
+        let pid: i32 = fs::read_to_string(&marker)?
+            .parse()
+            .map_err(io::Error::other)?;
+        let resize_at = app.transcript_len();
+        let current_screen = |bytes: &[u8]| {
+            let mut parser = vt100::Parser::new(SIZE.rows, SIZE.cols, 0);
+            let boundary = resize_at.min(bytes.len());
+            parser.process(&bytes[..boundary]);
+            parser.screen_mut().set_size(18, 60);
+            parser.process(&bytes[boundary..]);
+            parser
+        };
+        let started = Instant::now();
+        app.master
+            .resize(PtySize {
+                rows: 18,
+                cols: 60,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(io::Error::other)?;
+        app.write("MCP_NEXT_DRAFT")?;
+        app.wait_until(|bytes| {
+            current_screen(bytes)
+                .screen()
+                .contents()
+                .contains("MCP_NEXT_DRAFT")
+        })?;
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "MCP {phase} resize/input: {:?}",
+            started.elapsed()
+        );
+        let started = Instant::now();
+        app.write("\x03")?;
+        app.wait_until(|bytes| {
+            let text = current_screen(bytes).screen().contents();
+            text.contains("Agent request interrupted") && text.contains("MCP_NEXT_DRAFT")
+        })?;
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "MCP {phase} cancellation: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "MCP peer survived UI acknowledgement"
+        );
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        app.write(&"\x7f".repeat("MCP_NEXT_DRAFT".len()))?;
+        app.write("printf 'MCP_RECOVERED\\n'\r")?;
+        app.wait_until(|bytes| {
+            current_screen(bytes)
+                .screen()
+                .rows(0, 60)
+                .any(|line| line.trim() == "MCP_RECOVERED")
+        })?;
+        app.exit()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn managed_request_keeps_pasted_draft_and_requires_explicit_submit_after_completion()
+-> io::Result<()> {
+    let (home, held) = held_json_fixture()?;
+    let marker = home.join("draft-executed");
+    let mut app =
+        ApplicationPty::start_with_home_and_cwd(home, Path::new(env!("CARGO_MANIFEST_DIR")))?;
+    app.write("/ask held question\r")?;
+    held.ready
+        .recv_timeout(WAIT_TIMEOUT)
+        .map_err(io::Error::other)?;
+    app.wait_until(|bytes| screen_text(bytes).contains("Waiting for response"))?;
+    let draft = format!("printf done > '{}'", marker.display());
+    app.write(&format!("\x1b[200~{draft}\n\x1b[201~\r"))?;
+    app.wait_until(|bytes| screen_text(bytes).contains("draft-executed"))?;
+    assert!(!marker.exists(), "busy paste or Enter executed a command");
+    held.release.send(()).map_err(io::Error::other)?;
+    app.wait_until(|bytes| {
+        let text = screen_text(bytes);
+        text.contains("HELD_ANSWER")
+            && text.contains("draft-executed")
+            && !text.contains("Waiting for response")
+    })?;
+    assert!(
+        !marker.exists(),
+        "completion executed the draft automatically"
+    );
+    app.write("\r")?;
+    app.wait_until(|bytes| marker.exists() && settled_prompt_is_visible(bytes))?;
+    assert_eq!(fs::read_to_string(marker)?, "done");
+    app.exit()
+}
+
+#[test]
+fn managed_cancel_keeps_next_draft_and_clear_does_not_cancel_request() -> io::Result<()> {
+    let (home, held) = held_json_fixture()?;
+    let mut app =
+        ApplicationPty::start_with_home_and_cwd(home, Path::new(env!("CARGO_MANIFEST_DIR")))?;
+    app.write("/ask held question\r")?;
+    held.ready
+        .recv_timeout(WAIT_TIMEOUT)
+        .map_err(io::Error::other)?;
+    app.write("NEXT_DRAFT\x0c")?;
+    app.wait_until(|bytes| {
+        let text = screen_text(bytes);
+        text.contains("NEXT_DRAFT")
+            && text.contains("Waiting for response")
+            && !text.contains("held question")
+    })?;
+    app.write("\x03")?;
+    app.wait_until(|bytes| {
+        let text = screen_text(bytes);
+        text.contains("Agent request interrupted")
+            && text.contains("NEXT_DRAFT")
+            && !text.contains("Waiting for response")
+    })?;
+    // Cancel the editor draft before using /exit.
+    app.write("\x03")?;
+    app.exit()
+}
+
+fn wait_cli_exit(
+    mut child: std::process::Child,
+    deadline: Duration,
+) -> io::Result<std::process::Output> {
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if started.elapsed() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output()?;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "CLI failed to stop: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn headless_and_piped_commands_emit_answer_once_without_ansi() -> io::Result<()> {
+    for args in [vec!["-p", "held question"], vec!["/ask", "held question"]] {
+        let (home, held) = held_json_fixture()?;
+        let child = ProcessCommand::new(env!("CARGO_BIN_EXE_theseus"))
+            .args(args)
+            .env("HOME", &home)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        held.ready
+            .recv_timeout(WAIT_TIMEOUT)
+            .map_err(io::Error::other)?;
+        held.release.send(()).map_err(io::Error::other)?;
+        let output = wait_cli_exit(child, Duration::from_secs(2))?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.stdout.contains(&0x1b));
+        assert!(!output.stderr.contains(&0x1b));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .matches("HELD_ANSWER")
+                .count(),
+            1
+        );
+        fs::remove_dir_all(home)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn headless_sigint_cancels_waiting_http_and_exits_130() -> io::Result<()> {
+    let (home, held) = held_json_fixture()?;
+    let child = ProcessCommand::new(env!("CARGO_BIN_EXE_theseus"))
+        .args(["-p", "held question"])
+        .env("HOME", &home)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    held.ready
+        .recv_timeout(WAIT_TIMEOUT)
+        .map_err(io::Error::other)?;
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let output = wait_cli_exit(child, Duration::from_secs(2))?;
+    assert_eq!(output.status.code(), Some(130));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("interrupted"));
+    assert!(output.stdout.is_empty());
+    fs::remove_dir_all(home)?;
+    Ok(())
+}
+
+#[test]
+fn closing_headless_stdout_cancels_tool_producer_without_hanging() -> io::Result<()> {
+    let (home, server) = interrupted_agent_fixture()?;
+    let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_theseus"))
+        .args(["-p", "run tool"])
+        .env("HOME", &home)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    drop(child.stdout.take());
+    let output = wait_cli_exit(child, Duration::from_secs(3))?;
+    server.join().unwrap();
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
+    fs::remove_dir_all(home)?;
+    Ok(())
 }
 
 #[cfg(unix)]

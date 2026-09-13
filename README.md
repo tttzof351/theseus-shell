@@ -49,6 +49,31 @@ Regular input is executed as a shell command. Natural-language input is routed t
 the agent when it does not look like a shell command. Use `/ask ...` to
 explicitly talk to the agent.
 
+During an agent request, Theseus keeps the editor responsive. You can prepare the
+next input; Enter and pasted newlines do not submit it until the current operation
+finishes. Ctrl+C cancels the operation while keeping that draft. Ctrl+L clears the
+visible output without cancelling the request. PageUp/PageDown browse output and
+End returns to the latest output; Up/Down still navigate input history.
+
+Loading the model list in `/config` also keeps the editor responsive. Ctrl+C
+cancels loading; a draft typed while waiting is preserved after cancellation or
+after leaving the model picker.
+
+Large Markdown documents are formatted in a background worker while the editor
+and operation status continue updating. Cancelling `/resume` while it loads a
+trajectory preserves the previous agent context.
+
+Completed output enters terminal scrollback once; mutable previews stay in the
+application's viewport. Shell commands retain ordinary PTY interaction, and their
+main-screen output before and after a pager/TUI remains in the application history.
+
+Agent bash output is saved in full to its tool log. The on-screen preview is
+limited to 256 KiB per command and shows the log path when that limit is reached.
+The input/output architecture is described in
+[docs/INPUT_OUTPUT.md](docs/INPUT_OUTPUT.md), with verification evidence in the
+[acceptance report](docs/INPUT_OUTPUT_ACCEPTANCE.md). LLM responses still use JSON;
+SSE streaming is the next stage after the completed I/O refactoring.
+
 To start Theseus automatically from `~/.zshrc`, guard it with
 `THESEUS_ACTIVE` so commands executed by Theseus can still load your aliases
 from `~/.zshrc` without recursively starting another wrapper:

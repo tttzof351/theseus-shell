@@ -12,13 +12,14 @@ use rmcp::{
     ServiceExt,
     model::{CallToolRequestParams, CallToolResult, ClientInfo, JsonObject, Tool},
     transport::{
-        ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess,
-        streamable_http_client::StreamableHttpClientTransportConfig,
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 
+use crate::common::cancellation::CancellationEvent;
+use crate::common::events::{BlockKind, EventSink};
 use crate::{common::terminal_output, logging::AppLogger};
 
 use super::{
@@ -33,6 +34,8 @@ pub(super) struct McpManager {
     servers: BTreeMap<String, McpServerConfig>,
     sessions: Arc<Mutex<BTreeMap<String, McpSession>>>,
     logger: Arc<Mutex<Option<AppLogger>>>,
+    output: Arc<Mutex<Option<EventSink>>>,
+    cancellation: Arc<Mutex<CancellationEvent>>,
 }
 
 impl McpManager {
@@ -41,11 +44,38 @@ impl McpManager {
             servers,
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
             logger: Arc::new(Mutex::new(None)),
+            output: Arc::new(Mutex::new(None)),
+            cancellation: Arc::new(Mutex::new(CancellationEvent::new())),
         }
     }
 
     pub(super) fn set_logger(&self, logger: AppLogger) {
         *self.logger.lock().unwrap_or_else(|err| err.into_inner()) = Some(logger);
+    }
+
+    pub(super) fn set_cancellation(&self, cancellation: CancellationEvent) {
+        *self
+            .cancellation
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = cancellation;
+    }
+
+    fn cancellation(&self) -> CancellationEvent {
+        self.cancellation
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    pub(super) fn set_output(&self, output: Option<EventSink>) {
+        *self.output.lock().unwrap_or_else(|err| err.into_inner()) = output;
+    }
+
+    fn output(&self) -> Option<EventSink> {
+        self.output
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
     }
 
     pub(super) fn tool_schemas(&self) -> io::Result<Vec<Value>> {
@@ -55,6 +85,7 @@ impl McpManager {
         for (server_id, server) in self.enabled_servers() {
             let tools = match self.list_tools(server_id, server) {
                 Ok(tools) => tools,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => return Err(err),
                 Err(err) => {
                     self.log_event(
                         "warn",
@@ -77,7 +108,11 @@ impl McpManager {
         }
         drop(progress);
         for warning in warnings {
-            warn_mcp_discovery_failed(&warning)?;
+            if let Some(output) = self.output() {
+                output.message(BlockKind::Diagnostic, &format!("warning: {warning}"))?;
+            } else {
+                warn_mcp_discovery_failed(&warning)?;
+            }
         }
         Ok(schemas)
     }
@@ -122,6 +157,10 @@ impl McpManager {
             return None;
         }
 
+        if let Some(output) = self.output() {
+            let _ = output.activity("Discovering MCP tools", "");
+            return None;
+        }
         let _ = log_mcp_discovery();
         Some(Spinner::start())
     }
@@ -199,7 +238,14 @@ impl McpManager {
                 tool_call.function.name
             ));
         }
-        log_mcp_tool_call(&tool_call.function.name)?;
+        if let Some(output) = self.output() {
+            output.message(
+                BlockKind::ToolPreview,
+                &format_tool_call_name(&tool_call.function.name),
+            )?;
+        } else {
+            log_mcp_tool_call(&tool_call.function.name)?;
+        }
         self.log_event(
             "info",
             "mcp_tool_call_start",
@@ -289,6 +335,7 @@ impl McpManager {
         for attempt in 0..2 {
             match self.with_session_once(server_id, server, request.clone()) {
                 Ok(response) => return Ok(response),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => return Err(err),
                 Err(err) => {
                     last_error = Some(err);
                     if attempt == 0 {
@@ -314,6 +361,10 @@ impl McpManager {
         server: &McpServerConfig,
         request: McpSessionRequest,
     ) -> io::Result<McpSessionResponse> {
+        let cancellation = self.cancellation();
+        if cancellation.cancel_if_interrupted() {
+            return Err(mcp_interrupted());
+        }
         let mut sessions = self.sessions.lock().unwrap_or_else(|err| err.into_inner());
         let session = match sessions.get(server_id) {
             Some(session) if session.is_open() => session,
@@ -328,7 +379,7 @@ impl McpManager {
                         "timeout_seconds": server.timeout_seconds,
                     }),
                 );
-                match McpSession::start(server_id, server.clone()) {
+                match McpSession::start(server_id, server.clone(), cancellation.clone()) {
                     Ok(session) => {
                         self.log_event(
                             "info",
@@ -359,7 +410,7 @@ impl McpManager {
             }
         };
 
-        match session.request(request) {
+        match session.request(request, cancellation) {
             Ok(response) => Ok(response),
             Err(err) => {
                 sessions.remove(server_id);
@@ -392,24 +443,39 @@ pub(super) struct McpServerStatus {
 struct McpSession {
     requests: mpsc::Sender<McpWorkerMessage>,
     handle: Option<thread::JoinHandle<()>>,
+    shutdown: CancellationEvent,
 }
 
 impl McpSession {
-    fn start(server_id: &str, server: McpServerConfig) -> io::Result<Self> {
+    fn start(
+        server_id: &str,
+        server: McpServerConfig,
+        cancellation: CancellationEvent,
+    ) -> io::Result<Self> {
         let (tx, rx) = mpsc::channel();
         let server_id = server_id.to_string();
         let (ready_tx, ready_rx) = mpsc::channel();
         let thread_server_id = server_id.clone();
+        let shutdown = CancellationEvent::new();
+        let worker_shutdown = shutdown.clone();
         let handle = thread::Builder::new()
             .name(format!("theseus-mcp-{server_id}"))
             .spawn(move || {
-                run_mcp_session(thread_server_id, server, rx, ready_tx);
+                run_mcp_session(
+                    thread_server_id,
+                    server,
+                    rx,
+                    ready_tx,
+                    cancellation,
+                    worker_shutdown,
+                );
             })?;
 
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 requests: tx,
                 handle: Some(handle),
+                shutdown,
             }),
             Ok(Err(err)) => {
                 let _ = handle.join();
@@ -431,12 +497,17 @@ impl McpSession {
             .is_some_and(thread::JoinHandle::is_finished)
     }
 
-    fn request(&self, request: McpSessionRequest) -> io::Result<McpSessionResponse> {
+    fn request(
+        &self,
+        request: McpSessionRequest,
+        cancellation: CancellationEvent,
+    ) -> io::Result<McpSessionResponse> {
         let (tx, rx) = mpsc::channel();
         self.requests
             .send(McpWorkerMessage::Request {
                 request,
                 response: tx,
+                cancellation,
             })
             .map_err(|err| io::Error::other(format!("MCP session worker stopped: {err}")))?;
         rx.recv()
@@ -446,6 +517,7 @@ impl McpSession {
 
 impl Drop for McpSession {
     fn drop(&mut self) {
+        self.shutdown.cancel();
         let _ = self.requests.send(McpWorkerMessage::Shutdown);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -458,6 +530,7 @@ enum McpWorkerMessage {
     Request {
         request: McpSessionRequest,
         response: mpsc::Sender<io::Result<McpSessionResponse>>,
+        cancellation: CancellationEvent,
     },
     Shutdown,
 }
@@ -499,6 +572,8 @@ fn run_mcp_session(
     server: McpServerConfig,
     rx: mpsc::Receiver<McpWorkerMessage>,
     ready_tx: mpsc::Sender<io::Result<()>>,
+    cancellation: CancellationEvent,
+    shutdown: CancellationEvent,
 ) {
     let runtime = match Runtime::new() {
         Ok(runtime) => runtime,
@@ -514,9 +589,21 @@ fn run_mcp_session(
     runtime.block_on(async {
         match server.transport {
             McpTransport::Stdio => match stdio_transport(&server_id, &server) {
-                Ok(transport) => {
-                    run_mcp_session_with_transport(&server_id, &server, transport, rx, ready_tx)
-                        .await
+                Ok((transport, mut child)) => {
+                    run_mcp_session_with_transport(
+                        &server_id,
+                        &server,
+                        transport,
+                        rx,
+                        ready_tx,
+                        cancellation,
+                        shutdown,
+                    )
+                    .await;
+                    // Own and reap the stdio server explicitly. rmcp's default
+                    // child wrapper schedules cleanup in Drop; that task can
+                    // otherwise be lost when the runtime immediately shuts down.
+                    let _ = child.kill().await;
                 }
                 Err(err) => {
                     let _ = ready_tx.send(Err(err));
@@ -524,8 +611,16 @@ fn run_mcp_session(
             },
             McpTransport::StreamableHttp => match streamable_http_transport(&server) {
                 Ok(transport) => {
-                    run_mcp_session_with_transport(&server_id, &server, transport, rx, ready_tx)
-                        .await
+                    run_mcp_session_with_transport(
+                        &server_id,
+                        &server,
+                        transport,
+                        rx,
+                        ready_tx,
+                        cancellation,
+                        shutdown,
+                    )
+                    .await
                 }
                 Err(err) => {
                     let _ = ready_tx.send(Err(err));
@@ -541,41 +636,65 @@ async fn run_mcp_session_with_transport<T, E, A>(
     transport: T,
     rx: mpsc::Receiver<McpWorkerMessage>,
     ready_tx: mpsc::Sender<io::Result<()>>,
+    cancellation: CancellationEvent,
+    shutdown: CancellationEvent,
 ) where
     T: rmcp::transport::IntoTransport<rmcp::RoleClient, E, A> + Send + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
     let connect_timeout = Duration::from_secs(server.timeout_seconds as u64);
-    let mut client =
-        match tokio::time::timeout(connect_timeout, ClientInfo::default().serve(transport)).await {
-            Ok(Ok(client)) => client,
-            Ok(Err(err)) => {
-                let _ = ready_tx.send(Err(io::Error::other(format!(
-                    "MCP server `{server_id}` connection failed: {err}"
-                ))));
-                return;
-            }
-            Err(_) => {
-                let _ = ready_tx.send(Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("MCP server `{server_id}` connection timed out"),
-                )));
-                return;
-            }
-        };
+    let connect = tokio::time::timeout(connect_timeout, ClientInfo::default().serve(transport));
+    let connection = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => { let _ = ready_tx.send(Err(mcp_interrupted())); return; }
+        _ = shutdown.cancelled() => { let _ = ready_tx.send(Err(mcp_interrupted())); return; }
+        result = connect => result,
+    };
+    let mut client = match connection {
+        Ok(Ok(client)) => client,
+        Ok(Err(err)) => {
+            let _ = ready_tx.send(Err(io::Error::other(format!(
+                "MCP server `{server_id}` connection failed: {err}"
+            ))));
+            return;
+        }
+        Err(_) => {
+            let _ = ready_tx.send(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("MCP server `{server_id}` connection timed out"),
+            )));
+            return;
+        }
+    };
     let _ = ready_tx.send(Ok(()));
 
     for message in rx {
         match message {
-            McpWorkerMessage::Request { request, response } => {
-                let _ = response
-                    .send(timeout(server, handle_mcp_request(&client, server_id, request)).await);
+            McpWorkerMessage::Request {
+                request,
+                response,
+                cancellation,
+            } => {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(mcp_interrupted()),
+                    _ = shutdown.cancelled() => Err(mcp_interrupted()),
+                    result = timeout(server, handle_mcp_request(&client, server_id, request)) => result,
+                };
+                let interrupted = result
+                    .as_ref()
+                    .is_err_and(|err| err.kind() == io::ErrorKind::Interrupted);
+                let _ = response.send(result);
+                if interrupted {
+                    break;
+                }
             }
             McpWorkerMessage::Shutdown => break,
         }
     }
 
-    let _ = client.close().await;
+    // A peer that ignores shutdown cannot hold the worker indefinitely.
+    let _ = tokio::time::timeout(Duration::from_millis(500), client.close()).await;
 }
 
 async fn handle_mcp_request(
@@ -600,6 +719,10 @@ async fn handle_mcp_request(
             Ok(McpSessionResponse::Text(format_call_tool_result(result)))
         }
     }
+}
+
+fn mcp_interrupted() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "MCP operation interrupted")
 }
 
 fn log_mcp_tool_call(public_tool_name: &str) -> io::Result<()> {
@@ -642,7 +765,12 @@ async fn timeout<T>(
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "MCP request timed out"))?
 }
 
-fn stdio_transport(server_id: &str, server: &McpServerConfig) -> io::Result<TokioChildProcess> {
+type StdioTransport = (tokio::process::ChildStdout, tokio::process::ChildStdin);
+
+fn stdio_transport(
+    server_id: &str,
+    server: &McpServerConfig,
+) -> io::Result<(StdioTransport, tokio::process::Child)> {
     let command = server.command.as_ref().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -659,14 +787,13 @@ fn stdio_transport(server_id: &str, server: &McpServerConfig) -> io::Result<Toki
         ));
     }
 
-    let (transport, _stderr) =
-        TokioChildProcess::builder(tokio::process::Command::new(command).configure(|cmd| {
-            cmd.args(&server.args);
-            for (name, value) in &server.env {
-                cmd.env(name, value);
-            }
-        }))
+    let mut child = tokio::process::Command::new(command)
+        .args(&server.args)
+        .envs(&server.env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|err| {
             io::Error::new(
@@ -676,8 +803,9 @@ fn stdio_transport(server_id: &str, server: &McpServerConfig) -> io::Result<Toki
                 ),
             )
         })?;
-
-    Ok(transport)
+    let stdout = child.stdout.take().expect("piped MCP stdout");
+    let stdin = child.stdin.take().expect("piped MCP stdin");
+    Ok(((stdout, stdin), child))
 }
 
 fn streamable_http_transport(
@@ -847,6 +975,69 @@ mod tests {
         )]));
 
         assert!(manager.tool_schemas().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_stops_mcp_startup_discovery_and_call_and_reaps_child() {
+        for phase in ["initialize", "tools/list", "tools/call"] {
+            let marker = std::env::temp_dir().join(format!(
+                "theseus-mcp-cancel-{}-{}",
+                std::process::id(),
+                phase.replace('/', "-")
+            ));
+            let _ = std::fs::remove_file(&marker);
+            let mut server = test_server();
+            server.transport = McpTransport::Stdio;
+            server.command = Some("python3".into());
+            server.args = vec![
+                format!(
+                    "{}/tests/fixtures/stalled_mcp.py",
+                    env!("CARGO_MANIFEST_DIR")
+                ),
+                phase.into(),
+                marker.to_string_lossy().into_owned(),
+            ];
+            let cancellation = CancellationEvent::new();
+            let worker_cancel = cancellation.clone();
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let manager = McpManager::new(BTreeMap::from([("fake".into(), server.clone())]));
+                manager.set_cancellation(worker_cancel);
+                let request = if phase == "tools/call" {
+                    McpSessionRequest::CallTool {
+                        name: "stall".into(),
+                        arguments: JsonObject::new(),
+                    }
+                } else {
+                    McpSessionRequest::ListTools
+                };
+                let result = manager.with_session("fake", &server, request);
+                drop(manager);
+                let _ = done_tx.send(result);
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while !marker.exists() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            cancellation.cancel();
+            let result = done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("MCP cleanup hung");
+            worker.join().unwrap();
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+            let pid: i32 = std::fs::read_to_string(&marker)
+                .expect("peer phase not reached")
+                .parse()
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "MCP child survived cancellation"
+            );
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+            std::fs::remove_file(marker).unwrap();
+        }
     }
 
     #[test]
