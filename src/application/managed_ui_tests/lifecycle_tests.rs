@@ -1,7 +1,7 @@
 use super::*;
 use std::{net::TcpListener, sync::mpsc};
 
-fn waiting_spinner_is_visible(screen: &vt100::Screen) -> bool {
+pub(super) fn waiting_spinner_is_visible(screen: &vt100::Screen) -> bool {
     screen.rows(0, screen.size().1).any(|line| {
         let mut chars = line.trim().chars();
         chars
@@ -9,6 +9,27 @@ fn waiting_spinner_is_visible(screen: &vt100::Screen) -> bool {
             .is_some_and(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch))
             && chars.next().is_none()
     })
+}
+
+#[test]
+fn operation_without_activity_shows_only_spinner_and_preserves_draft() {
+    let mut ui = UiPty::start_with_options(None, true);
+    ui.write("INITIAL_ACTIVITY_DRAFT");
+    ui.wait(|screen| {
+        waiting_spinner_is_visible(screen) && screen.contents().contains("INITIAL_ACTIVITY_DRAFT")
+    });
+    let text = ui.parser.lock().unwrap().screen().contents();
+    assert!(!text.contains("Working"), "{text}");
+    fs::write(ui.directory.join("release-initial-activity"), b"").unwrap();
+    ui.wait(|screen| screen.contents().contains("Fixture waiting"));
+    ui.command("finish", "");
+    ui.wait(|screen| {
+        !waiting_spinner_is_visible(screen)
+            && !screen.contents().contains("Fixture waiting")
+            && screen.contents().contains("INITIAL_ACTIVITY_DRAFT")
+    });
+    let history = ui.history().join("\n");
+    assert!(!history.contains("Working"), "{history}");
 }
 
 struct CompactServer {

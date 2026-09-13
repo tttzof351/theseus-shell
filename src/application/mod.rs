@@ -293,11 +293,7 @@ impl Application {
             self.screen_cache.push_render_line(&RenderLine::plain(text));
         }
         if let Some(active) = &self.active_operation {
-            let (phase, detail) = self
-                .document
-                .activity
-                .clone()
-                .unwrap_or_else(|| ("Working".into(), String::new()));
+            let (phase, detail) = self.document.activity.clone().unwrap_or_default();
             let phase = if self.execution_state() == ExecutionState::Cancelling {
                 "Cancelling"
             } else {
@@ -305,7 +301,7 @@ impl Application {
             };
             let elapsed = active.started.elapsed();
             let spinner = common::progress::spinner_frame(elapsed);
-            let status = if phase == "Waiting for response" {
+            let status = if matches!(phase, "" | "Waiting for response") {
                 spinner.to_string()
             } else {
                 format!("{spinner} {phase} · {}s {detail}", elapsed.as_secs())

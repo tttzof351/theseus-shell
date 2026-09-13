@@ -145,6 +145,18 @@ fn run_script(
     output: &EventSink,
     cancellation: &CancellationEvent,
 ) -> io::Result<String> {
+    if directory.join("hold-initial-activity").exists() {
+        let deadline = Instant::now() + TIMEOUT;
+        while !directory.join("release-initial-activity").exists() {
+            if cancellation.is_cancelled() {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
     let mut block = output.start_block(BlockKind::Markdown)?;
     output.activity("Fixture waiting", "")?;
     for step in 1.. {
@@ -243,12 +255,19 @@ impl UiPty {
     }
 
     fn start_with_fault(fault: Option<&str>) -> Self {
+        Self::start_with_options(fault, false)
+    }
+
+    fn start_with_options(fault: Option<&str>, hold_initial_activity: bool) -> Self {
         let directory = env::temp_dir().join(format!(
             "theseus-ui-fixture-{}-{}",
             std::process::id(),
             common::events::OperationId::next().0
         ));
         fs::create_dir_all(&directory).unwrap();
+        if hold_initial_activity {
+            fs::write(directory.join("hold-initial-activity"), b"").unwrap();
+        }
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 18,
@@ -303,7 +322,11 @@ impl UiPty {
         if fault.is_none() {
             result.write("/ask fixture\r");
         }
-        result.wait(|screen| screen.contents().contains("Fixture waiting"));
+        if hold_initial_activity {
+            result.wait(lifecycle_tests::waiting_spinner_is_visible);
+        } else {
+            result.wait(|screen| screen.contents().contains("Fixture waiting"));
+        }
         result
     }
 
