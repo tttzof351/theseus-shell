@@ -2192,8 +2192,8 @@ mod tests {
         let path = temporary_test_path("streaming-config-patch");
         AgentConfig::load_or_create_at(path.clone()).unwrap();
         let original = fs::read_to_string(&path).unwrap()
-            .replacen("\"llm_request_settings\": {", "\"llm_request_settings\": {\n    // keep network timeout\n    \"stream_idle_timeout_seconds\": 17,", 1)
-            .replacen("\"body\": {", "\"body\": {\n      // explicit streaming options\n      \"stream\": true,\n      \"stream_options\": { \"include_usage\": true },", 1);
+            .replacen("\"stream_idle_timeout_seconds\": 60", "// keep network timeout\n    \"stream_idle_timeout_seconds\": 17", 1)
+            .replacen("\"body\": {", "\"body\": {\n      // explicit streaming options\n      \"stream_options\": { \"include_usage\": true },", 1);
         fs::write(&path, &original).unwrap();
         for patch in [
             ConfigPatch::SetModel("example/stream-model".into()),

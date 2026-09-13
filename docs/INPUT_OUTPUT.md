@@ -192,7 +192,7 @@ completion cannot change this protocol failure into success. Plain mode flushes
 the retained text and unfinished tool lines once on this path, including incomplete
 UTF-8, and rejects subsequent events for the closed operation.
 
-JSON and opt-in SSE HTTP requests run as scoped async futures inside the worker.
+JSON and SSE HTTP requests run as scoped async futures inside the worker.
 Cancellation drops the request/response and shuts down its Tokio runtime before
 terminal events can wait for output queue capacity. This also closes hyper's
 connection tasks when a consumer is stalled. There is no detached HTTP thread.
@@ -210,9 +210,20 @@ reasoning representation is displayed, preferring string reasoning within a fram
 
 Streaming is enabled by `llm_request_settings.body.stream: true`. Content-Type
 selects SSE or a JSON fallback for that response; unexpected formats fail without
-resubmitting. The default remains JSON. Optional `stream_idle_timeout_seconds`
-(60 seconds by default) applies to network waits, including headers; output queue
-backpressure is governed by the overall `request_timeout_seconds` deadline instead.
+resubmitting. Newly generated configurations explicitly set `stream: true` and
+`stream_idle_timeout_seconds: 60`; existing configurations with `stream` absent
+or `false` retain JSON. Optional
+`stream_idle_timeout_seconds` (60 seconds by default) applies to network waits,
+including headers. Streaming requests have no overall deadline: incoming chunks
+or heartbeat comments can keep them alive beyond `request_timeout_seconds`.
+This also applies to a JSON fallback for a request made with `stream: true`.
+Output queue backpressure does not count toward network idle; cancel/disconnect
+still releases the producer and closes HTTP before terminal-event cleanup.
+JSON-mode requests retain the total `request_timeout_seconds` deadline across
+reading, parsing and enqueueing. The shared reqwest client has a connect timeout
+only, so it cannot impose a hidden total deadline on streaming requests.
+Request telemetry records the applied total timeout as null for streaming, with
+`stream_idle_timeout_seconds` recorded separately.
 Heartbeats create no mandatory UI events. Limits are 8 MiB per unfinished SSE event,
 32 MiB of aggregated fields, and a bounded HTTP error body. Decoding, accumulator
 assembly and enqueueing yield between bounded portions so cancellation/deadlines

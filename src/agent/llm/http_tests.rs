@@ -188,10 +188,13 @@ fn real_http_prefix_is_emitted_before_done_and_cancel_closes_socket() {
 
 #[test]
 fn idle_deadline_covers_headers_and_stalled_body() {
-    for headers in [false, true] {
+    for stage in ["headers", "body", "after_prefix"] {
         let (url, server) = server(1, move |_, stream, _| {
-            if headers {
+            if stage != "headers" {
                 stream.write_all(SSE_HEADERS).unwrap();
+            }
+            if stage == "after_prefix" {
+                stream.write_all(delta("PREFIX").as_bytes()).unwrap();
             }
             assert_closed(stream);
         });
@@ -205,30 +208,95 @@ fn idle_deadline_covers_headers_and_stalled_body() {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(error.to_string().contains("idle"));
         assert!(started.elapsed() < Duration::from_millis(500));
+        if stage == "after_prefix" {
+            assert!(!is_retryable_llm_error(&error));
+        }
     }
 }
 
 #[test]
-fn continuous_heartbeats_do_not_extend_total_deadline() {
-    let (url, server) = server(1, |_, stream, _| {
-        stream.write_all(SSE_HEADERS).unwrap();
-        for _ in 0..100 {
-            if stream.write_all(b": heartbeat\n\n").is_err() {
-                break;
+fn active_streaming_requests_outlive_the_configured_total_timeout() {
+    for mode in ["heartbeat", "content", "json_fallback"] {
+        let (url, server) = server(1, move |_, stream, request| {
+            assert_eq!(request["stream"], true);
+            if mode == "json_fallback" {
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n").unwrap();
+            } else {
+                stream.write_all(SSE_HEADERS).unwrap();
             }
-            thread::sleep(Duration::from_millis(5));
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_millis(1150) {
+                let chunk = match mode {
+                    "heartbeat" => ": heartbeat\n\n".to_owned(),
+                    "content" => delta("tick "),
+                    _ => " ".to_owned(),
+                };
+                stream.write_all(chunk.as_bytes()).unwrap();
+                // Controlled network pacing exercises the idle reset while the
+                // whole exchange crosses the configured one-second deadline.
+                thread::sleep(Duration::from_millis(20));
+            }
+            if mode == "json_fallback" {
+                stream.write_all(br#"{"choices":[{"message":{"role":"assistant","content":"COMPLETE"},"finish_reason":"stop"}]}"#).unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+            } else {
+                stream.write_all(delta("COMPLETE").as_bytes()).unwrap();
+                stream.write_all(done().as_bytes()).unwrap();
+            }
+            assert_closed(stream);
+        });
+        let mut config = AgentConfig::default_empty();
+        config.llm_request_settings.base_url = url;
+        config.llm_request_settings.retries = 1;
+        config.llm_request_settings.request_timeout_seconds = 1;
+        config
+            .llm_request_settings
+            .body
+            .insert("stream".into(), json!(true));
+        // Construct the real client with this config too: changing only the
+        // coordinator's field would miss a hidden reqwest-wide total timeout.
+        let mut agent = Agent::new(config);
+        agent.stream_idle_timeout = Duration::from_millis(200);
+        let started = Instant::now();
+        let result = agent.request_completion(&CancellationEvent::new());
+        server.join().unwrap();
+        let result = result.unwrap();
+        assert!(started.elapsed() > agent.llm_request_timeout);
+        let content = result.trajectory.message().unwrap().content_text().unwrap();
+        assert!(content.ends_with("COMPLETE"), "{content}");
+        if mode == "content" {
+            assert!(content.starts_with("tick "));
         }
-        assert_closed(stream);
-    });
-    let mut agent = agent(url);
-    agent.stream_idle_timeout = Duration::from_millis(100);
-    agent.llm_request_timeout = Duration::from_millis(60);
-    let error = agent
-        .request_completion(&CancellationEvent::new())
-        .unwrap_err();
-    server.join().unwrap();
-    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-    assert!(error.to_string().contains("deadline"));
+    }
+}
+
+#[test]
+fn json_requests_keep_total_deadline_even_while_body_bytes_arrive() {
+    for explicit_false in [false, true] {
+        let (url, server) = server(1, |_, stream, request| {
+            assert_ne!(request["stream"], true);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n").unwrap();
+            for _ in 0..60 {
+                if stream.write_all(b" ").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_closed(stream);
+        });
+        let mut agent = agent(url);
+        agent.body.remove("stream");
+        if explicit_false {
+            agent.body.insert("stream".into(), json!(false));
+        }
+        agent.llm_request_timeout = Duration::from_millis(60);
+        let error = agent
+            .request_completion(&CancellationEvent::new())
+            .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("deadline"));
+    }
 }
 
 #[test]
@@ -329,7 +397,7 @@ fn json_fallback_uses_same_presentation_and_unknown_content_type_fails() {
 }
 
 #[test]
-fn full_ingress_keeps_total_deadline_and_closes_http_before_terminal_events() {
+fn full_streaming_ingress_waits_without_idle_error_and_cancel_closes_http_before_cleanup() {
     let (release, released) = mpsc::channel();
     let (closed_tx, closed) = mpsc::channel();
     let (url, server) = server(1, move |_, stream, _| {
@@ -348,7 +416,8 @@ fn full_ingress_keeps_total_deadline_and_closes_http_before_terminal_events() {
     agent.output = Some(sink);
     agent.llm_request_timeout = Duration::from_millis(300);
     agent.stream_idle_timeout = Duration::from_millis(100);
-    let worker = thread::spawn(move || agent.request_completion(&cancellation));
+    let worker_cancel = cancellation.clone();
+    let worker = thread::spawn(move || agent.request_completion(&worker_cancel));
     loop {
         let event = events.recv_timeout(TIMEOUT).unwrap();
         if matches!(&event.event, OutputEvent::TextAppended { text, .. } if text == "PREFIX") {
@@ -356,10 +425,20 @@ fn full_ingress_keeps_total_deadline_and_closes_http_before_terminal_events() {
         }
     }
     release.send(()).unwrap();
-    // No draining until the actual socket closes. This forces enqueue pressure;
-    // terminal block finishes are allowed to wait after releasing the HTTP body.
-    closed.recv_timeout(TIMEOUT).unwrap();
-    let mut text_bytes = 0;
+    // Wait for assembly to reach enqueue, then hold the bounded consumer beyond
+    // both configured timeouts. Queue backpressure is not provider inactivity.
+    let OutputEvent::TextAppended { text, .. } = events.recv_timeout(TIMEOUT).unwrap().event else {
+        panic!("expected live text");
+    };
+    let premature_close = closed.recv_timeout(Duration::from_millis(400));
+    let started = Instant::now();
+    cancellation.cancel();
+    if premature_close.is_err() {
+        // The actual socket must close before we make room for terminal events.
+        closed.recv_timeout(TIMEOUT).unwrap();
+    }
+    let cancellation_elapsed = started.elapsed();
+    let mut text_bytes = text.len();
     while let Ok(event) = events.recv_timeout(TIMEOUT) {
         if let OutputEvent::TextAppended { text, .. } = event.event {
             text_bytes += text.len();
@@ -367,8 +446,9 @@ fn full_ingress_keeps_total_deadline_and_closes_http_before_terminal_events() {
     }
     let error = worker.join().unwrap().unwrap_err();
     server.join().unwrap();
-    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-    assert!(error.to_string().contains("deadline"), "{error}");
+    assert_eq!(premature_close, Err(mpsc::RecvTimeoutError::Timeout));
+    assert!(cancellation_elapsed < Duration::from_millis(250));
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     assert_eq!(
         error
             .get_ref()

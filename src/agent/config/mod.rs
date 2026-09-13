@@ -110,6 +110,7 @@ impl AgentConfig {
     pub(crate) fn default_empty() -> Self {
         let mut body = Map::new();
         body.insert("model".to_string(), json!(models::DEFAULT_MODEL));
+        body.insert("stream".to_string(), json!(true));
         body.insert("tool_choice".to_string(), json!("auto"));
         body.insert("parallel_tool_calls".to_string(), json!(true));
         body.insert("include_reasoning".to_string(), json!(true));
@@ -145,7 +146,7 @@ impl AgentConfig {
                 retries: models::DEFAULT_LLM_REQUEST_RETRIES,
                 request_timeout_seconds: models::DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
                 connect_timeout_seconds: models::DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS,
-                stream_idle_timeout_seconds: None,
+                stream_idle_timeout_seconds: Some(models::DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS),
                 body,
                 header,
             },
@@ -221,16 +222,36 @@ mod tests {
     };
 
     #[test]
-    fn streaming_settings_are_opt_in_and_round_trip_with_opaque_body_options() {
-        let old = AgentConfig::default_empty();
-        let parsed = AgentConfig::from_jsonc(&old.to_jsonc()).unwrap();
-        assert_eq!(parsed, old);
+    fn streaming_defaults_and_legacy_settings_round_trip_with_opaque_body_options() {
+        let defaults = AgentConfig::default_empty();
+        let parsed = AgentConfig::from_jsonc(&defaults.to_jsonc()).unwrap();
+        assert_eq!(parsed, defaults);
         assert_eq!(
             parsed.llm_request_settings.stream_idle_timeout_seconds,
-            None
+            Some(models::DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS)
         );
-        assert!(!super::validate_stream_settings(&parsed.llm_request_settings.body, None).unwrap());
-        let mut config = old;
+        assert!(super::validate_stream_settings(&parsed.llm_request_settings.body, None).unwrap());
+        for stream in [None, Some(json!(false))] {
+            let mut legacy = defaults.clone();
+            legacy.llm_request_settings.stream_idle_timeout_seconds = None;
+            legacy.llm_request_settings.body.remove("stream");
+            if let Some(stream) = stream {
+                legacy
+                    .llm_request_settings
+                    .body
+                    .insert("stream".into(), stream);
+            }
+            let parsed = AgentConfig::from_jsonc(&legacy.to_jsonc()).unwrap();
+            assert_eq!(parsed, legacy);
+            assert!(
+                !super::validate_stream_settings(&parsed.llm_request_settings.body, None).unwrap()
+            );
+            assert_eq!(
+                crate::agent::Agent::new(parsed).stream_idle_timeout,
+                std::time::Duration::from_secs(models::DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS as u64)
+            );
+        }
+        let mut config = defaults;
         config.llm_request_settings.stream_idle_timeout_seconds = Some(17);
         config
             .llm_request_settings
@@ -291,6 +312,10 @@ mod tests {
         assert_eq!(
             init.config.llm_request_settings.body.get("model"),
             Some(&json!(models::DEFAULT_MODEL))
+        );
+        assert_eq!(
+            init.config.llm_request_settings.body.get("stream"),
+            Some(&json!(true))
         );
         assert_eq!(
             init.config.llm_request_settings.body.get("tool_choice"),
@@ -393,6 +418,10 @@ mod tests {
             init.config.llm_request_settings.connect_timeout_seconds,
             models::DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS
         );
+        assert_eq!(
+            init.config.llm_request_settings.stream_idle_timeout_seconds,
+            Some(models::DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS)
+        );
         assert!(init.config.mcp_servers.is_empty());
         assert!(path.exists());
 
@@ -401,6 +430,7 @@ mod tests {
         assert_eq!(loaded.config, init.config);
 
         let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"stream_idle_timeout_seconds\": 60"));
         assert_field_order(
             &text,
             &[

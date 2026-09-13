@@ -75,13 +75,14 @@ The input/output architecture is described in
 
 ### Streaming responses
 
-Streaming is opt-in for Chat Completions endpoints. Merge these settings into
-`~/.theseus/config.jsonc`, preserving the existing model, headers and other fields,
-then restart Theseus:
+New configurations enable streaming for Chat Completions endpoints by default
+with `llm_request_settings.body.stream: true` and explicitly set
+`llm_request_settings.stream_idle_timeout_seconds: 60`. To enable it in an existing
+`~/.theseus/config.jsonc`, merge these settings while preserving the model, headers
+and other fields, then restart Theseus:
 
 ```jsonc
 "llm_request_settings": {
-  "request_timeout_seconds": 600,
   "stream_idle_timeout_seconds": 60,
   "body": {
     "stream": true
@@ -98,10 +99,14 @@ existing spinner and editor. Tools execute only after `[DONE]` and validation of
 the complete assistant message. Cancelled or interrupted streams retain their
 visible prefix; they are not retried after semantic data has arrived.
 
-`request_timeout_seconds` limits the whole HTTP attempt, including waits for the
-output queue. `stream_idle_timeout_seconds` limits each wait for headers or more
-network data and defaults to 60 seconds; it must be positive. Keep-alive comments
-reset the idle wait, but do not extend the overall deadline. Responses are limited
+For `stream: true`, there is no total request-duration limit.
+`stream_idle_timeout_seconds` limits each wait for headers or more network data
+and defaults to 60 seconds; it must be positive. Incoming chunks, including
+keep-alive comments, reset that wait. The same policy applies if the endpoint
+returns JSON to a streaming request. Waiting for output queue capacity does not
+count as provider inactivity; cancellation remains available.
+For JSON mode (`stream` absent or `false`), `request_timeout_seconds` still limits
+the whole HTTP attempt, including output queue waits. Responses remain limited
 to 8 MiB per unfinished SSE event and 32 MiB of accumulated message fields.
 
 For pipes and headless mode (`theseus -p ...`), replaceable text is buffered until

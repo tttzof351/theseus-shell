@@ -166,7 +166,9 @@ impl Agent {
         let mut started = state.telemetry();
         started["model"] = json!(self.body.get("model"));
         started["messages"] = json!(message_count);
-        started["request_timeout_seconds"] = json!(self.llm_request_timeout.as_secs());
+        started["request_timeout_seconds"] =
+            json!((!stream).then_some(self.llm_request_timeout.as_secs()));
+        started["stream_idle_timeout_seconds"] = json!(idle.map(|timeout| timeout.as_secs()));
         started["connect_timeout_seconds"] = json!(self.llm_connect_timeout.as_secs());
         self.log_event("info", "llm_request_start", started);
         state.phase = "headers";

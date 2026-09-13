@@ -122,7 +122,7 @@ impl Agent {
             mcp: McpManager::new(config.mcp_servers),
             system_prompt,
             compact_prompt,
-            client: super::llm::llm_client(llm_request_timeout, llm_connect_timeout),
+            client: super::llm::llm_client(llm_connect_timeout),
             trajectory,
             latest_request_usage: super::status::LatestRequestUsage::default(),
             logger: None,

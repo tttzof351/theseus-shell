@@ -122,6 +122,7 @@ impl Agent {
     ) -> io::Result<CompletionResponse> {
         // The request future and its runtime are owned by this call. Dropping the
         // losing branch closes the response before the worker acknowledges cancel.
+        let stream = super::config::validate_stream_settings(&self.body, None)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -135,12 +136,23 @@ impl Agent {
                     self.log_event("info", "llm_request_interrupted", state.telemetry());
                     Err(interrupted_error())
                 }
-                result = tokio::time::timeout(self.llm_request_timeout, async {
-                    if let Some(output) = &self.output {
-                        output.activity_async("Waiting for response", &format!("attempt {attempt}/{}", self.llm_request_retries)).await?;
+                result = async {
+                    let request = async {
+                        if let Some(output) = &self.output {
+                            output.activity_async("Waiting for response", &format!("attempt {attempt}/{}", self.llm_request_retries)).await?;
+                        }
+                        self.request_completion_once(message_count, request, &mut state, &mut presentation).await
+                    };
+                    if stream {
+                        // Live streams are bounded by each network idle wait,
+                        // not by the accumulated duration of a useful response.
+                        request.await
+                    } else {
+                        tokio::time::timeout(self.llm_request_timeout, request)
+                            .await
+                            .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "LLM request deadline exceeded")))
                     }
-                    self.request_completion_once(message_count, request, &mut state, &mut presentation).await
-                }) => result.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "LLM request deadline exceeded"))),
+                } => result,
             }
         });
         // Reqwest/hyper connection tasks belong to this runtime. Shut them down
@@ -252,9 +264,10 @@ fn interrupted_error() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "interrupted by user")
 }
 
-pub(super) fn llm_client(request_timeout: Duration, connect_timeout: Duration) -> Client {
+pub(super) fn llm_client(connect_timeout: Duration) -> Client {
     Client::builder()
-        .timeout(request_timeout)
+        // The coordinator applies the total deadline to JSON requests only.
+        // A client-wide timeout would also cut off continuously active SSE.
         .connect_timeout(connect_timeout)
         .build()
         .unwrap_or_else(|_| Client::new())
