@@ -43,6 +43,23 @@ cargo build --workspace --release
 # → target/release/theseus
 ```
 
+## Tests
+
+```sh
+cargo fmt --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
+
+# Real PTY recordings replayed through xterm.js (Node.js 22+ and Vim)
+npm --prefix tests/xterm ci --ignore-scripts --no-audit --no-fund
+npm --prefix tests/xterm test
+```
+
+See [the development guidelines](docs/GUIDELINES.md) for required checks, focused
+runs, ignored tests, version/lock-file updates and releases. The
+[xterm.js test guide](tests/xterm/README.md) describes its scenarios, failure
+artifacts and replaying a recorded run.
+
 ## Shell usage
 
 Regular input is executed as a shell command. Natural-language input is routed to
@@ -69,9 +86,6 @@ main-screen output before and after a pager/TUI remains in the application histo
 
 Agent bash output is saved in full to its tool log. The on-screen preview is
 limited to 256 KiB per command and shows the log path when that limit is reached.
-The input/output architecture is described in
-[docs/INPUT_OUTPUT.md](docs/INPUT_OUTPUT.md), with verification evidence in the
-[streaming acceptance report](docs/STREAMING_ACCEPTANCE.md).
 
 ### Streaming responses
 

@@ -719,6 +719,7 @@ pub struct DiffPhysicalTerminal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhysicalOperation {
+    /// Erase the viewport in place, preserving native scrollback.
     ClearAll,
     ScrollUp(usize),
     MoveCursor(PhysicalPosition),
@@ -1015,11 +1016,19 @@ impl DiffRenderer {
     }
 }
 
+fn clear_viewport(output: &mut impl Write) -> io::Result<()> {
+    // ED2 (ClearType::All) pushes the visible frame into scrollback in VS Code
+    // (xterm.js scrollOnEraseInDisplay) and some other terminals. That would
+    // publish mutable previews and the editor outside our stable-prefix path.
+    // ED0 from the top-left erases the same cells without scrolling them.
+    queue!(output, MoveTo(0, 0), Clear(ClearType::FromCursorDown))
+}
+
 pub fn apply_diff(output: &mut impl Write, diff: &DiffPhysicalTerminal) -> io::Result<()> {
     for operation in &diff.operations {
         match operation {
             PhysicalOperation::ClearAll => {
-                queue!(output, Clear(ClearType::All), MoveTo(0, 0))?;
+                clear_viewport(output)?;
             }
             PhysicalOperation::ScrollUp(amount) => {
                 queue!(output, ScrollUp((*amount).min(u16::MAX as usize) as u16))?;

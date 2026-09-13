@@ -286,7 +286,7 @@ impl ManagedRenderer {
                     None,
                     size.width,
                 );
-                queue!(output, Clear(ClearType::All), MoveTo(0, 0))?;
+                clear_viewport(output)?;
                 for row in &tail.rows {
                     publish_row(output, row)?;
                 }
@@ -324,7 +324,7 @@ impl ManagedRenderer {
         for unit in publication.iter().take_while(|unit| unit.stable) {
             let end = self.layout.heights.prefix_sum(unit.end);
             if start < native_end && native_end < end {
-                queue!(output, Clear(ClearType::All), MoveTo(0, 0))?;
+                clear_viewport(output)?;
                 for absolute in native_end..end {
                     let (line, row) = self
                         .layout
@@ -456,7 +456,7 @@ impl ManagedRenderer {
                         partial.row(&self.layout.logical_lines[line], row, line - first, unit)
                     {
                         if !wrote {
-                            queue!(output, Clear(ClearType::All), MoveTo(0, 0))?;
+                            clear_viewport(output)?;
                             wrote = true;
                         }
                         publish_row(output, &next.row)?;
@@ -567,13 +567,19 @@ fn fit_row(row: &PhysicalRow, width: usize) -> PhysicalRow {
 }
 
 fn publish_row(output: &mut impl Write, row: &PhysicalRow) -> io::Result<()> {
+    // A line feed at the bottom margin appends the top row to scrollback.
+    // CSI S drops that row without saving it in xterm.js. Move explicitly
+    // before LF so a full-width row cannot trigger an extra autowrap scroll.
+    // CUP clamps to the actual bottom even if a resize has overtaken this frame.
+    // Leave room for crossterm's conversion to a one-based row number.
     queue!(
         output,
         MoveTo(0, 0),
         Print("\x1b[0m"),
         Print(row_terminal_text(row, 0, row.cells.len())),
         Print("\x1b[0m"),
-        ScrollUp(1)
+        MoveTo(0, u16::MAX - 1),
+        Print("\n")
     )
 }
 
@@ -618,6 +624,22 @@ fn publish_row_at_width(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_width_publication_scrolls_once_at_the_actual_terminal_height() {
+        let scene = screen(vec![RenderLine::plain("PUBLISHED_01")]);
+        let layout = layout_virtual_screen(&scene, TerminalSize::new(12, 6));
+        let mut bytes = Vec::new();
+        publish_row(&mut bytes, &layout.rows[0]).unwrap();
+        for height in [1, 6, 9] {
+            let mut terminal = vt100::Parser::new(height, 12, 100);
+            terminal.process(&bytes);
+            assert_eq!(terminal.screen().contents(), "");
+            terminal.screen_mut().set_scrollback(100);
+            assert_eq!(terminal.screen().scrollback(), 1);
+            assert_eq!(terminal.screen().contents(), "PUBLISHED_01");
+        }
+    }
 
     #[test]
     fn busy_footer_follows_output_and_moves_back_after_preview_shrinks() {

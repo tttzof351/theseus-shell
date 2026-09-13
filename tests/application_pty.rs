@@ -17,6 +17,12 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 #[path = "application_pty/streaming.rs"]
 mod streaming;
 
+#[path = "application_pty/terminal.rs"]
+mod terminal;
+
+#[path = "application_pty/xterm.rs"]
+mod xterm;
+
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_TIMEOUT: Duration = Duration::from_millis(500);
 const SIZE: PtySize = PtySize {
@@ -1044,9 +1050,8 @@ fn ctrl_l_clears_virtual_transcript_and_preserves_current_input() -> io::Result<
     let clear_offset = shell.transcript_len();
     shell.write("\x0c")?;
     let after_clear = shell.wait_until(|bytes| {
-        bytes
-            .get(clear_offset..)
-            .is_some_and(|tail| find_bytes(tail, b"\x1b[2J").is_some())
+        bytes.len() > clear_offset
+            && !screen_text(bytes).contains(MARKER)
             && settled_prompt_is_visible(bytes)
     })?;
     let screen = screen_text(&after_clear);
@@ -1129,7 +1134,7 @@ fn git_branch_output_has_no_extra_rows_around_streamed_output() -> io::Result<()
     let tail = &transcript[offset..];
     let streamed_output_end = find_bytes(tail, b"master").expect("streamed branch output");
     let renderer_resume = streamed_output_end
-        + find_bytes(&tail[streamed_output_end..], b"\x1b[2J")
+        + find_bytes(&tail[streamed_output_end..], b"\x1b[1;1H\x1b[J")
             .expect("renderer recovery frame after streamed branch output");
     let streamed_rows = terminal_history_rows(&transcript[..offset + renderer_resume]);
     let streamed_command_row = streamed_rows

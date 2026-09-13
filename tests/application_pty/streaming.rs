@@ -218,6 +218,7 @@ struct Ui {
     server: SseServer,
     resizes: Vec<(usize, u16, u16)>,
     observer: RefCell<Observation>,
+    xterm: xterm::Trace,
 }
 
 struct Observation {
@@ -247,20 +248,21 @@ impl Ui {
                 offset: 0,
                 resizes: 0,
             }),
+            xterm: xterm::Trace::default(),
         })
     }
 
-    fn parser(&self, bytes: &[u8]) -> vt100::Parser {
-        let mut parser = vt100::Parser::new(SIZE.rows, SIZE.cols, 20_000);
+    fn parser(&self, bytes: &[u8], scroll_on_erase: bool) -> vt100::Parser {
+        let mut terminal = terminal::Terminal::new(SIZE.rows, SIZE.cols, 20_000, scroll_on_erase);
         let mut offset = 0;
         for &(boundary, rows, cols) in &self.resizes {
             let boundary = boundary.min(bytes.len());
-            parser.process(&bytes[offset..boundary]);
-            parser.screen_mut().set_size(rows, cols);
+            terminal.process(&bytes[offset..boundary]);
+            terminal.parser.screen_mut().set_size(rows, cols);
             offset = boundary;
         }
-        parser.process(&bytes[offset..]);
-        parser
+        terminal.process(&bytes[offset..]);
+        terminal.parser
     }
 
     fn wait(&self, predicate: impl Fn(&vt100::Screen) -> bool) -> io::Result<Snapshot> {
@@ -286,7 +288,9 @@ impl Ui {
     }
 
     fn resize(&mut self, rows: u16, cols: u16) -> io::Result<()> {
-        self.resizes.push((self.app.transcript_len(), rows, cols));
+        let offset = self.app.transcript_len();
+        self.resizes.push((offset, rows, cols));
+        self.xterm.resize(offset, rows, cols);
         self.app
             .master
             .resize(PtySize {
@@ -299,7 +303,34 @@ impl Ui {
     }
 
     fn history(&self) -> String {
-        let mut parser = self.parser(&self.app.transcript());
+        self.history_with_scroll_on_erase(true)
+    }
+
+    fn xterm_checkpoint(&self, name: &str) {
+        self.xterm.checkpoint(self.app.transcript_len(), name);
+    }
+
+    fn export_xterm(&self, name: &str) -> io::Result<()> {
+        if std::env::var_os("THESEUS_XTERM_TRACE_DIR").is_none() {
+            return Ok(());
+        }
+        // A shell marker can arrive before the lease returns to the renderer.
+        // Record the final checkpoint only once the editable prompt is back.
+        self.wait(|screen| {
+            !screen.alternate_screen()
+                && spinner(screen).is_none()
+                && screen.cursor_position().1 > 0
+                && screen
+                    .rows(0, screen.size().1)
+                    .nth(screen.cursor_position().0 as usize)
+                    .is_some_and(|row| row.trim_end() == "tester theseus-shell>")
+        })?;
+        self.xterm_checkpoint("final");
+        self.xterm.export(name, &self.app.transcript())
+    }
+
+    fn history_with_scroll_on_erase(&self, scroll_on_erase: bool) -> String {
+        let mut parser = self.parser(&self.app.transcript(), scroll_on_erase);
         let screen = parser.screen_mut();
         let cols = screen.size().1;
         screen.set_scrollback(usize::MAX);
@@ -453,6 +484,7 @@ fn late_reference_code_table_and_unicode_publish_once_across_resize() -> io::Res
     ui.server.headers()?;
     ui.server.content("[**LINK_TITLE**][doc]")?;
     ui.wait(|screen| screen.contents().contains("[doc]"))?;
+    ui.xterm_checkpoint("unresolved-reference");
     ui.server.content("\n\n[doc]: https://example.test/guide\n\n| Key | Value |\n| --- | --- |\n| TABLE_界 | Привет |\n")?;
     ui.wait(|screen| {
         screen
@@ -461,6 +493,7 @@ fn late_reference_code_table_and_unicode_publish_once_across_resize() -> io::Res
             && screen.contents().contains("TABLE_界")
             && !screen.contents().contains("[doc]")
     })?;
+    ui.xterm_checkpoint("resolved-reference");
     ui.server
         .content("| TABLE_🙂 | мир |\n\n```rust\nlet CODE_MARKER = \"Привет界🙂\";")?;
     ui.wait(|screen| screen.contents().contains("CODE_MARKER"))?;
@@ -475,6 +508,7 @@ fn late_reference_code_table_and_unicode_publish_once_across_resize() -> io::Res
     ui.server.bytes(&data.as_bytes()[..boundary])?;
     ui.server.bytes(&data.as_bytes()[boundary..])?;
     ui.wait(|screen| screen.contents().contains("UNICODE_界🙂"))?;
+    ui.xterm_checkpoint("narrow-preview");
     ui.server.finish("stop")?;
     ui.wait(|screen| spinner(screen).is_none())?;
     ui.resize(18, 90)?;
@@ -496,11 +530,93 @@ fn late_reference_code_table_and_unicode_publish_once_across_resize() -> io::Res
         assert_eq!(history.matches(marker).count(), 1, "{marker}: {history}");
     }
     assert!(!history.contains("[doc]"), "{history}");
+    ui.export_xterm("markdown-resize")?;
     ui.app.exit()
 }
 
 fn tool_delta(command: &str) -> Value {
     json!({"role":"assistant","tool_calls":[{"index":0,"id":"call_fixture","type":"function","function":{"name":"bash","arguments":json!({"command":command}).to_string()}}]})
+}
+
+#[test]
+fn long_bash_output_then_streamed_table_publish_once_without_preview_in_history() -> io::Result<()>
+{
+    let mut ui = Ui::start()?;
+    ui.app.write("/ask list files\r")?;
+    ui.server.request()?;
+    ui.server.headers()?;
+    // More than a publication frame (128 rows), followed by a mutable table
+    // taller than the viewport. Neither command text contains an output marker.
+    ui.server.delta(tool_delta(
+        "i=0; while [ $i -lt 180 ]; do printf 'BASH_%s_%03d\\n' ROW $i; i=$((i+1)); done",
+    ))?;
+    ui.server.finish("tool_calls")?;
+    ui.server.request()?;
+    ui.wait(|screen| screen.contents().contains("BASH_ROW_179"))?;
+    ui.xterm_checkpoint("tool-tail");
+    ui.server.headers()?;
+    ui.server.delta(json!({"reasoning":"TABLE_REASONING"}))?;
+    ui.server
+        .content("TABLE_INTRO\n\n| File | Bytes |\n| --- | --- |\n")?;
+    ui.app.write("KEPT_DRAFT")?;
+    for i in 0..36 {
+        ui.server
+            .content(&format!("| TABLE_ROW_{i:03} | {} |\n", 1000 + i))?;
+        ui.wait(|screen| {
+            screen.contents().contains(&format!("TABLE_ROW_{i:03}"))
+                && screen.contents().contains("KEPT_DRAFT")
+                && spinner(screen).is_some()
+        })?;
+        if matches!(i, 18 | 35) {
+            ui.xterm_checkpoint(&format!("table-preview-{i}"));
+        }
+    }
+    ui.server.content("\nTABLE_SUMMARY")?;
+    ui.server.finish("stop")?;
+    ui.wait(|screen| screen.contents().contains("TABLE_SUMMARY") && spinner(screen).is_none())?;
+    ui.xterm_checkpoint("table-complete");
+    // Grow native history again after completion, exposing a leaked preview
+    // even if it would otherwise remain hidden above the live viewport.
+    ui.app.write(&"\x7f".repeat("KEPT_DRAFT".len()))?;
+    ui.app.write("printf 'AFTER_%s\\n' TABLE\r")?;
+    ui.wait(|screen| {
+        screen
+            .rows(0, screen.size().1)
+            .any(|row| row == "AFTER_TABLE")
+    })?;
+    assert_eq!(
+        terminal::scroll_up_commands(&ui.app.transcript()),
+        0,
+        "CSI S discards published rows in xterm.js instead of saving them to scrollback"
+    );
+    for scroll_on_erase in [false, true] {
+        let history = ui.history_with_scroll_on_erase(scroll_on_erase);
+        let markers = (0..180)
+            .map(|i| format!("BASH_ROW_{i:03}"))
+            .chain(["TABLE_REASONING".to_string(), "TABLE_INTRO".to_string()])
+            .chain((0..36).map(|i| format!("TABLE_ROW_{i:03}")))
+            .chain(["TABLE_SUMMARY".to_string(), "AFTER_TABLE".to_string()]);
+        let mut previous = 0;
+        for marker in markers {
+            assert_eq!(
+                history.matches(&marker).count(),
+                1,
+                "{marker}, scroll_on_erase={scroll_on_erase}: {history}"
+            );
+            let position = history.find(&marker).unwrap();
+            assert!(position >= previous, "{marker}: {history}");
+            previous = position;
+        }
+        assert!(!history.contains("KEPT_DRAFT"), "{history}");
+        assert!(
+            !history
+                .chars()
+                .any(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch)),
+            "{history}"
+        );
+    }
+    ui.export_xterm("long-bash-table")?;
+    ui.app.exit()
 }
 
 #[test]
@@ -583,6 +699,7 @@ fn cancel_provider_error_and_eof_preserve_prefix_draft_and_next_operation() -> i
         ui.wait(|screen| screen.contents().contains("PRESERVED_PREFIX"))?;
         ui.app.write("KEPT_DRAFT")?;
         ui.wait(|screen| screen.contents().contains("KEPT_DRAFT"))?;
+        ui.xterm_checkpoint("busy");
         match outcome {
             "cancel" => {
                 let started = Instant::now();
@@ -623,6 +740,7 @@ fn cancel_provider_error_and_eof_preserve_prefix_draft_and_next_operation() -> i
                     "[failed:"
                 })
         })?;
+        ui.xterm_checkpoint("interrupted");
         assert!(
             matches!(
                 ui.server.requests.try_recv(),
@@ -652,6 +770,7 @@ fn cancel_provider_error_and_eof_preserve_prefix_draft_and_next_operation() -> i
             "{outcome}: {history}"
         );
         assert!(!history.contains("LATE_REJECTED"), "{history}");
+        ui.export_xterm(&format!("interruption-{outcome}"))?;
         ui.app.exit()?;
     }
     Ok(())
@@ -1121,6 +1240,7 @@ fn sse_shell_leases_stdin_and_real_vim_return_to_streaming_without_replay() -> i
     ui.wait(|screen| screen.alternate_screen() && screen.contents().contains("sse-vim.txt"))?;
     ui.app.write("iVIM_SSE_TEXT")?;
     ui.wait(|screen| screen.contents().contains("VIM_SSE_TEXT"))?;
+    ui.xterm_checkpoint("vim-edit");
     ui.resize(18, 90)?;
     ui.app.write("_RESIZED\x1b:wq\r")?;
     ui.wait(|screen| {
@@ -1131,6 +1251,7 @@ fn sse_shell_leases_stdin_and_real_vim_return_to_streaming_without_replay() -> i
                 .is_some_and(|row| row.trim_end().ends_with('>'))
     })?;
     assert_eq!(fs::read_to_string(file)?, "VIM_SSE_TEXT_RESIZED\n");
+    ui.xterm_checkpoint("after-vim");
     ui.app.write("printf 'AFTER_%s\\n' VIM\r")?;
     ui.wait(|screen| {
         screen
@@ -1159,6 +1280,7 @@ fn sse_shell_leases_stdin_and_real_vim_return_to_streaming_without_replay() -> i
         !history.contains("VIM_SSE_TEXT"),
         "alternate buffer leaked: {history}"
     );
+    ui.export_xterm("vim-handoff")?;
     ui.app.exit()
 }
 
