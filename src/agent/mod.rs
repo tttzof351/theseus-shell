@@ -1,4 +1,5 @@
 mod compact;
+mod completion_output;
 pub(crate) mod config;
 mod core;
 mod llm;
@@ -7,6 +8,7 @@ mod mcp;
 mod messages;
 mod spinner;
 mod status;
+mod streaming;
 mod tools;
 pub(crate) mod worker;
 

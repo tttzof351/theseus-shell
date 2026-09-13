@@ -1,4 +1,10 @@
-use std::{error::Error, io, thread, time::Duration};
+use std::{io, thread, time::Duration};
+
+use super::completion_output::{CompletionOutput, CompletionResponse};
+#[cfg(test)]
+mod http_tests;
+mod transport;
+use transport::{Attempt, AttemptError, next_request_id};
 
 use reqwest::{
     Client, RequestBuilder,
@@ -12,13 +18,12 @@ use super::{
     spinner::Spinner,
     tools::tool_schemas,
 };
-use crate::common::text::{TruncatePosition, truncate_utf8_to_bytes};
 
 impl Agent {
     pub(super) fn request_completion(
         &self,
         cancellation: &crate::common::cancellation::CancellationEvent,
-    ) -> io::Result<TrajectoryMessage> {
+    ) -> io::Result<CompletionResponse> {
         let messages = self.completion_messages();
         self.request_completion_for_messages(messages, true, "chat", cancellation)
     }
@@ -36,25 +41,22 @@ impl Agent {
         include_tools: bool,
         purpose: &str,
         cancellation: &crate::common::cancellation::CancellationEvent,
-    ) -> io::Result<TrajectoryMessage> {
+    ) -> io::Result<CompletionResponse> {
+        self.latest_request_usage.set(None);
+        super::config::validate_stream_settings(&self.body, None)?;
         let message_count = messages.len();
         let request = self.build_completion_request_with_tools(messages, include_tools)?;
+        let request_id = next_request_id();
 
         let _progress = self.output.is_none().then(Spinner::start);
         let mut last_error = None;
 
         for attempt in 1..=self.llm_request_retries {
-            if let Some(output) = &self.output {
-                output.activity(
-                    "Waiting for response",
-                    &format!("attempt {attempt}/{}", self.llm_request_retries),
-                )?;
-            }
             if cancellation.cancel_if_interrupted() {
                 self.log_event(
                     "info",
                     "llm_request_interrupted",
-                    json!({ "attempt": attempt }),
+                    json!({ "request_id": request_id, "attempt": attempt }),
                 );
                 return Err(interrupted_error());
             }
@@ -62,20 +64,29 @@ impl Agent {
             match self.request_completion_once_cancellable(
                 message_count,
                 &request,
+                request_id,
                 attempt,
                 purpose,
                 cancellation,
             ) {
-                Ok(message) => return Ok(message),
+                Ok(message) => {
+                    self.latest_request_usage
+                        .set(message.trajectory.usage().cloned());
+                    return Ok(message);
+                }
                 Err(err) if is_retryable_llm_error(&err) => {
                     if attempt < self.llm_request_retries {
                         self.log_event(
                             "warn",
                             "llm_request_retry",
                             json!({
+                                "request_id": request_id,
+                                "attempt_id": format!("{request_id}:{attempt}"),
                                 "attempt": attempt,
                                 "next_attempt": attempt + 1,
                                 "error": err.to_string(),
+                                "phase": err.get_ref().and_then(|e| e.downcast_ref::<AttemptError>()).map(|e| e.phase),
+                                "failed_attempt": err.get_ref().and_then(|e| e.downcast_ref::<AttemptError>()).map(|e| e.attempt),
                             }),
                         );
                         if sleep_cancellable(
@@ -85,7 +96,7 @@ impl Agent {
                             self.log_event(
                                 "info",
                                 "llm_request_interrupted",
-                                json!({ "attempt": attempt }),
+                                json!({ "request_id": request_id, "attempt": attempt }),
                             );
                             return Err(interrupted_error());
                         }
@@ -104,156 +115,76 @@ impl Agent {
         &self,
         message_count: usize,
         request: &Value,
+        request_id: u64,
         attempt: usize,
         purpose: &str,
         cancellation: &crate::common::cancellation::CancellationEvent,
-    ) -> io::Result<TrajectoryMessage> {
+    ) -> io::Result<CompletionResponse> {
         // The request future and its runtime are owned by this call. Dropping the
         // losing branch closes the response before the worker acknowledges cancel.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(async {
+        let sink = (purpose == "chat").then(|| self.output.clone()).flatten();
+        let mut presentation = CompletionOutput::new(sink);
+        let mut state = Attempt::new(request_id, attempt, purpose);
+        let mut result = runtime.block_on(async {
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => {
-                    self.log_event("info", "llm_request_interrupted", json!({ "attempt": attempt }));
+                    self.log_event("info", "llm_request_interrupted", state.telemetry());
                     Err(interrupted_error())
                 }
-                result = self.request_completion_once(message_count, request, attempt, purpose) => result,
+                result = tokio::time::timeout(self.llm_request_timeout, async {
+                    if let Some(output) = &self.output {
+                        output.activity_async("Waiting for response", &format!("attempt {attempt}/{}", self.llm_request_retries)).await?;
+                    }
+                    self.request_completion_once(message_count, request, &mut state, &mut presentation).await
+                }) => result.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "LLM request deadline exceeded"))),
             }
-        })
-    }
-
-    async fn request_completion_once(
-        &self,
-        message_count: usize,
-        request: &Value,
-        attempt: usize,
-        purpose: &str,
-    ) -> io::Result<TrajectoryMessage> {
-        self.log_event(
-            "info",
-            "llm_request_start",
-            json!({
-                "purpose": purpose,
-                "model": self.body.get("model"),
-                "base_url": self.base_url,
-                "messages": message_count,
-                "attempt": attempt,
-                "request_timeout_seconds": self.llm_request_timeout.as_secs(),
-                "connect_timeout_seconds": self.llm_connect_timeout.as_secs(),
-            }),
-        );
-        let response = self
-            .apply_headers(self.client.post(&self.base_url))?
-            .json(&request)
-            .send()
-            .await
-            .map_err(io_other)?;
-
-        let status = response.status();
-        let headers = response_headers_json(response.headers());
-        self.log_event(
-            "info",
-            "llm_response_headers",
-            json!({
-                "status": status.as_u16(),
-                "headers": headers,
-            }),
-        );
-
-        let body_bytes = response.bytes().await.map_err(|err| {
-            self.log_event(
-                "error",
-                "llm_response_body_read_failed",
-                json!({
-                    "attempt": attempt,
-                    "status": status.as_u16(),
-                    "error": err.to_string(),
-                    "error_debug": format!("{err:?}"),
-                    "error_chain": error_chain(&err),
-                }),
-            );
-            io_other(err)
-        })?;
-        let body = String::from_utf8_lossy(&body_bytes).into_owned();
-        self.log_event(
-            "info",
-            "llm_response_body_read",
-            json!({
-                "status": status.as_u16(),
-                "body_bytes": body_bytes.len(),
-                "body_preview": truncate_for_log(&body),
-                "attempt": attempt,
-            }),
-        );
-
-        if !status.is_success() {
-            self.log_event(
-                "error",
-                "llm_request_failed",
-                json!({
-                    "status": status.as_u16(),
-                    "body": truncate_for_log(&body),
-                }),
-            );
-            return Err(io::Error::other(format!(
-                "LLM request failed with status {status}: {body}"
-            )));
+        });
+        // Reqwest/hyper connection tasks belong to this runtime. Shut them down
+        // before terminal events can wait for room in a stalled UI queue.
+        drop(runtime);
+        if cancellation.cancel_if_interrupted() {
+            result = Err(interrupted_error());
         }
-
-        let response = parse_chat_response_body(&body).inspect_err(|err| {
+        if state.format == "sse" {
+            let mut telemetry = state.telemetry();
+            if let Err(error) = &result {
+                telemetry["error_kind"] = json!(format!("{:?}", error.kind()));
+                telemetry["retryable"] = json!(is_retryable_llm_error(
+                    &state.error(io::Error::from(error.kind()))
+                ));
+            }
             self.log_event(
-                "error",
-                "llm_response_decode_failed",
-                json!({
-                    "error": err.to_string(),
-                    "body": truncate_for_log(&body),
-                }),
+                if result.is_ok() { "info" } else { "warn" },
+                match &result {
+                    Ok(_) => "llm_stream_finished",
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                        "llm_stream_cancelled"
+                    }
+                    Err(_) => "llm_stream_failed",
+                },
+                telemetry,
             );
-        })?;
-        let usage = response.usage.clone();
-        let choices_len = response.choices.len();
-        let choice = response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| io::Error::other("LLM response has no choices"))?;
-        validate_provider_finish_reason(&choice).inspect_err(|err| {
-            self.log_event(
-                "error",
-                "llm_response_invalid",
-                json!({
-                    "error": err.to_string(),
-                    "choices": choices_len,
-                    "finish_reason": choice.finish_reason.as_deref(),
-                    "native_finish_reason": choice.native_finish_reason.as_deref(),
-                    "usage": usage,
-                }),
-            );
-        })?;
-        let trajectory_message = TrajectoryMessage::with_usage(choice.message, usage.clone());
-        validate_trajectory_message(&trajectory_message).inspect_err(|err| {
-            self.log_event(
-                "error",
-                "llm_response_invalid",
-                json!({
-                    "error": err.to_string(),
-                    "choices": choices_len,
-                    "usage": usage,
-                }),
-            );
-        })?;
-        self.log_event(
-            "info",
-            "llm_request_ok",
-            json!({
-                "choices": choices_len,
-                "usage": usage,
-            }),
-        );
-        Ok(trajectory_message)
+        }
+        if result.is_ok() {
+            self.log_event("info", "llm_request_ok", state.telemetry());
+        }
+        let result = result.map_err(|error| state.error(error));
+        let outcome = match &result {
+            Ok(_) => crate::common::events::Outcome::Completed,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                crate::common::events::Outcome::Cancelled
+            }
+            Err(error) => crate::common::events::Outcome::Failed(error.to_string()),
+        };
+        let presented = presentation.finish(outcome)?;
+        result.map(|trajectory| CompletionResponse {
+            trajectory,
+            presentation: presented,
+        })
     }
 
     #[cfg(test)]
@@ -329,16 +260,26 @@ pub(super) fn llm_client(request_timeout: Duration, connect_timeout: Duration) -
         .unwrap_or_else(|_| Client::new())
 }
 
-fn truncate_for_log(text: &str) -> String {
-    const MAX_LOG_FIELD_BYTES: usize = 32 * 1024;
-
-    truncate_utf8_to_bytes(text, MAX_LOG_FIELD_BYTES, TruncatePosition::End)
-}
-
 fn response_headers_json(headers: &HeaderMap) -> Value {
     Value::Object(
         headers
             .iter()
+            .filter(|(key, _)| {
+                matches!(
+                    key.as_str(),
+                    "content-type"
+                        | "content-length"
+                        | "retry-after"
+                        | "request-id"
+                        | "x-request-id"
+                        | "x-ratelimit-limit-requests"
+                        | "x-ratelimit-limit-tokens"
+                        | "x-ratelimit-remaining-requests"
+                        | "x-ratelimit-remaining-tokens"
+                        | "x-ratelimit-reset-requests"
+                        | "x-ratelimit-reset-tokens"
+                )
+            })
             .map(|(key, value)| {
                 (
                     key.as_str().to_string(),
@@ -350,25 +291,65 @@ fn response_headers_json(headers: &HeaderMap) -> Value {
 }
 
 fn is_retryable_llm_error(err: &io::Error) -> bool {
-    err.kind() == io::ErrorKind::UnexpectedEof
-        || err.kind() == io::ErrorKind::TimedOut
-        || err.kind() == io::ErrorKind::ConnectionAborted
-        || err.kind() == io::ErrorKind::ConnectionReset
-        || err.to_string().contains("decoding response body")
+    if let Some(error) = err.get_ref().and_then(|e| e.downcast_ref::<AttemptError>()) {
+        return error.retryable
+            && !error.semantic_started
+            && err.kind() != io::ErrorKind::Interrupted;
+    }
+    matches!(
+        err.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    )
+}
+
+pub(super) fn allows_context_trim(err: &io::Error) -> bool {
+    err.kind() != io::ErrorKind::Interrupted
+        && err
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<AttemptError>())
+            .is_some_and(|error| error.provider_error && !error.semantic_started)
 }
 
 fn validate_provider_finish_reason(choice: &super::messages::ChatChoice) -> io::Result<()> {
-    if choice.native_finish_reason.as_deref() != Some("network_error") {
-        return Ok(());
+    if choice.native_finish_reason.as_deref() == Some("network_error") {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!(
+                "LLM provider returned native_finish_reason `network_error` (finish_reason: {})",
+                choice.finish_reason.as_deref().unwrap_or("unknown")
+            ),
+        ));
     }
-
-    Err(io::Error::new(
-        io::ErrorKind::ConnectionAborted,
-        format!(
-            "LLM provider returned native_finish_reason `network_error` (finish_reason: {})",
-            choice.finish_reason.as_deref().unwrap_or("unknown")
-        ),
-    ))
+    match choice.finish_reason.as_deref() {
+        None => Ok(()), // Compatibility with existing JSON endpoints/fixtures.
+        Some("length") => Ok(()),
+        Some(reason @ ("stop" | "tool_calls")) => {
+            let tools = choice
+                .message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty());
+            if (reason == "tool_calls") != tools {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "finish_reason does not match tool calls",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Some("error") => Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "Provider ended response with error",
+        )),
+        Some(reason) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported finish_reason: {reason}"),
+        )),
+    }
 }
 
 fn validate_trajectory_message(message: &TrajectoryMessage) -> io::Result<()> {
@@ -378,6 +359,44 @@ fn validate_trajectory_message(message: &TrajectoryMessage) -> io::Result<()> {
             "LLM response choice did not contain a chat message",
         ));
     };
+    if message.role != "assistant" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "LLM response role is not assistant",
+        ));
+    }
+    if message
+        .reasoning_details
+        .as_ref()
+        .is_some_and(|details| details.iter().any(|detail| !detail.is_object()))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reasoning_details must contain objects",
+        ));
+    }
+    let mut ids = std::collections::HashSet::new();
+    for call in message.tool_calls.as_deref().unwrap_or_default() {
+        if call.id.is_empty()
+            || !ids.insert(&call.id)
+            || call.kind != "function"
+            || call.function.name.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid or duplicate LLM tool call",
+            ));
+        }
+        let arguments = serde_json::from_str::<Value>(&call.function.arguments).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "Invalid JSON tool arguments")
+        })?;
+        if !arguments.is_object() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Tool arguments must be a JSON object",
+            ));
+        }
+    }
     let has_content = message
         .content_text()
         .as_deref()
@@ -446,22 +465,6 @@ fn error_code_string(value: &Value) -> Option<String> {
         .or_else(|| value.as_u64().map(|code| code.to_string()))
 }
 
-fn error_chain(err: &dyn Error) -> Vec<String> {
-    let mut chain = vec![err.to_string()];
-    let mut current = err.source();
-
-    while let Some(source) = current {
-        chain.push(source.to_string());
-        current = source.source();
-    }
-
-    chain
-}
-
-fn io_other(err: impl std::error::Error + Send + Sync + 'static) -> io::Error {
-    io::Error::other(err)
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::messages::ChatMessage;
@@ -474,6 +477,31 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn response_telemetry_only_keeps_known_non_secret_headers() {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("content-type", "text/event-stream"),
+            ("x-request-id", "request-123"),
+            ("retry-after", "1"),
+            ("set-cookie", "secret"),
+            ("authorization", "secret"),
+            ("x-api-key", "secret"),
+            ("x-provider-session-token", "secret"),
+        ] {
+            headers.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+        }
+        assert_eq!(
+            response_headers_json(&headers),
+            json!({
+                "content-type":"text/event-stream", "x-request-id":"request-123", "retry-after":"1"
+            })
+        );
+    }
 
     #[test]
     fn completion_request_preserves_configured_body_and_overlays_runtime_fields() {
@@ -733,6 +761,7 @@ mod tests {
                 .request_completion_once_cancellable(
                     0,
                     &json!({"messages": []}),
+                    next_request_id(),
                     1,
                     "test",
                     &cancellation,
@@ -828,7 +857,7 @@ mod tests {
         (format!("http://{address}/chat"), requests, server)
     }
 
-    fn read_http_json_request(stream: &mut impl Read) -> Value {
+    pub(super) fn read_http_json_request(stream: &mut impl Read) -> Value {
         let mut bytes = Vec::new();
         let mut buffer = [0; 8192];
         loop {

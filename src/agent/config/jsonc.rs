@@ -58,11 +58,15 @@ pub(super) fn jsonc_parse_options() -> ParseOptions {
 
 fn llm_request_settings_jsonc(settings: &LlmRequestSettings) -> String {
     format!(
-        "{{\n    \"base_url\": {},\n    \"retries\": {},\n    \"connect_timeout_seconds\": {},\n    \"request_timeout_seconds\": {},\n    \"body\": {},\n    \"header\": {}\n  }}",
+        "{{\n    \"base_url\": {},\n    \"retries\": {},\n    \"connect_timeout_seconds\": {},\n    \"request_timeout_seconds\": {},\n{}    \"body\": {},\n    \"header\": {}\n  }}",
         pretty_json(&json!(settings.base_url)),
         settings.retries,
         settings.connect_timeout_seconds,
         settings.request_timeout_seconds,
+        settings
+            .stream_idle_timeout_seconds
+            .map(|seconds| format!("    \"stream_idle_timeout_seconds\": {seconds},\n"))
+            .unwrap_or_default(),
         pretty_json_indented(&Value::Object(settings.body.clone()), "      "),
         pretty_json_indented(&json!(settings.header), "      "),
     )
@@ -432,12 +436,17 @@ fn validate_build_in_tools(build_in_tools: &[String]) -> io::Result<()> {
 fn read_llm_request_settings(object: &Map<String, Value>) -> io::Result<LlmRequestSettings> {
     let settings = read_object_ref(object, "llm_request_settings")?;
 
+    let body = read_object_field(settings, "body")?;
+    let stream_idle_timeout_seconds =
+        read_optional_usize_field(settings, "stream_idle_timeout_seconds")?;
+    super::validate_stream_settings(&body, stream_idle_timeout_seconds)?;
     Ok(LlmRequestSettings {
         base_url: read_string_field(settings, "base_url")?,
         retries: read_usize_field(settings, "retries")?,
         request_timeout_seconds: read_usize_field(settings, "request_timeout_seconds")?,
         connect_timeout_seconds: read_usize_field(settings, "connect_timeout_seconds")?,
-        body: read_object_field(settings, "body")?,
+        stream_idle_timeout_seconds,
+        body,
         header: read_string_map_field(settings, "header")?,
     })
 }

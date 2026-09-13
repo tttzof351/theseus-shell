@@ -55,6 +55,7 @@ fn fixture_child() {
             }
             crate::agent::worker::Operation::Run { .. } => {
                 run_script(&script_directory, output, cancellation)
+                    .map(crate::agent::worker::RunResult::from)
             }
             operation @ crate::agent::worker::Operation::ModelCatalog { .. } => {
                 if script_directory.join("hold-model-catalog").exists() {

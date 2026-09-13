@@ -38,12 +38,14 @@ pub struct Agent {
     pub(super) llm_request_retries: usize,
     pub(super) llm_request_timeout: Duration,
     pub(super) llm_connect_timeout: Duration,
+    pub(super) stream_idle_timeout: Duration,
     pub(super) build_in_tools: Vec<String>,
     pub(super) mcp: McpManager,
     pub(super) system_prompt: String,
     pub(super) compact_prompt: String,
     pub(super) client: Client,
     pub(super) trajectory: Vec<TrajectoryMessage>,
+    pub(super) latest_request_usage: super::status::LatestRequestUsage,
     pub(super) logger: Option<AppLogger>,
     pub(super) output: Option<EventSink>,
 }
@@ -109,12 +111,20 @@ impl Agent {
             llm_request_retries,
             llm_request_timeout,
             llm_connect_timeout,
+            stream_idle_timeout: Duration::from_secs(
+                config
+                    .llm_request_settings
+                    .stream_idle_timeout_seconds
+                    .unwrap_or(super::config::models::DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS)
+                    as u64,
+            ),
             build_in_tools: config.agent_settings.build_in_tools,
             mcp: McpManager::new(config.mcp_servers),
             system_prompt,
             compact_prompt,
             client: super::llm::llm_client(llm_request_timeout, llm_connect_timeout),
             trajectory,
+            latest_request_usage: super::status::LatestRequestUsage::default(),
             logger: None,
             output: None,
         }
@@ -122,6 +132,7 @@ impl Agent {
 
     pub fn reset_context(&mut self) {
         self.trajectory = initial_trajectory(self.model_name(), self.system_prompt.clone());
+        self.latest_request_usage.set(None);
     }
 
     pub(crate) fn model_name(&self) -> Option<String> {
@@ -167,6 +178,13 @@ impl Agent {
             return Err(io::ErrorKind::Interrupted.into());
         }
         self.trajectory = messages;
+        let latest = self.trajectory.iter().rev().find(|entry| {
+            entry
+                .message()
+                .is_some_and(|message| matches!(message.role.as_str(), "user" | "assistant"))
+        });
+        self.latest_request_usage
+            .set(latest.and_then(|entry| entry.usage().cloned()));
         self.log_event(
             "info",
             "agent_trajectory_resumed",
@@ -209,6 +227,12 @@ impl Agent {
     }
 
     pub(super) fn push_trajectory_message(&mut self, message: TrajectoryMessage) {
+        if message
+            .message()
+            .is_some_and(|message| message.role == "assistant")
+        {
+            self.latest_request_usage.set(message.usage().cloned());
+        }
         self.trajectory.push(message);
     }
 }
@@ -313,6 +337,59 @@ pub(super) fn ensure_trailing_newline(mut text: String) -> String {
 mod tests {
     use super::super::config::models;
     use super::*;
+
+    #[test]
+    fn sse_and_json_reasoning_survive_snapshot_resume_and_next_request() -> io::Result<()> {
+        use crate::agent::streaming::Accumulator;
+        use serde_json::json;
+        let details = json!([
+            {"index":0,"id":"text","type":"reasoning.text","text":"visible","format":"provider","signature":"signed-text"},
+            {"index":1,"id":"encrypted","type":"reasoning.encrypted","data":"opaque-payload","extension":{"version":2}}
+        ]);
+        let mut stream = Accumulator::default();
+        stream.push(&json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"answer","reasoning_details":details}}]}).to_string()).unwrap();
+        stream.push(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7}}"#).unwrap();
+        stream.push("[DONE]").unwrap();
+        let sse = stream.finish().unwrap().trajectory;
+        let json: TrajectoryMessage = serde_json::from_value(
+            json!({"role":"assistant","content":"answer","reasoning_details":details,"usage":{"prompt_tokens":7}}),
+        )?;
+        assert_eq!(serde_json::to_value(&sse)?, serde_json::to_value(&json)?);
+        let directory = std::env::temp_dir().join(format!(
+            "theseus-reasoning-resume-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory)?;
+        let path = directory.join("trajectory.json");
+        for assistant in [sse, json] {
+            let mut agent = Agent::new(AgentConfig::default_empty());
+            let mut snapshot = agent.trajectory.clone();
+            snapshot.push(TrajectoryMessage::new(ChatMessage::user(
+                "old snapshot without reasoning_details",
+            )));
+            snapshot.push(assistant);
+            fs::write(&path, serde_json::to_vec(&json!({"messages":snapshot}))?)?;
+            agent.resume_trajectory_from_path(&path, &CancellationEvent::new())?;
+            let request = agent.build_completion_request_with_tools(
+                agent
+                    .trajectory
+                    .iter()
+                    .filter_map(|entry| entry.message().cloned())
+                    .collect(),
+                false,
+            )?;
+            let messages = request["messages"].as_array().unwrap();
+            assert!(messages[1].get("reasoning_details").is_none());
+            assert_eq!(messages.last().unwrap()["reasoning_details"], details);
+            assert_eq!(agent.latest_context_tokens(), Some(7));
+        }
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
 
     #[test]
     fn resume_cancel_during_large_string_or_final_read_preserves_context() {

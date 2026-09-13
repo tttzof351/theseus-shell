@@ -71,8 +71,46 @@ Agent bash output is saved in full to its tool log. The on-screen preview is
 limited to 256 KiB per command and shows the log path when that limit is reached.
 The input/output architecture is described in
 [docs/INPUT_OUTPUT.md](docs/INPUT_OUTPUT.md), with verification evidence in the
-[acceptance report](docs/INPUT_OUTPUT_ACCEPTANCE.md). LLM responses still use JSON;
-SSE streaming is the next stage after the completed I/O refactoring.
+[streaming acceptance report](docs/STREAMING_ACCEPTANCE.md).
+
+### Streaming responses
+
+Streaming is opt-in for Chat Completions endpoints. Merge these settings into
+`~/.theseus/config.jsonc`, preserving the existing model, headers and other fields,
+then restart Theseus:
+
+```jsonc
+"llm_request_settings": {
+  "request_timeout_seconds": 600,
+  "stream_idle_timeout_seconds": 60,
+  "body": {
+    "stream": true
+  }
+}
+```
+
+With `stream` absent or `false`, requests retain the JSON response path. Streaming
+supports one choice (`n` absent or `1`); explicit `stream_options` are passed through.
+An endpoint returning JSON to a streaming request is handled without a second request.
+
+In the terminal, reasoning and formatted Markdown appear as they arrive, above the
+existing spinner and editor. Tools execute only after `[DONE]` and validation of
+the complete assistant message. Cancelled or interrupted streams retain their
+visible prefix; they are not retried after semantic data has arrived.
+
+`request_timeout_seconds` limits the whole HTTP attempt, including waits for the
+output queue. `stream_idle_timeout_seconds` limits each wait for headers or more
+network data and defaults to 60 seconds; it must be positive. Keep-alive comments
+reset the idle wait, but do not extend the overall deadline. Responses are limited
+to 8 MiB per unfinished SSE event and 32 MiB of accumulated message fields.
+
+For pipes and headless mode (`theseus -p ...`), replaceable text is buffered until
+its block finishes, then printed once without ANSI controls. Tool output lines
+remain live. `/compact` uses streaming internally without displaying its summary.
+Public `Agent::run` and `run_with_context` continue returning the complete String.
+`/status` shows unavailable usage as `n/a` and marks incomplete totals as `partial`.
+The last known context-token estimate is listed separately and still guards the
+context limit when the current request has no usage.
 
 To start Theseus automatically from `~/.zshrc`, guard it with
 `THESEUS_ACTIVE` so commands executed by Theseus can still load your aliases

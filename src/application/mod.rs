@@ -2188,6 +2188,40 @@ mod tests {
     }
 
     #[test]
+    fn config_model_and_key_edits_preserve_streaming_settings_and_comments() {
+        let path = temporary_test_path("streaming-config-patch");
+        AgentConfig::load_or_create_at(path.clone()).unwrap();
+        let original = fs::read_to_string(&path).unwrap()
+            .replacen("\"llm_request_settings\": {", "\"llm_request_settings\": {\n    // keep network timeout\n    \"stream_idle_timeout_seconds\": 17,", 1)
+            .replacen("\"body\": {", "\"body\": {\n      // explicit streaming options\n      \"stream\": true,\n      \"stream_options\": { \"include_usage\": true },", 1);
+        fs::write(&path, &original).unwrap();
+        for patch in [
+            ConfigPatch::SetModel("example/stream-model".into()),
+            ConfigPatch::SetAuthorization("Bearer new-fixture-key".into()),
+        ] {
+            let config = patch_config_jsonc_file(&path, patch).unwrap();
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(text.contains("// keep network timeout"));
+            assert!(text.contains("// explicit streaming options"));
+            assert!(text.contains("\"stream_options\": { \"include_usage\": true }"));
+            assert_eq!(
+                config.llm_request_settings.stream_idle_timeout_seconds,
+                Some(17)
+            );
+            assert_eq!(config.llm_request_settings.body["stream"], true);
+            assert_eq!(
+                config.llm_request_settings.body["stream_options"]["include_usage"],
+                true
+            );
+            assert_eq!(
+                config.llm_request_settings.body["model"],
+                "example/stream-model"
+            );
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn enter_creates_new_prompt_and_moves_virtual_cursor() {
         let screen = VirtualScreen::from_render_lines(
             vec![

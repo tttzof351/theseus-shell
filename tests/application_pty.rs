@@ -14,6 +14,9 @@ use std::{
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+#[path = "application_pty/streaming.rs"]
+mod streaming;
+
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_TIMEOUT: Duration = Duration::from_millis(500);
 const SIZE: PtySize = PtySize {

@@ -3,7 +3,7 @@
 use std::{
     io,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, TryLockError,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
@@ -131,7 +131,6 @@ pub(crate) struct BackendEvent {
 struct Ingress {
     tx: SyncSender<BackendEvent>,
     sequence: u64,
-    next_block: u64,
     finished: bool,
 }
 
@@ -140,6 +139,7 @@ pub(crate) struct EventSink {
     operation: OperationId,
     ingress: Arc<Mutex<Ingress>>,
     cancellation: CancellationEvent,
+    next_block: Arc<AtomicU64>,
 }
 
 impl EventSink {
@@ -158,10 +158,10 @@ impl EventSink {
                 ingress: Arc::new(Mutex::new(Ingress {
                     tx,
                     sequence: 0,
-                    next_block: 0,
                     finished: false,
                 })),
                 cancellation,
+                next_block: Arc::new(AtomicU64::new(1)),
             },
             rx,
         )
@@ -175,20 +175,28 @@ impl EventSink {
         self.send(event, false)
     }
 
-    fn send(&self, event: OutputEvent, terminal: bool) -> io::Result<()> {
-        let payload_bytes = event.payload_bytes();
-        if payload_bytes > MAX_EVENT_BYTES {
+    // The guard covers one enqueue attempt only. Both sync and async producers
+    // share this ordering point; queue pressure never holds the ingress lock.
+    fn try_enqueue(&self, event: OutputEvent, terminal: bool) -> io::Result<Option<OutputEvent>> {
+        if event.payload_bytes() > MAX_EVENT_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "output event exceeds payload budget",
             ));
         }
-        // This mutex orders concurrent stdout/stderr producers. Cancellation
-        // itself is an independent atomic, never queued behind output.
-        let mut ingress = self
-            .ingress
-            .lock()
-            .map_err(|_| io::Error::other("output ingress poisoned"))?;
+        if !terminal && self.cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "output cancelled",
+            ));
+        }
+        let mut ingress = match self.ingress.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(Some(event)),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(io::Error::other("output ingress poisoned"));
+            }
+        };
         if ingress.finished {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -196,50 +204,79 @@ impl EventSink {
             ));
         }
         let is_finish = matches!(event, OutputEvent::Finished { .. });
-        let mut message = BackendEvent {
+        let message = BackendEvent {
             operation: self.operation,
             sequence: ingress.sequence + 1,
             event,
         };
-        loop {
-            if !terminal && self.cancellation.is_cancelled() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "output cancelled",
-                ));
+        match ingress.tx.try_send(message) {
+            Ok(()) => {
+                ingress.sequence += 1;
+                ingress.finished = is_finish;
+                Ok(None)
             }
-            match ingress.tx.try_send(message) {
-                Ok(()) => {
-                    ingress.sequence += 1;
-                    ingress.finished = is_finish;
-                    return Ok(());
-                }
-                Err(TrySendError::Full(pending)) => {
-                    message = pending;
-                    thread::sleep(Duration::from_millis(2));
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    self.cancellation.cancel();
-                    return Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "output consumer stopped",
-                    ));
-                }
+            Err(TrySendError::Full(pending)) => Ok(Some(pending.event)),
+            Err(TrySendError::Disconnected(_)) => {
+                self.cancellation.cancel();
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "output consumer stopped",
+                ))
             }
         }
     }
 
+    fn send(&self, mut event: OutputEvent, terminal: bool) -> io::Result<()> {
+        while let Some(pending) = self.try_enqueue(event, terminal)? {
+            event = pending;
+            thread::sleep(Duration::from_millis(2));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn emit_async(&self, mut event: OutputEvent) -> io::Result<()> {
+        while let Some(pending) = self.try_enqueue(event, false)? {
+            event = pending;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        Ok(())
+    }
+
     pub(crate) fn start_block(&self, kind: BlockKind) -> io::Result<BlockId> {
-        let id = {
-            let mut ingress = self
-                .ingress
-                .lock()
-                .map_err(|_| io::Error::other("output ingress poisoned"))?;
-            ingress.next_block += 1;
-            BlockId(ingress.next_block)
-        };
+        let id = BlockId(self.next_block.fetch_add(1, Ordering::Relaxed));
         self.emit(OutputEvent::BlockStarted { id, kind })?;
         Ok(id)
+    }
+
+    pub(crate) async fn start_block_async(&self, kind: BlockKind) -> io::Result<BlockId> {
+        let id = BlockId(self.next_block.fetch_add(1, Ordering::Relaxed));
+        self.emit_async(OutputEvent::BlockStarted { id, kind })
+            .await?;
+        Ok(id)
+    }
+
+    pub(crate) async fn text_async(&self, id: BlockId, mut text: &str) -> io::Result<()> {
+        while !text.is_empty() {
+            let mut end = text.len().min(MAX_EVENT_BYTES);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.emit_async(OutputEvent::TextAppended {
+                id,
+                text: text[..end].into(),
+            })
+            .await?;
+            text = &text[end..];
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn activity_async(&self, phase: &str, detail: &str) -> io::Result<()> {
+        self.emit_async(OutputEvent::Activity {
+            phase: bounded_diagnostic(phase, MAX_EVENT_BYTES / 2),
+            detail: bounded_diagnostic(detail, MAX_EVENT_BYTES / 2),
+        })
+        .await
     }
 
     pub(crate) fn text(&self, id: BlockId, text: &str) -> io::Result<()> {
@@ -324,6 +361,159 @@ fn bounded_outcome(outcome: Outcome) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_async_queue_yields_to_deadline_and_does_not_consume_sequence() {
+        let cancellation = CancellationEvent::new();
+        let (sink, rx) = EventSink::with_capacity(cancellation.clone(), 1);
+        sink.emit(OutputEvent::Started).unwrap();
+        // A blocking implementation is released by the watchdog, then fails
+        // the latency assertion instead of stranding the test executable.
+        let (done, finished) = mpsc::channel();
+        let watchdog = thread::spawn(move || {
+            if finished.recv_timeout(Duration::from_secs(1)).is_err() {
+                cancellation.cancel();
+            }
+        });
+        let started = std::time::Instant::now();
+        let timeout = tokio::time::timeout(
+            Duration::from_millis(20),
+            sink.activity_async("pending", ""),
+        )
+        .await;
+        let _ = done.send(());
+        watchdog.join().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(timeout.is_err());
+        assert_eq!(rx.recv().unwrap().sequence, 1);
+        sink.activity_async("accepted", "").await.unwrap();
+        assert_eq!(rx.recv().unwrap().sequence, 2);
+        sink.finish(Outcome::Completed).unwrap();
+        assert_eq!(rx.recv().unwrap().sequence, 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_queue_cancel_and_disconnect_keep_accepted_data() {
+        for disconnect in [false, true] {
+            let cancellation = CancellationEvent::new();
+            let (sink, rx) = EventSink::with_capacity(cancellation.clone(), 1);
+            sink.emit(OutputEvent::Started).unwrap();
+            let started = std::time::Instant::now();
+            let consumer = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                if disconnect {
+                    drop(rx);
+                    None
+                } else {
+                    cancellation.cancel();
+                    Some(rx)
+                }
+            });
+            let error = sink.activity_async("pending", "").await.unwrap_err();
+            let rx = consumer.join().unwrap();
+            assert!(started.elapsed() < Duration::from_millis(250));
+            assert_eq!(
+                error.kind(),
+                if disconnect {
+                    io::ErrorKind::BrokenPipe
+                } else {
+                    io::ErrorKind::Interrupted
+                }
+            );
+            if let Some(rx) = rx {
+                assert_eq!(rx.recv().unwrap().event, OutputEvent::Started);
+                assert!(rx.try_recv().is_err());
+                sink.finish(Outcome::Cancelled).unwrap();
+                assert_eq!(rx.recv().unwrap().sequence, 2);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mixed_sync_async_producers_share_order_and_utf8_payload_limits() {
+        let (sink, rx) = EventSink::with_capacity(CancellationEvent::new(), 2);
+        let consumer = thread::spawn(move || {
+            let mut events = Vec::new();
+            while let Ok(event) = rx.recv_timeout(Duration::from_secs(2)) {
+                let finished = matches!(event.event, OutputEvent::Finished { .. });
+                events.push(event);
+                if finished {
+                    break;
+                }
+            }
+            events
+        });
+        let text_id = sink.start_block_async(BlockKind::Markdown).await.unwrap();
+        let sync = sink.clone();
+        let producer = thread::spawn(move || {
+            let id = sync.start_block(BlockKind::ToolOutput).unwrap();
+            for byte in 0..80 {
+                sync.bytes(id, 0, &[byte]).unwrap();
+            }
+            sync.finish_block(id, Outcome::Completed).unwrap();
+        });
+        let text = "界🙂".repeat(MAX_EVENT_BYTES);
+        sink.text_async(text_id, &text).await.unwrap();
+        producer.join().unwrap();
+        sink.finish_block(text_id, Outcome::Completed).unwrap();
+        sink.finish(Outcome::Completed).unwrap();
+        let events = consumer.join().unwrap();
+        let mut rendered = String::new();
+        let mut bytes = Vec::new();
+        for (i, event) in events.iter().enumerate() {
+            assert_eq!(event.sequence, i as u64 + 1);
+            assert!(event.event.payload_bytes() <= MAX_EVENT_BYTES);
+            match &event.event {
+                OutputEvent::TextAppended { text, .. } => rendered.push_str(text),
+                OutputEvent::BytesAppended { bytes: data, .. } => bytes.extend_from_slice(data),
+                _ => {}
+            }
+        }
+        assert_eq!(rendered, text);
+        assert_eq!(bytes, (0..80u8).collect::<Vec<_>>());
+        assert!(matches!(
+            events.last().unwrap().event,
+            OutputEvent::Finished { .. }
+        ));
+        assert_eq!(
+            sink.activity_async("late", "").await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_ingress_lock_contention_yields_and_oversize_is_rejected() {
+        let (sink, rx) = EventSink::channel(CancellationEvent::new());
+        let ingress = sink.ingress.clone();
+        let (held_tx, held) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let locker = thread::spawn(move || {
+            let _guard = ingress.lock().unwrap();
+            held_tx.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(1)).unwrap();
+        });
+        held.recv().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            sink.emit_async(OutputEvent::Started),
+        )
+        .await;
+        release.send(()).unwrap();
+        locker.join().unwrap();
+        assert!(result.is_err());
+        assert!(rx.try_recv().is_err());
+        let error = sink
+            .emit_async(OutputEvent::BlockReplaced {
+                id: BlockId(1),
+                revision: 1,
+                text: "x".repeat(MAX_EVENT_BYTES + 1),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        sink.emit_async(OutputEvent::Started).await.unwrap();
+        assert_eq!(rx.recv().unwrap().sequence, 1);
+    }
 
     #[test]
     fn cancelling_a_full_queue_releases_the_producer_without_losing_queued_data() {

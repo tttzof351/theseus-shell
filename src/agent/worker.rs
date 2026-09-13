@@ -1,5 +1,7 @@
 //! The UI owns neither Agent locks nor the lifetime of an individual HTTP call.
 
+use super::completion_output::Presentation;
+pub(crate) use super::completion_output::RunResult;
 use super::{Agent, AgentConfig, AgentRunContext, CompactOutcome};
 use crate::{
     common::{
@@ -110,7 +112,7 @@ impl AgentWorker {
             Operation,
             &EventSink,
             &CancellationEvent,
-        ) -> io::Result<String>
+        ) -> io::Result<RunResult>
         + Send
         + 'static,
     ) -> io::Result<Self> {
@@ -168,10 +170,12 @@ impl AgentWorker {
                                 Ok(_) => Outcome::Completed,
                             };
                             match &result {
-                                Ok(text)
-                                    if !text.trim().is_empty() && !cancellation.is_cancelled() =>
+                                Ok(result)
+                                    if result.presentation == Presentation::Pending
+                                        && !result.text.trim().is_empty()
+                                        && !cancellation.is_cancelled() =>
                                 {
-                                    let _ = output.message(BlockKind::Markdown, text);
+                                    let _ = output.message(BlockKind::Markdown, &result.text);
                                 }
                                 _ => {}
                             }
@@ -182,7 +186,7 @@ impl AgentWorker {
                                 agent.status_text();
                             *worker_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
                             let _ = completion.send(Completion {
-                                result,
+                                result: result.map(|result| result.text),
                                 outcome,
                                 logger: agent.logger.clone(),
                             });
@@ -279,7 +283,7 @@ pub(crate) fn execute(
     operation: Operation,
     output: &EventSink,
     cancellation: &CancellationEvent,
-) -> io::Result<String> {
+) -> io::Result<RunResult> {
     match operation {
         Operation::Configure { config, logger } => {
             let _ = output.activity("Applying configuration", "");
@@ -303,7 +307,7 @@ pub(crate) fn execute(
         } => {
             context.output = Some(output.clone());
             context.cancellation = cancellation.clone();
-            agent.run_with_context(&prompt, *context)
+            return agent.run_with_context_result(&prompt, *context);
         }
         Operation::Mcp => {
             let text = agent.mcp_status_text();
@@ -351,4 +355,5 @@ pub(crate) fn execute(
             }
         },
     }
+    .map(RunResult::from)
 }

@@ -216,15 +216,15 @@ impl OutputDocument {
             return false;
         }
         state.sequence = envelope.sequence;
-        self.dirty = true;
         let operation = envelope.operation;
         match envelope.event {
-            OutputEvent::Started => {}
+            OutputEvent::Started => return true,
             OutputEvent::Activity { phase, detail } => {
                 self.activity = Some((
                     super::ansi::terminal_label(&phase),
                     super::ansi::terminal_label(&detail),
                 ));
+                return true;
             }
             OutputEvent::Finished { outcome } => {
                 self.finish_operation(operation, outcome);
@@ -316,6 +316,7 @@ impl OutputDocument {
                 }
             }
         }
+        self.dirty = true;
         self.version += 1;
         true
     }
@@ -441,9 +442,54 @@ fn rebase_clear_anchor(previous: &str, next: &str, anchor: usize) -> usize {
 }
 
 #[cfg(test)]
+#[path = "output_document_streaming_tests.rs"]
+mod streaming_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::common::{cancellation::CancellationEvent, events::EventSink};
+
+    #[test]
+    fn activity_updates_status_without_invalidating_source_or_layout() {
+        let (sink, events) = crate::common::events::EventSink::channel(
+            crate::common::cancellation::CancellationEvent::new(),
+        );
+        let mut document = OutputDocument::default();
+        document.start_operation(sink.operation());
+        let block = sink.start_block(BlockKind::Markdown).unwrap();
+        sink.text(block, "**unchanged**").unwrap();
+        for event in events.try_iter() {
+            assert!(document.apply(event));
+        }
+        document.render(60);
+        let key = super::super::document_layout::Key::of(&document, 60);
+        let revision = document.blocks[0].revision;
+        let cache = document.blocks[0].cache.as_ref().unwrap().2.clone();
+        sink.activity("Waiting for response", "attempt 2/3")
+            .unwrap();
+        for event in events.try_iter() {
+            assert!(document.apply(event));
+        }
+        assert_eq!(
+            document.activity,
+            Some(("Waiting for response".into(), "attempt 2/3".into()))
+        );
+        assert_eq!(super::super::document_layout::Key::of(&document, 60), key);
+        assert!(!document.needs_render(60));
+        sink.finish_block(block, Outcome::Completed).unwrap();
+        for event in events.try_iter() {
+            assert!(document.apply(event));
+        }
+        assert_ne!(super::super::document_layout::Key::of(&document, 60), key);
+        assert!(document.needs_render(60));
+        document.render(60);
+        assert_eq!(document.blocks[0].revision, revision);
+        assert!(Arc::ptr_eq(
+            &document.blocks[0].cache.as_ref().unwrap().2,
+            &cache
+        ));
+    }
 
     #[test]
     fn finishing_text_reuses_preview_cache_and_adds_outcome_once() {

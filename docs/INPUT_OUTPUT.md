@@ -9,10 +9,19 @@ ordered event queue, edits an `OutputDocument`, and renders its current revision
 The queue holds at most 64 events, each with at most 16 KiB of payload. Text and
 byte appends split at that limit; an oversized replacement is an explicit error.
 Cancellation uses an independent handle and cannot wait behind a full queue.
+Synchronous and asynchronous producers share the same ingress, sequence and block
+allocator. The async path yields while the queue or short ingress lock is busy;
+no blocking mutex guard or thread sleep spans an await. Sequence advances only
+after successful enqueue. Terminal events follow accepted payloads, even on cancel.
 
-In managed mode the JSON agent loop emits provider reasoning as Reasoning blocks
-and text preceding tool calls as Markdown blocks. Reasoning on the final response
-is emitted too; final content is returned to AgentWorker, which emits it once.
+`agent/completion_output.rs` owns presentation for both JSON and SSE responses.
+It emits Reasoning and Markdown blocks once per completion, retaining their ids
+through validation, failure or cancellation. Content arriving before reasoning
+reserves an invisible Reasoning block so later deltas keep reasoning/content/tools
+in document order. Empty placeholders finish without an extra outcome diagnostic.
+The internal result carries full text and `Pending`/`Emitted` presentation state;
+AgentWorker emits only pending results, including local command confirmations.
+Public String APIs wrap that result without replaying SSE deltas.
 Legacy direct Agent callers keep their previous tool-message presentation.
 
 Reset and saved configuration changes are acknowledged operations too. Their
@@ -55,7 +64,8 @@ from elapsed operation time. Managed UI frames draw it without a spinner thread 
 direct terminal writes; animation frames never become document/history entries.
 While waiting for an LLM response, only the spinner is visible: the waiting label,
 elapsed time and attempt counter are omitted from that status row.
-SSE is not enabled by this refactoring.
+This includes startup before the first activity, headers, heartbeats, tool-only
+streams and retries. Activity updates do not change the source/layout version.
 
 The loop drains ready input before a bounded backend batch (normally at most
 32 KiB), and coalesces rendering at a 33 ms frame interval. Frames use a buffered
@@ -182,10 +192,45 @@ completion cannot change this protocol failure into success. Plain mode flushes
 the retained text and unfinished tool lines once on this path, including incomplete
 UTF-8, and rejects subsequent events for the closed operation.
 
-JSON HTTP requests run as scoped async futures inside the worker. Cancellation
-drops the request/response before acknowledgement; there is no detached blocking
-HTTP request thread. Retry waits and compaction share the operation's cancellation
-handle. SSE framing and LLM delta assembly are a subsequent task.
+JSON and opt-in SSE HTTP requests run as scoped async futures inside the worker.
+Cancellation drops the request/response and shuts down its Tokio runtime before
+terminal events can wait for output queue capacity. This also closes hyper's
+connection tasks when a consumer is stalled. There is no detached HTTP thread.
+Retry waits and compaction share the operation's cancellation handle.
+
+`agent/streaming/` decodes SSE framing and accumulates choice zero independently
+of the UI. It preserves UTF-8 across reads, BOM, CR/LF/CRLF, comments and multiline
+data; incomplete EOF events are discarded. A valid finish reason and `[DONE]`
+are required before trajectory commit or tool execution. Usage can arrive after
+finish_reason, and repeated usage snapshots replace previous values. Tool deltas
+assemble by index, with late identities and validated JSON object arguments.
+Reasoning text and opaque `reasoning_details` remain in trajectory and subsequent
+requests; encrypted details never become display text. Only the first nonempty
+reasoning representation is displayed, preferring string reasoning within a frame.
+
+Streaming is enabled by `llm_request_settings.body.stream: true`. Content-Type
+selects SSE or a JSON fallback for that response; unexpected formats fail without
+resubmitting. The default remains JSON. Optional `stream_idle_timeout_seconds`
+(60 seconds by default) applies to network waits, including headers; output queue
+backpressure is governed by the overall `request_timeout_seconds` deadline instead.
+Heartbeats create no mandatory UI events. Limits are 8 MiB per unfinished SSE event,
+32 MiB of aggregated fields, and a bounded HTTP error body. Decoding, accumulator
+assembly and enqueueing yield between bounded portions so cancellation/deadlines
+can make progress; semantic state is recorded before the first assembly yield.
+
+Typed attempt errors carry phase, attempt, retryability and semantic-start state.
+Only retryable failures before any content, reasoning, opaque detail or tool delta
+can retry. All attempts reuse the same request snapshot and request id, with distinct
+attempt ids. Stream milestones log aggregated timings, counters and usage presence,
+without token payloads or encrypted reasoning. Response headers use an explicit
+non-secret allowlist. `/compact` uses the same transport with progress-only
+presentation; its summary commits internally after validation. Context trimming
+can retry only a provider context-window error before semantic data arrives.
+Current-request usage resets before request preparation and is updated only after
+a validated completion. It is separate from the latest known prompt-token estimate
+in trajectory, which still protects the context limit. Status displays absent
+values as `n/a` and incomplete cumulative values as `partial`. Resume/reset and
+Agent clones maintain independent request-usage state.
 
 MCP startup, discovery and calls select cancellation alongside the network future.
 Cancelled sessions join before returning; close has a deadline. Stdio child
@@ -328,7 +373,6 @@ frames. Clippy also passes for all targets/features with `-D warnings`.
 Footer-position tests cover submitting inline/multiline requests through real PTY,
 growing/shrinking previews and pending resize without a gap above status/editor.
 
-The I/O refactoring has passed the requirement-by-requirement
-[acceptance audit](INPUT_OUTPUT_ACCEPTANCE.md). That report records evidence,
-measurement limits and the final verification commands. LLM transport still uses
-JSON; implementing SSE is the next separate stage.
+These are historical I/O-refactoring results. Current streaming implementation,
+HTTP/PTY evidence, performance measurements and completed acceptance audit are
+recorded in [STREAMING_ACCEPTANCE.md](STREAMING_ACCEPTANCE.md).

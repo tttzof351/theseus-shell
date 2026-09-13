@@ -529,10 +529,12 @@ pub(super) fn render_markdown_at_width(text: &str, width: Option<usize>) -> Stri
     let mut skin = termimad::MadSkin::default();
     skin.inline_code.object_style.background_color = None;
     skin.code_block.compound_style.object_style.background_color = None;
-    let mut rendered = match width {
-        Some(width) => skin.text(&text, Some(width.max(1))).to_string(),
-        None => skin.term_text(&text).to_string(),
+    let mut formatted = match width {
+        Some(width) => skin.text(&text, Some(width.max(1))),
+        None => skin.term_text(&text),
     };
+    constrain_wrapped_code_spacing(&mut formatted);
+    let mut rendered = formatted.to_string();
     if !rendered.ends_with('\n') {
         rendered.push('\n');
     }
@@ -560,7 +562,8 @@ pub(super) fn markdown_lines_with_groups(
     let mut skin = termimad::MadSkin::default();
     skin.inline_code.object_style.background_color = None;
     skin.code_block.compound_style.object_style.background_color = None;
-    let formatted = skin.text(&source, Some(width.max(1)));
+    let mut formatted = skin.text(&source, Some(width.max(1)));
+    constrain_wrapped_code_spacing(&mut formatted);
     check()?;
     let line_ends = source
         .match_indices('\n')
@@ -621,6 +624,26 @@ pub(super) fn markdown_lines_with_groups(
         lines.extend(rendered);
     }
     Ok((lines, groups, origins))
+}
+
+fn constrain_wrapped_code_spacing(formatted: &mut termimad::FmtText<'_, '_>) {
+    let Some(width) = formatted.width else { return };
+    // Termimad justifies code blocks before wrapping. Wrapped rows retain the
+    // original (possibly megabyte-long) spacing width, causing that many spaces
+    // to be rendered on *every* row. Only synthetic padding needs correction;
+    // borrowed text slices and their source origins remain intact.
+    for line in &mut formatted.lines {
+        if let termimad::FmtLine::Normal(composite) = line
+            && composite.kind == termimad::CompositeKind::Code
+            && let Some(spacing) = &mut composite.spacing
+        {
+            let (left, right) = formatted
+                .skin
+                .line_style(composite.kind)
+                .margins_in(Some(width));
+            spacing.width = spacing.width.min(width.saturating_sub(left + right));
+        }
+    }
 }
 
 pub(super) fn char_len(text: &str) -> usize {

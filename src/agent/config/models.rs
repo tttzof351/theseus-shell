@@ -13,5 +13,6 @@ pub(crate) const DEFAULT_TMP_FILES_TTL_MIN: usize = 24 * 60;
 pub(crate) const DEFAULT_LLM_REQUEST_RETRIES: usize = 3;
 pub(crate) const DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS: usize = 180;
 pub(crate) const DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS: usize = 30;
+pub(crate) const DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS: usize = 60;
 
 pub(super) const AVAILABLE_MODELS: &[&str] = &["openrouter/free", "openai/gpt-oss-120b:free"];

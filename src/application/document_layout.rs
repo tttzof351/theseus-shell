@@ -191,6 +191,11 @@ impl Worker {
     pub fn pending(&self, current: Key) -> bool {
         self.applied != Some(current)
     }
+
+    #[cfg(test)]
+    pub(super) fn has_ready_result(&self) -> bool {
+        self.queue.0.lock().unwrap().ready.is_some()
+    }
 }
 
 impl Drop for Worker {

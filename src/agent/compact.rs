@@ -140,9 +140,10 @@ impl Agent {
                 "compact",
                 cancellation,
             ) {
-                Ok(message) => break message,
+                Ok(message) => break message.trajectory,
                 Err(err)
                     if is_context_window_error(&err)
+                        && super::llm::allows_context_trim(&err)
                         && trim_retries < self.compact_trim_retry_limit =>
                 {
                     let Some(removed) = remove_oldest_compact_history_item(&mut messages) else {
@@ -350,6 +351,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: Some(MessageContent::Text("answer".to_string())),
                 reasoning: None,
+                reasoning_details: None,
                 tool_calls: None,
                 tool_call_id: None,
             }),
@@ -383,6 +385,7 @@ mod tests {
                     },
                 ])),
                 reasoning: None,
+                reasoning_details: None,
                 tool_calls: None,
                 tool_call_id: None,
             }),
@@ -448,6 +451,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: Some(MessageContent::Text("assistant".to_string())),
                 reasoning: None,
+                reasoning_details: None,
                 tool_calls: None,
                 tool_call_id: None,
             },

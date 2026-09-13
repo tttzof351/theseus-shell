@@ -16,6 +16,8 @@ pub(super) struct ChatMessage {
         deserialize_with = "deserialize_optional_content"
     )]
     pub(super) reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) reasoning_details: Option<Vec<Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -147,6 +149,7 @@ impl ChatMessage {
             role: "system".to_string(),
             content: Some(MessageContent::Text(content.into())),
             reasoning: None,
+            reasoning_details: None,
             tool_calls: None,
             tool_call_id: None,
         }
@@ -157,6 +160,7 @@ impl ChatMessage {
             role: "user".to_string(),
             content: Some(MessageContent::Text(content.into())),
             reasoning: None,
+            reasoning_details: None,
             tool_calls: None,
             tool_call_id: None,
         }
@@ -167,6 +171,7 @@ impl ChatMessage {
             role: "tool".to_string(),
             content: Some(MessageContent::Text(content.into())),
             reasoning: None,
+            reasoning_details: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
         }
@@ -188,9 +193,31 @@ impl ChatMessage {
                 },
             ])),
             reasoning: None,
+            reasoning_details: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
         }
+    }
+
+    pub(super) fn reasoning_text(&self) -> String {
+        if let Some(text) = &self.reasoning
+            && !text.is_empty()
+        {
+            return text.clone();
+        }
+        self.reasoning_details
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|detail| {
+                let field = match detail.get("type").and_then(Value::as_str) {
+                    Some("reasoning.text") => "text",
+                    Some("reasoning.summary") => "summary",
+                    _ => return None,
+                };
+                detail.get(field).and_then(Value::as_str)
+            })
+            .collect()
     }
 
     pub(super) fn content_text(&self) -> Option<String> {
@@ -563,6 +590,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: Some(MessageContent::Text("done".to_string())),
                 reasoning: None,
+                reasoning_details: None,
                 tool_calls: None,
                 tool_call_id: None,
             },

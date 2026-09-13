@@ -52,8 +52,32 @@ pub struct LlmRequestSettings {
     pub retries: usize,
     pub request_timeout_seconds: usize,
     pub connect_timeout_seconds: usize,
+    pub stream_idle_timeout_seconds: Option<usize>,
     pub body: Map<String, Value>,
     pub header: BTreeMap<String, String>,
+}
+
+pub(crate) fn validate_stream_settings(
+    body: &Map<String, Value>,
+    idle: Option<usize>,
+) -> std::io::Result<bool> {
+    let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+    let stream = match body.get("stream") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(invalid(
+                "llm_request_settings.body.stream must be a boolean",
+            ));
+        }
+    };
+    if stream && body.get("n").is_some_and(|n| n.as_u64() != Some(1)) {
+        return Err(invalid("Streaming supports exactly one choice (n = 1)"));
+    }
+    if idle == Some(0) {
+        return Err(invalid("stream_idle_timeout_seconds must be positive"));
+    }
+    Ok(stream)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +145,7 @@ impl AgentConfig {
                 retries: models::DEFAULT_LLM_REQUEST_RETRIES,
                 request_timeout_seconds: models::DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
                 connect_timeout_seconds: models::DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS,
+                stream_idle_timeout_seconds: None,
                 body,
                 header,
             },
@@ -194,6 +219,59 @@ mod tests {
         AgentConfig, AgentSettings, ImageInputSettings, LlmRequestSettings, McpServerConfig,
         McpTransport, ShellSettings, default_compact_prompt, default_system_prompt, models,
     };
+
+    #[test]
+    fn streaming_settings_are_opt_in_and_round_trip_with_opaque_body_options() {
+        let old = AgentConfig::default_empty();
+        let parsed = AgentConfig::from_jsonc(&old.to_jsonc()).unwrap();
+        assert_eq!(parsed, old);
+        assert_eq!(
+            parsed.llm_request_settings.stream_idle_timeout_seconds,
+            None
+        );
+        assert!(!super::validate_stream_settings(&parsed.llm_request_settings.body, None).unwrap());
+        let mut config = old;
+        config.llm_request_settings.stream_idle_timeout_seconds = Some(17);
+        config
+            .llm_request_settings
+            .body
+            .insert("stream".into(), json!(true));
+        config
+            .llm_request_settings
+            .body
+            .insert("stream_options".into(), json!({"include_usage":true}));
+        let parsed = AgentConfig::from_jsonc(&config.to_jsonc()).unwrap();
+        assert_eq!(parsed, config);
+        assert_eq!(
+            crate::agent::Agent::new(parsed).stream_idle_timeout,
+            std::time::Duration::from_secs(17)
+        );
+    }
+
+    #[test]
+    fn streaming_settings_reject_invalid_types_choices_and_idle_timeout() {
+        for value in [json!(0), json!(2), json!("1"), json!(null)] {
+            let mut config = AgentConfig::default_empty();
+            config
+                .llm_request_settings
+                .body
+                .insert("stream".into(), json!(true));
+            config.llm_request_settings.body.insert("n".into(), value);
+            assert!(AgentConfig::from_jsonc(&config.to_jsonc()).is_err());
+        }
+        let mut config = AgentConfig::default_empty();
+        config
+            .llm_request_settings
+            .body
+            .insert("stream".into(), json!("true"));
+        assert!(AgentConfig::from_jsonc(&config.to_jsonc()).is_err());
+        config
+            .llm_request_settings
+            .body
+            .insert("stream".into(), json!(false));
+        config.llm_request_settings.stream_idle_timeout_seconds = Some(0);
+        assert!(AgentConfig::from_jsonc(&config.to_jsonc()).is_err());
+    }
 
     #[test]
     fn creates_default_config_file() {
@@ -1054,6 +1132,7 @@ mod tests {
                 retries: 5,
                 request_timeout_seconds: 300,
                 connect_timeout_seconds: 60,
+                stream_idle_timeout_seconds: None,
                 body: serde_json::Map::from_iter([
                     ("model".to_string(), json!("minimax/minimax-m2.7")),
                     ("temperature".to_string(), json!(0.2)),

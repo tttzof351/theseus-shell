@@ -2,6 +2,7 @@ use std::{io, io::Write};
 
 use super::{
     Agent,
+    completion_output::RunResult,
     core::{AgentRunContext, ensure_trailing_newline},
     messages::{ChatMessage, ToolCall},
     tools::{ToolAttachment, ToolOutput, execute_tool_call},
@@ -25,8 +26,17 @@ impl Agent {
     pub fn run_with_context(
         &mut self,
         prompt: &str,
-        mut context: AgentRunContext,
+        context: AgentRunContext,
     ) -> io::Result<String> {
+        self.run_with_context_result(prompt, context)
+            .map(|result| result.text)
+    }
+
+    pub(crate) fn run_with_context_result(
+        &mut self,
+        prompt: &str,
+        mut context: AgentRunContext,
+    ) -> io::Result<RunResult> {
         self.output = context.output.clone();
         self.mcp.set_output(context.output.clone());
         self.mcp.set_cancellation(context.cancellation.clone());
@@ -35,11 +45,13 @@ impl Agent {
         context.max_tool_bash_bytes = self.max_tool_bash_bytes;
 
         if !has_authorization_header_value(self.header.get("Authorization").map(String::as_str)) {
-            return Ok("LLM Authorization header is empty. Run /config first.\n".to_string());
+            return Ok("LLM Authorization header is empty. Run /config first.\n"
+                .to_string()
+                .into());
         }
 
         if let Some(error) = self.context_tokens_limit_error() {
-            return Ok(error);
+            return Ok(error.into());
         }
 
         if let Some(shell_command) = context.last_shell_command.as_ref() {
@@ -52,17 +64,18 @@ impl Agent {
         self.write_trajectory();
 
         for _ in 0..self.max_agent_turns {
-            let trajectory_message = match self.request_completion(&context.cancellation) {
+            let completion = match self.request_completion(&context.cancellation) {
                 Ok(message) => message,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {
                     self.push_message(ChatMessage::user(
                         "LLM request was interrupted by the user.",
                     ));
                     self.write_trajectory();
-                    return Ok("Agent request interrupted.\n".to_string());
+                    return Ok("Agent request interrupted.\n".to_string().into());
                 }
                 Err(err) => return Err(err),
             };
+            let trajectory_message = completion.trajectory;
             let message = trajectory_message
                 .message()
                 .cloned()
@@ -77,28 +90,25 @@ impl Agent {
                 .to_string();
             let tool_calls = message.tool_calls.clone().unwrap_or_default();
 
+            if context.cancellation.cancel_if_interrupted() {
+                self.push_message(ChatMessage::user(
+                    "LLM request was interrupted by the user.",
+                ));
+                self.write_trajectory();
+                return Ok("Agent request interrupted.\n".to_string().into());
+            }
             self.push_trajectory_message(trajectory_message);
             self.write_trajectory();
 
             if let Some(error) = self.context_tokens_limit_error() {
-                return Ok(error);
-            }
-
-            if let Some(output) = &context.output {
-                if let Some(reasoning) = message
-                    .reasoning
-                    .as_deref()
-                    .filter(|text| !text.trim().is_empty())
-                {
-                    output.message(crate::common::events::BlockKind::Reasoning, reasoning)?;
-                }
-                if !tool_calls.is_empty() && !content.trim().is_empty() {
-                    output.message(crate::common::events::BlockKind::Markdown, &content)?;
-                }
+                return Ok(error.into());
             }
 
             if tool_calls.is_empty() {
-                return Ok(ensure_trailing_newline(content));
+                return Ok(RunResult {
+                    text: ensure_trailing_newline(content),
+                    presentation: completion.presentation,
+                });
             }
 
             if context.output.is_none() {
@@ -107,7 +117,11 @@ impl Agent {
 
             let mut tool_calls = tool_calls.into_iter();
             while let Some(tool_call) = tool_calls.next() {
-                let mut output = match self.execute_agent_tool_call(&tool_call, &context) {
+                let mut output = match if context.cancellation.cancel_if_interrupted() {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    self.execute_agent_tool_call(&tool_call, &context)
+                } {
                     Ok(_output) if context.cancellation.cancel_if_interrupted() => {
                         ToolOutput::text(INTERRUPTED_TOOL_OUTPUT)
                     }
@@ -133,12 +147,14 @@ impl Agent {
                         );
                     }
                     self.write_trajectory();
-                    return Ok("Agent tool execution interrupted.\n".to_string());
+                    return Ok("Agent tool execution interrupted.\n".to_string().into());
                 }
             }
         }
 
-        Ok("Agent stopped: reached maximum tool loop turns.\n".to_string())
+        Ok("Agent stopped: reached maximum tool loop turns.\n"
+            .to_string()
+            .into())
     }
 
     fn context_tokens_limit_error(&self) -> Option<String> {
@@ -416,52 +432,76 @@ mod tests {
                 (BlockKind::Markdown, "**CONTENT_BEFORE**"),
                 (BlockKind::ToolOutput, "REAL_TOOL_OUTPUT"),
                 (BlockKind::Reasoning, "REASON_AFTER"),
+                (BlockKind::Markdown, "**CONTENT_AFTER**"),
             ]
         );
-        // The final content is returned to AgentWorker for one Markdown event;
-        // it must not also have been emitted by the loop.
-        assert!(
-            !blocks
+        assert_eq!(
+            blocks
                 .iter()
-                .any(|(_, _, text)| text.contains("CONTENT_AFTER"))
+                .filter(|(_, _, text)| text.contains("CONTENT_AFTER"))
+                .count(),
+            1
         );
     }
 
     #[test]
     fn interrupted_parallel_tool_calls_record_outputs_for_all_pending_calls() {
-        let context = AgentRunContext::default();
+        use crate::common::events::{BlockKind, EventSink, OutputEvent};
+        let mut context = AgentRunContext::default();
         let cancellation = context.cancellation.clone();
-        let (base_url, server) = one_response_chat_server(
-            json!({
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": null,
-                            "tool_calls": [
-                                {
-                                    "id": "call_1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "bash",
-                                        "arguments": "{\"command\":\"sleep 10\"}"
-                                    }
-                                },
-                                {
-                                    "id": "call_2",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "bash",
-                                        "arguments": "{\"command\":\"echo later\"}"
-                                    }
-                                }
-                            ]
+        let (sink, events) = EventSink::channel(cancellation.clone());
+        context.output = Some(sink);
+        let cancel_worker = thread::spawn(move || {
+            let mut tool_block = None;
+            let mut output = Vec::new();
+            loop {
+                let event = events
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap();
+                match event.event {
+                    OutputEvent::BlockStarted {
+                        id,
+                        kind: BlockKind::ToolOutput,
+                    } => tool_block = Some(id),
+                    OutputEvent::BytesAppended { id, bytes, .. } if Some(id) == tool_block => {
+                        output.extend(bytes);
+                        if String::from_utf8_lossy(&output).contains("TOOL_READY") {
+                            cancellation.cancel();
+                            return events;
                         }
                     }
-                ]
-            }),
-            cancellation,
-        );
+                    _ => {}
+                }
+            }
+        });
+        let (base_url, server) = one_response_chat_server(json!({
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": "{\"command\":\"printf TOOL_READY; sleep 10\"}"
+                                }
+                            },
+                            {
+                                "id": "call_2",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": "{\"command\":\"echo later\"}"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }));
         let mut config = AgentConfig::default_empty();
         config.llm_request_settings.base_url = base_url;
         config
@@ -473,6 +513,7 @@ mod tests {
 
         let output = agent.run_with_context("run tools", context).unwrap();
         server.join().unwrap();
+        let _events = cancel_worker.join().unwrap();
 
         assert_eq!(output, "Agent tool execution interrupted.\n");
         assert_eq!(
@@ -485,10 +526,7 @@ mod tests {
         );
     }
 
-    fn one_response_chat_server(
-        response: serde_json::Value,
-        cancellation: crate::common::cancellation::CancellationEvent,
-    ) -> (String, thread::JoinHandle<()>) {
+    fn one_response_chat_server(response: serde_json::Value) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
@@ -502,7 +540,6 @@ mod tests {
                 body
             );
             stream.write_all(response.as_bytes()).unwrap();
-            cancellation.cancel();
         });
 
         (format!("http://{address}/chat"), handle)

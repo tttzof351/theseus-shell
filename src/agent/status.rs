@@ -3,7 +3,33 @@ use rmcp::model::Tool;
 use super::Agent;
 use super::config::{McpServerConfig, McpTransport};
 use super::mcp::McpServerStatus;
+use super::messages::ChatUsage;
 use crate::input::dedent;
+use std::sync::Mutex;
+
+/// Usage of the current/most recent request, independently of the last known
+/// context estimate retained in trajectory for the context-limit guard.
+#[derive(Debug, Default)]
+pub(super) struct LatestRequestUsage(Mutex<Option<ChatUsage>>);
+
+impl Clone for LatestRequestUsage {
+    fn clone(&self) -> Self {
+        Self(Mutex::new(self.get()))
+    }
+}
+
+impl LatestRequestUsage {
+    pub fn get(&self) -> Option<ChatUsage> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub fn set(&self, usage: Option<ChatUsage>) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = usage;
+    }
+}
 
 impl Agent {
     pub(super) fn latest_context_tokens(&self) -> Option<u64> {
@@ -18,7 +44,12 @@ impl Agent {
         let usage_entries = self
             .trajectory
             .iter()
-            .filter_map(|entry| entry.usage())
+            .filter(|entry| {
+                entry
+                    .message()
+                    .is_some_and(|message| message.role == "assistant")
+            })
+            .map(|entry| entry.usage())
             .collect::<Vec<_>>();
         let message_count = self
             .trajectory
@@ -26,25 +57,41 @@ impl Agent {
             .filter_map(|entry| entry.message())
             .count();
 
-        let completion_tokens = usage_entries
-            .iter()
-            .filter_map(|usage| usage.completion_tokens)
-            .sum::<u64>();
-        let cache_write_tokens = usage_entries
-            .iter()
-            .filter_map(|usage| usage.prompt_tokens_details.as_ref())
-            .filter_map(|details| details.cache_write_tokens)
-            .sum::<u64>();
-        let reasoning_tokens = usage_entries
-            .iter()
-            .filter_map(|usage| usage.completion_tokens_details.as_ref())
-            .filter_map(|details| details.reasoning_tokens)
-            .sum::<u64>();
-        let cost = usage_entries
-            .iter()
-            .filter_map(|usage| usage.cost)
-            .sum::<f64>();
+        let completion_tokens = known_total(
+            usage_entries
+                .iter()
+                .map(|usage| usage.and_then(|usage| usage.completion_tokens)),
+            format_human_count,
+        );
+        let cache_write_tokens = known_total(
+            usage_entries.iter().map(|usage| {
+                usage
+                    .and_then(|usage| usage.prompt_tokens_details.as_ref())
+                    .and_then(|details| details.cache_write_tokens)
+            }),
+            format_human_count,
+        );
+        let reasoning_tokens = known_total(
+            usage_entries.iter().map(|usage| {
+                usage
+                    .and_then(|usage| usage.completion_tokens_details.as_ref())
+                    .and_then(|details| details.reasoning_tokens)
+            }),
+            format_human_count,
+        );
+        let cost = known_total(
+            usage_entries
+                .iter()
+                .map(|usage| usage.and_then(|usage| usage.cost)),
+            |cost| format!("${cost:.6}"),
+        );
         let context_tokens = self
+            .latest_request_usage
+            .get()
+            .and_then(|usage| usage.prompt_tokens)
+            .map(format_human_count)
+            .unwrap_or_else(|| "n/a".to_string());
+        let last_known_context_tokens = self
             .latest_context_tokens()
             .map(format_human_count)
             .unwrap_or_else(|| "n/a".to_string());
@@ -65,10 +112,11 @@ impl Agent {
             | **messages** | {} |
             | **llm calls** | {} |
             | **context tokens** | {} |
+            | **last known context tokens** | {} |
             | **completion tokens** | {} |
             | **cache write tokens** | {} |
             | **reasoning tokens** | {} |
-            | **cost** | ${:.6} |
+            | **cost** | {} |
             | --- | ---: |
             "#,
             model,
@@ -76,9 +124,10 @@ impl Agent {
             format_human_count(message_count as u64),
             format_human_count(usage_entries.len() as u64),
             context_tokens,
-            format_human_count(completion_tokens),
-            format_human_count(cache_write_tokens),
-            format_human_count(reasoning_tokens),
+            last_known_context_tokens,
+            completion_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
             cost,
         ));
         status.push('\n');
@@ -92,6 +141,28 @@ impl Agent {
             .map(format_mcp_server_section)
             .collect::<Vec<_>>()
             .join("\n\n")
+    }
+}
+
+fn known_total<T: Copy + std::iter::Sum>(
+    values: impl Iterator<Item = Option<T>>,
+    format: impl Fn(T) -> String,
+) -> String {
+    let mut missing = false;
+    let known = values
+        .filter_map(|value| {
+            missing |= value.is_none();
+            value
+        })
+        .collect::<Vec<_>>();
+    if known.is_empty() {
+        return "n/a".into();
+    }
+    let total = format(known.into_iter().sum());
+    if missing {
+        format!("{total} (partial)")
+    } else {
+        total
     }
 }
 
@@ -254,6 +325,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: Some(MessageContent::Text("done".to_string())),
                 reasoning: None,
+                reasoning_details: None,
                 tool_calls: None,
                 tool_call_id: None,
             },
@@ -303,6 +375,70 @@ mod tests {
         let status = agent.status_text();
 
         assert!(status.contains("| **api key** | none |"));
+    }
+
+    #[test]
+    fn unknown_usage_is_not_zero_or_the_previous_request_usage() {
+        let mut agent = Agent::new(AgentConfig::default_empty());
+        let known = ChatMessage {
+            role: "assistant".into(),
+            content: Some(MessageContent::Text("known".into())),
+            reasoning: None,
+            reasoning_details: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        agent.push_trajectory_message(TrajectoryMessage::with_usage(
+            known.clone(),
+            Some(
+                serde_json::from_value(serde_json::json!({
+                    "prompt_tokens":100,"completion_tokens":4,"cost":0.001
+                }))
+                .unwrap(),
+            ),
+        ));
+        let clone = agent.clone();
+        clone.latest_request_usage.set(None);
+        assert!(
+            agent.status_text().contains("| **context tokens** | 100 |"),
+            "clones must not share request state"
+        );
+        // Starting a request clears only its usage; the guard retains the last
+        // estimate even when validation fails before reaching the network.
+        agent
+            .body
+            .insert("stream".into(), serde_json::json!("invalid"));
+        assert!(
+            agent
+                .request_completion(&crate::common::cancellation::CancellationEvent::new())
+                .is_err()
+        );
+        assert_eq!(agent.latest_context_tokens(), Some(100));
+        let failed = agent.status_text();
+        assert!(failed.contains("| **context tokens** | n/a |"), "{failed}");
+        assert!(
+            failed.contains("| **last known context tokens** | 100 |"),
+            "{failed}"
+        );
+        agent.push_trajectory_message(TrajectoryMessage::new(known));
+        let unknown = agent.status_text();
+        assert!(unknown.contains("| **llm calls** | 2 |"), "{unknown}");
+        assert!(
+            unknown.contains("| **completion tokens** | 4 (partial) |"),
+            "{unknown}"
+        );
+        assert!(
+            unknown.contains("| **cost** | $0.001000 (partial) |"),
+            "{unknown}"
+        );
+        assert!(
+            unknown.contains("| **reasoning tokens** | n/a |"),
+            "{unknown}"
+        );
+        agent.reset_context();
+        let reset = agent.status_text();
+        assert!(reset.contains("| **context tokens** | n/a |"));
+        assert!(reset.contains("| **last known context tokens** | n/a |"));
     }
 
     #[test]
