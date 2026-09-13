@@ -33,6 +33,9 @@ jobs:
           cache-dependency-path: tests/xterm/package-lock.json
       - name: Verify Vim fixture is available
         run: vim --version
+      - name: Verify dash fixture is available
+        if: runner.os == 'Linux'
+        run: test -x /bin/dash
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-targets --all-features

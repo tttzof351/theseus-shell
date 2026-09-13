@@ -198,8 +198,13 @@ impl PersistentShellSession {
     }
 
     fn initialize_shell(&mut self) -> io::Result<()> {
+        // dash abandons the surrounding command group on SIGINT unless the
+        // shell handles it. Foreground children reset a caught signal to its
+        // default disposition, so Ctrl+C still stops them while the shell can
+        // report their exit status. Bash and Zsh already handle this case.
         let payload = self.command_payload(
             "stty -echo 2>/dev/null || true\n\
+             if [ -z \"${BASH_VERSION-}${ZSH_VERSION-}\" ]; then trap ':' INT; fi\n\
              bind 'set enable-bracketed-paste off' 2>/dev/null || true\n\
              unsetopt zle prompt_cr prompt_sp 2>/dev/null || true\n\
              PROMPT=''\n\
@@ -992,9 +997,11 @@ fn shell_group_payload(command: &str, nonce: &str, uses_zsh_protocol: bool) -> S
         );
     }
 
+    // `command` removes eval's special-builtin error semantics in POSIX
+    // shells: a syntax error returns a status instead of skipping the sentinel.
     format!(
         "{{ \n\
-         eval {command}\n\
+         command eval {command}\n\
          __theseus_status=$?\n\
          printf '\\n__THESEUS_DONE_{nonce}_%s__\\n' \"$__theseus_status\"\n\
          }}\n"
@@ -1212,7 +1219,7 @@ mod tests {
 
         assert_eq!(
             payload,
-            "{ \neval ' vim'\n__theseus_status=$?\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\n}\n"
+            "{ \ncommand eval ' vim'\n__theseus_status=$?\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\n}\n"
         );
     }
 
@@ -1222,7 +1229,7 @@ mod tests {
 
         assert_eq!(
             payload,
-            "{ \neval ' printf '\\''%s'\\'' '\\''a b'\\'''\n__theseus_status=$?\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\n}\n"
+            "{ \ncommand eval ' printf '\\''%s'\\'' '\\''a b'\\'''\n__theseus_status=$?\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\n}\n"
         );
     }
 
@@ -1555,8 +1562,9 @@ mod tests {
                 .unwrap_or_else(|_| panic!("command hung for shell: {shell}"));
             let output = output.unwrap();
             assert_ne!(output.status_code, Some(0), "shell: {shell}");
+            let diagnostic = normalized_transcript(&output);
             assert!(
-                normalized_transcript(&output).contains("`"),
+                diagnostic.contains('`') || diagnostic.contains("backquote"),
                 "shell: {shell}, output: {:?}",
                 output.transcript_lossy()
             );
@@ -1586,10 +1594,11 @@ mod tests {
                 .unwrap_or_else(|_| panic!("command hung for shell: {shell}"));
             let output = output.unwrap();
             assert_ne!(output.status_code, Some(0), "shell: {shell}");
+            let diagnostic = normalized_transcript(&output).to_ascii_lowercase();
             assert!(
-                normalized_transcript(&output).contains("unmatched")
-                    || normalized_transcript(&output).contains("unexpected EOF")
-                    || normalized_transcript(&output).contains("unterminated"),
+                diagnostic.contains("unmatched")
+                    || diagnostic.contains("unexpected eof")
+                    || diagnostic.contains("unterminated"),
                 "shell: {shell}, output: {:?}",
                 output.transcript_lossy()
             );
@@ -1607,14 +1616,30 @@ mod tests {
             let (mut session, _home) = start_clean_test_session(&shell);
             let writer = Arc::clone(&session.writer);
             let (tx, rx) = test_mpsc::channel();
+            let directory = TempTestDir::new();
+            let ready = directory.path().join("foreground-ready");
+            let command = format!(
+                "sh -c {}",
+                shell_single_quote(&format!(
+                    "printf ready > {}; exec sleep 100",
+                    shell_single_quote(&ready.to_string_lossy())
+                ))
+            );
 
             thread::spawn(move || {
-                let output = session.run_command("sleep 100");
+                let output = session.run_command(&command);
                 let recovery = session.run_command("printf recovered");
                 let _ = tx.send((output, recovery));
             });
 
-            thread::sleep(Duration::from_millis(200));
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !ready.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "foreground command did not start for shell: {shell}"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
             {
                 let mut writer = writer.lock().unwrap();
                 writer.write_all(&[3]).unwrap();
@@ -1625,7 +1650,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .unwrap_or_else(|_| panic!("Ctrl+C did not interrupt command for shell: {shell}"));
             let output = output.unwrap();
-            assert_ne!(output.status_code, Some(0), "shell: {shell}");
+            assert_eq!(output.status_code, Some(130), "shell: {shell}");
 
             let recovery = recovery.unwrap();
             assert_eq!(recovery.status_code, Some(0), "shell: {shell}");
@@ -1690,7 +1715,7 @@ mod tests {
 
     #[cfg(unix)]
     fn available_shells() -> Vec<String> {
-        ["/bin/sh", "/bin/bash", "/bin/zsh"]
+        ["/bin/sh", "/bin/dash", "/bin/bash", "/bin/zsh"]
             .into_iter()
             .filter(|shell| Path::new(shell).exists())
             .map(str::to_string)

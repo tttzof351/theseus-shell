@@ -827,8 +827,11 @@ fn sse_bash_preview_keeps_editor_prompt_style_before_and_after_tool_cancel() -> 
     ui.app.write("/ask bash preview\r")?;
     ui.server.request()?;
     ui.server.headers()?;
-    ui.server
-        .delta(tool_delta("printf 'BASH_%s\\n' READY; exec sleep 30"))?;
+    // Explicit spaces reproduce the trailing blank cells left when the
+    // renderer overwrites the longer editor prompt with this output in CI.
+    ui.server.delta(tool_delta(
+        "printf 'BASH_%s            \\n' READY; exec sleep 30",
+    ))?;
     ui.server.finish("tool_calls")?;
     let assert_style = |screen: &vt100::Screen| {
         let prefix = "tester theseus-shell> ";
@@ -852,7 +855,7 @@ fn sse_bash_preview_keeps_editor_prompt_style_before_and_after_tool_cancel() -> 
     let before = ui.wait(|screen| {
         screen
             .rows(0, screen.size().1)
-            .any(|row| row == "BASH_READY")
+            .any(|row| row.trim_end() == "BASH_READY")
     })?;
     assert_style(before.screen());
     ui.app.write("\x03")?;
