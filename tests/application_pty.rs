@@ -229,6 +229,20 @@ fn shell_handoff_preserves_input_sent_in_same_write_as_command_enter() -> io::Re
     app.exit()
 }
 
+fn is_waiting_spinner(line: &str) -> bool {
+    let mut chars = line.trim().chars();
+    chars
+        .next()
+        .is_some_and(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch))
+        && chars.next().is_none()
+}
+
+fn waiting_spinner_row(bytes: &[u8]) -> Option<usize> {
+    screen_rows(bytes)
+        .iter()
+        .position(|line| is_waiting_spinner(line))
+}
+
 fn screen_rows(bytes: &[u8]) -> Vec<String> {
     let mut parser = vt100::Parser::new(SIZE.rows, SIZE.cols, 0);
     parser.process(bytes);
@@ -541,6 +555,110 @@ fn managed_mcp_startup_and_discovery_keep_resize_draft_and_cancel_responsive() -
 }
 
 #[test]
+fn managed_waiting_spinner_animates_in_place_and_does_not_enter_history() -> io::Result<()> {
+    let (home, held) = held_json_fixture()?;
+    let mut app =
+        ApplicationPty::start_with_home_and_cwd(home, Path::new(env!("CARGO_MANIFEST_DIR")))?;
+    app.write("/ask held question\r")?;
+    held.ready
+        .recv_timeout(WAIT_TIMEOUT)
+        .map_err(io::Error::other)?;
+    let snapshot = |bytes: &[u8]| {
+        let mut parser = vt100::Parser::new(SIZE.rows, SIZE.cols, 0);
+        parser.process(bytes);
+        parser
+            .screen()
+            .rows(0, SIZE.cols)
+            .enumerate()
+            .find_map(|(row, text)| {
+                let glyph = text.chars().next()?;
+                is_waiting_spinner(&text).then_some((row, glyph, parser.screen().cursor_position()))
+            })
+    };
+    let bytes = app.wait_until(|bytes| snapshot(bytes).is_some())?;
+    let first = snapshot(&bytes).unwrap();
+    let visible = screen_text(&bytes);
+    assert!(
+        !visible.contains("Waiting for response") && !visible.contains("attempt 1/"),
+        "{visible}"
+    );
+    // The HTTP fixture is still held: observing another frame proves that the
+    // UI animates without a backend event or completion waking it up.
+    let bytes = app.wait_until(|bytes| snapshot(bytes).is_some_and(|next| next.1 != first.1))?;
+    let second = snapshot(&bytes).unwrap();
+    assert_eq!(second.0, first.0, "animation moved the status row");
+    assert_eq!(second.2, first.2, "animation moved the editor cursor");
+    held.release.send(()).map_err(io::Error::other)?;
+    app.wait_until(|bytes| {
+        let text = screen_text(bytes);
+        text.contains("HELD_ANSWER") && waiting_spinner_row(bytes).is_none()
+    })?;
+    app.write("printf 'AFTER_SPINNER\\n'\r")?;
+    let bytes =
+        app.wait_until(|bytes| screen_rows(bytes).iter().any(|row| row == "AFTER_SPINNER"))?;
+    let history = terminal_history_rows(&bytes).join("\n");
+    assert!(
+        !history
+            .chars()
+            .any(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch)),
+        "{history}"
+    );
+    assert!(!history.contains("Waiting for response"), "{history}");
+    app.exit()
+}
+
+#[test]
+fn submitting_short_request_keeps_status_and_draft_next_to_the_prompt() -> io::Result<()> {
+    for submission in ["/ask Что ты умеешь?\r", "/ask\rЧто ты умеешь?\r/end\r"]
+    {
+        let (home, held) = held_json_fixture()?;
+        let mut app =
+            ApplicationPty::start_with_home_and_cwd(home, Path::new(env!("CARGO_MANIFEST_DIR")))?;
+        app.write("\x0c")?;
+        app.wait_until(|bytes| !screen_text(bytes).contains("Theseus shell wrapper"))?;
+        app.write(submission)?;
+        held.ready
+            .recv_timeout(WAIT_TIMEOUT)
+            .map_err(io::Error::other)?;
+        let bytes = app.wait_until(|bytes| waiting_spinner_row(bytes).is_some())?;
+        let rows = screen_rows(&bytes);
+        let question = rows
+            .iter()
+            .position(|line| line.contains("Что ты умеешь?"))
+            .unwrap();
+        let status = rows
+            .iter()
+            .position(|line| is_waiting_spinner(line))
+            .unwrap();
+        assert_eq!(
+            status,
+            question + 1,
+            "status jumped away from submitted text: {rows:?}"
+        );
+        assert!(rows[status + 1].trim_end().ends_with('>'), "{rows:?}");
+        assert!(
+            rows[status + 2..].iter().all(|line| line.trim().is_empty()),
+            "{rows:?}"
+        );
+        app.write("NEXT_DRAFT")?;
+        let bytes = app.wait_until(|bytes| screen_text(bytes).contains("NEXT_DRAFT"))?;
+        let mut parser = vt100::Parser::new(SIZE.rows, SIZE.cols, 0);
+        parser.process(&bytes);
+        assert_eq!(usize::from(parser.screen().cursor_position().0), status + 1);
+        held.release.send(()).map_err(io::Error::other)?;
+        app.wait_until(|bytes| {
+            let text = screen_text(bytes);
+            text.contains("HELD_ANSWER")
+                && text.contains("NEXT_DRAFT")
+                && waiting_spinner_row(bytes).is_none()
+        })?;
+        app.write("\x03")?;
+        app.exit()?;
+    }
+    Ok(())
+}
+
+#[test]
 fn managed_request_keeps_pasted_draft_and_requires_explicit_submit_after_completion()
 -> io::Result<()> {
     let (home, held) = held_json_fixture()?;
@@ -551,7 +669,7 @@ fn managed_request_keeps_pasted_draft_and_requires_explicit_submit_after_complet
     held.ready
         .recv_timeout(WAIT_TIMEOUT)
         .map_err(io::Error::other)?;
-    app.wait_until(|bytes| screen_text(bytes).contains("Waiting for response"))?;
+    app.wait_until(|bytes| waiting_spinner_row(bytes).is_some())?;
     let draft = format!("printf done > '{}'", marker.display());
     app.write(&format!("\x1b[200~{draft}\n\x1b[201~\r"))?;
     app.wait_until(|bytes| screen_text(bytes).contains("draft-executed"))?;
@@ -561,7 +679,7 @@ fn managed_request_keeps_pasted_draft_and_requires_explicit_submit_after_complet
         let text = screen_text(bytes);
         text.contains("HELD_ANSWER")
             && text.contains("draft-executed")
-            && !text.contains("Waiting for response")
+            && waiting_spinner_row(bytes).is_none()
     })?;
     assert!(
         !marker.exists(),
@@ -586,7 +704,7 @@ fn managed_cancel_keeps_next_draft_and_clear_does_not_cancel_request() -> io::Re
     app.wait_until(|bytes| {
         let text = screen_text(bytes);
         text.contains("NEXT_DRAFT")
-            && text.contains("Waiting for response")
+            && waiting_spinner_row(bytes).is_some()
             && !text.contains("held question")
     })?;
     app.write("\x03")?;
@@ -594,7 +712,7 @@ fn managed_cancel_keeps_next_draft_and_clear_does_not_cancel_request() -> io::Re
         let text = screen_text(bytes);
         text.contains("Agent request interrupted")
             && text.contains("NEXT_DRAFT")
-            && !text.contains("Waiting for response")
+            && waiting_spinner_row(bytes).is_none()
     })?;
     // Cancel the editor draft before using /exit.
     app.write("\x03")?;
@@ -829,20 +947,59 @@ fn interrupted_agent_preserves_output_written_before_ctrl_c() -> io::Result<()> 
     let (home, server) = interrupted_agent_fixture()?;
     let mut shell =
         ApplicationPty::start_with_home_and_cwd(home, Path::new(env!("CARGO_MANIFEST_DIR")))?;
+    shell.write("\x0c")?;
+    let before = shell.wait_until(|bytes| {
+        !screen_text(bytes).contains("Theseus shell wrapper") && settled_prompt_is_visible(bytes)
+    })?;
+    let mut prompt_screen = vt100::Parser::new(SIZE.rows, SIZE.cols, 0);
+    prompt_screen.process(&before);
+    let prompt_row = prompt_screen.screen().cursor_position().0;
     let command_offset = shell.transcript_len();
     shell.write("/ask run interruption fixture\r")?;
-    shell.wait_until(|bytes| {
+    let preview = shell.wait_until(|bytes| {
         bytes
             .get(command_offset..)
             .is_some_and(|tail| find_bytes(tail, MARKER.as_bytes()).is_some())
     })?;
+
+    let assert_prompt_style = |bytes: &[u8]| {
+        let mut parser = vt100::Parser::new(SIZE.rows, SIZE.cols, 0);
+        parser.process(bytes);
+        let prefix = "tester theseus-shell> ";
+        let row = parser
+            .screen()
+            .rows(0, SIZE.cols)
+            .position(|line| line.starts_with(&format!("{prefix}printf ")))
+            .expect("agent bash command preview is visible") as u16;
+        for column in 0..prefix.chars().count() as u16 {
+            let editor_cell = prompt_screen.screen().cell(prompt_row, column).unwrap();
+            let tool_cell = parser.screen().cell(row, column).unwrap();
+            assert_eq!(tool_cell.contents(), editor_cell.contents());
+            assert_eq!(
+                tool_cell.fgcolor(),
+                editor_cell.fgcolor(),
+                "prompt color at column {column}"
+            );
+            assert_eq!(
+                tool_cell.bold(),
+                editor_cell.bold(),
+                "prompt weight at column {column}"
+            );
+        }
+        let marker = parser
+            .screen()
+            .cell(row, (prefix.chars().count() - 2) as u16)
+            .unwrap();
+        assert!(!marker.bold(), "prompt style leaked onto >");
+        assert_eq!(marker.fgcolor(), vt100::Color::Default);
+    };
+    assert_prompt_style(&preview);
 
     let interrupt_offset = shell.transcript_len();
     shell.write("\x03")?;
     let after_interrupt = shell.wait_until(|bytes| {
         let tail = bytes.get(interrupt_offset..).unwrap_or_default();
         find_bytes(tail, b"Agent tool execution interrupted.").is_some()
-            && find_bytes(tail, b"\x1b[2J").is_some()
             && settled_prompt_is_visible(bytes)
     })?;
     let screen = screen_text(&after_interrupt);
@@ -851,6 +1008,7 @@ fn interrupted_agent_preserves_output_written_before_ctrl_c() -> io::Result<()> 
         screen.contains(MARKER),
         "the recovery diff discarded Agent output that was visible before Ctrl+C:\n{screen}"
     );
+    assert_prompt_style(&after_interrupt);
 
     server.join().unwrap();
     shell.exit()

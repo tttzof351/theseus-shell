@@ -1,6 +1,16 @@
 use super::*;
 use std::{net::TcpListener, sync::mpsc};
 
+fn waiting_spinner_is_visible(screen: &vt100::Screen) -> bool {
+    screen.rows(0, screen.size().1).any(|line| {
+        let mut chars = line.trim().chars();
+        chars
+            .next()
+            .is_some_and(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch))
+            && chars.next().is_none()
+    })
+}
+
 struct CompactServer {
     url: String,
     ready: mpsc::Receiver<Value>,
@@ -160,7 +170,7 @@ fn compact_keeps_draft_and_old_context_on_cancel_or_error_and_commits_success_on
                 .to_string()
                 .contains("OLD_ASSISTANT_CONTEXT")
         );
-        ui.wait(|screen| screen.contents().contains("Waiting for response"));
+        ui.wait(waiting_spinner_is_visible);
         ui.write("COMPACT_DRAFT");
         ui.wait(|screen| screen.contents().contains("COMPACT_DRAFT"));
         if outcome == "cancel" {
@@ -171,7 +181,7 @@ fn compact_keeps_draft_and_old_context_on_cancel_or_error_and_commits_success_on
         ui.wait(|screen| {
             let contents = screen.contents();
             contents.contains("COMPACT_DRAFT")
-                && !contents.contains("Waiting for response")
+                && !waiting_spinner_is_visible(screen)
                 && !contents.contains("Cancelling")
                 && if outcome == "success" {
                     contents.contains("Agent context compacted")

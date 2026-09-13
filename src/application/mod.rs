@@ -303,11 +303,15 @@ impl Application {
             } else {
                 &phase
             };
+            let elapsed = active.started.elapsed();
+            let spinner = common::progress::spinner_frame(elapsed);
+            let status = if phase == "Waiting for response" {
+                spinner.to_string()
+            } else {
+                format!("{spinner} {phase} · {}s {detail}", elapsed.as_secs())
+            };
             self.screen_cache
-                .push_render_line(&RenderLine::plain(format!(
-                    "{phase} · {}s {detail}",
-                    active.started.elapsed().as_secs()
-                )));
+                .push_render_line(&RenderLine::plain(status));
         }
         let base = self.screen_cache.lines.len();
         let (mut active_lines, cursor, cursor_visible) = match &mut self.interaction {
@@ -880,9 +884,11 @@ impl Application {
 
     fn run_agent(&mut self, prompt: &str) -> io::Result<()> {
         common::cancellation::clear_sigint_request();
+        let mut tool_prompt = RenderLine::new(shell_prompt(self.working_dir.as_deref()), "");
+        style_prompt(&mut tool_prompt);
         let context = AgentRunContext {
             shell: self.shell_path.clone(),
-            shell_prompt: shell_prompt(self.working_dir.as_deref()),
+            shell_prompt: terminal_styled_text(&tool_prompt.prefix, &tool_prompt.prefix_styles),
             shell_highlight: self.config.shell_settings.shell_highlight.clone(),
             env_vars: self.shell_env.clone(),
             working_dir: self.working_dir.clone(),

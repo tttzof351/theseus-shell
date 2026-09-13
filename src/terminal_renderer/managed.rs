@@ -142,7 +142,10 @@ impl ManagedRenderer {
             });
         }
         self.last_viewport_top = top;
-        let rows = (0..output_height)
+        // Reserve space for the footer, but don't fill unused output space
+        // above it: short output keeps status/editor immediately afterwards.
+        let footer_top = document_end.saturating_sub(top).min(output_height);
+        let mut rows = (0..footer_top)
             .map(|row| {
                 let absolute = top + row;
                 if absolute >= document_end {
@@ -170,13 +173,14 @@ impl ManagedRenderer {
                 fit_row(&self.layout.logical_lines[line].rows[row], size.width)
             })
             .chain(footer_frame.rows.into_iter().take(footer_height))
-            .collect();
+            .collect::<Vec<_>>();
+        rows.resize_with(size.height, || PhysicalRow::empty(size.width));
         let next = PhysicalTerminal {
             size,
             rows,
             cursor: PhysicalCursor {
                 position: PhysicalPosition {
-                    row: output_height + footer_frame.cursor.position.row,
+                    row: footer_top + footer_frame.cursor.position.row,
                     column: footer_frame.cursor.position.column,
                 },
                 visible: footer_frame.cursor.visible,
@@ -491,10 +495,12 @@ impl ManagedRenderer {
                 ))
             });
         }
+        let footer_top = footer_row.saturating_sub(viewport_top).min(output_height);
         next.rows = (0..size.height)
             .map(|row| {
-                let absolute = if pinned && row >= output_height {
-                    Some(footer_row + footer_clip + row - output_height)
+                let absolute = if pinned && row >= footer_top {
+                    (row - footer_top < footer_height)
+                        .then_some(footer_row + footer_clip + row - footer_top)
                 } else {
                     let absolute = viewport_top + row;
                     (!pinned || absolute < footer_row).then_some(absolute)
@@ -524,7 +530,7 @@ impl ManagedRenderer {
             })
             .collect();
         next.cursor.position.row = if pinned {
-            output_height + absolute_cursor_row.saturating_sub(footer_row + footer_clip)
+            footer_top + absolute_cursor_row.saturating_sub(footer_row + footer_clip)
         } else {
             absolute_cursor_row.saturating_sub(viewport_top)
         };
@@ -612,6 +618,108 @@ fn publish_row_at_width(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn busy_footer_follows_output_and_moves_back_after_preview_shrinks() {
+        let mut renderer = ManagedRenderer::default();
+        let mut terminal = vt100::Parser::new(8, 60, 100);
+        for count in [1, 25, 1] {
+            let mut lines = (0..count)
+                .map(|index| RenderLine::plain(format!("OUTPUT_{index}")))
+                .collect::<Vec<_>>();
+            lines.extend([
+                RenderLine::plain("Waiting"),
+                RenderLine::plain("user> DRAFT"),
+            ]);
+            let scene = screen(lines);
+            let mut units = publication(count);
+            for unit in &mut units {
+                unit.stable = false;
+            }
+            let mut bytes = Vec::new();
+            renderer
+                .render(
+                    &mut bytes,
+                    &scene,
+                    &units,
+                    count,
+                    true,
+                    TerminalSize::new(60, 8),
+                )
+                .unwrap();
+            terminal.process(&bytes);
+            let rows = terminal.screen().rows(0, 60).collect::<Vec<_>>();
+            let footer_top = count.min(6);
+            assert_eq!(
+                rows[footer_top - 1].trim_end(),
+                format!("OUTPUT_{}", count - 1)
+            );
+            assert_eq!(rows[footer_top].trim_end(), "Waiting");
+            assert_eq!(rows[footer_top + 1].trim_end(), "user> DRAFT");
+            assert_eq!(
+                usize::from(terminal.screen().cursor_position().0),
+                footer_top + 1
+            );
+            assert!(
+                rows[footer_top + 2..]
+                    .iter()
+                    .all(|line| line.trim().is_empty()),
+                "{rows:?}"
+            );
+            assert!(!renderer.publication_pending());
+        }
+        assert!(
+            history(&mut terminal).is_empty(),
+            "preview reached native history"
+        );
+    }
+
+    #[test]
+    fn pending_resize_keeps_short_output_and_footer_together() {
+        let mut renderer = ManagedRenderer::default();
+        let mut terminal = vt100::Parser::new(8, 60, 100);
+        let scene = screen(vec![
+            RenderLine::plain("OUTPUT"),
+            RenderLine::plain("Waiting"),
+            RenderLine::plain("user> DRAFT"),
+        ]);
+        let units = publication(1);
+        let mut bytes = Vec::new();
+        renderer
+            .render(
+                &mut bytes,
+                &scene,
+                &units,
+                1,
+                true,
+                TerminalSize::new(60, 8),
+            )
+            .unwrap();
+        terminal.process(&bytes);
+        let cached = renderer.layout.logical_lines.clone();
+        for (width, height) in [(30, 18), (80, 6)] {
+            terminal.screen_mut().set_size(height, width);
+            bytes.clear();
+            renderer
+                .render_pending_resize(
+                    &mut bytes,
+                    &scene,
+                    &units,
+                    1,
+                    TerminalSize::new(width, height),
+                )
+                .unwrap();
+            terminal.process(&bytes);
+            let rows = terminal.screen().rows(0, width).collect::<Vec<_>>();
+            assert_eq!(&rows[..3], ["OUTPUT", "Waiting", "user> DRAFT"]);
+            assert!(rows[3..].iter().all(String::is_empty), "{rows:?}");
+            assert_eq!(terminal.screen().cursor_position().0, 2);
+            assert_eq!(renderer.layout.logical_lines, cached);
+            assert_eq!(renderer.layout.width, 60);
+            assert!(!renderer.publication_pending());
+        }
+        assert!(history(&mut terminal).is_empty());
+    }
 
     #[test]
     fn pending_resize_keeps_document_cache_and_publication_while_editor_reflows() {

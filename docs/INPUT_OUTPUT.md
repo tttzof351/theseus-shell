@@ -46,6 +46,15 @@ including repeated words and reordered table cells; publication remembers which
 characters have already reached native history. Resizing does not republish them.
 While browsing, a source-group anchor keeps the viewport in place as the backend
 appends, and the status/editor stay visible in a separate footer.
+The footer follows the visible output directly when it fits on screen. Reserving
+space for status/editor does not insert blank rows above them; they reach the bottom
+only when output fills the available height. Shrinking a preview moves the footer
+back up. Pending-resize frames follow the same rule using the cached output height.
+The active status includes the original braille spinner, advancing every 120 ms
+from elapsed operation time. Managed UI frames draw it without a spinner thread or
+direct terminal writes; animation frames never become document/history entries.
+While waiting for an LLM response, only the spinner is visible: the waiting label,
+elapsed time and attempt counter are omitted from that status row.
 SSE is not enabled by this refactoring.
 
 The loop drains ready input before a bounded backend batch (normally at most
@@ -309,13 +318,15 @@ Additional tests exercise real MCP initialization/discovery with responsive inpu
 resize and cancellation, retry-backoff cancellation, plain-event validation and
 an interactive Vim round trip with a saved file and terminal resize.
 
-The final suite passes: 401 unit tests, 14 integration PTY/CLI tests and one stdout
-test (416 passed, two explicitly ignored tests). The ignored cases are a managed
+The final suite passes: 403 unit tests, 16 integration PTY/CLI tests and one stdout
+test (420 passed, two explicitly ignored tests). The ignored cases are a managed
 fixture subprocess entry point and an older Vim version smoke test; the new
 interactive Vim test ran successfully on the acceptance machine.
 Regression tests check preview cache reuse across success/error/cancel, separate
 outcome publication, ANSI finalization, shared physical layouts and unchanged older
 frames. Clippy also passes for all targets/features with `-D warnings`.
+Footer-position tests cover submitting inline/multiline requests through real PTY,
+growing/shrinking previews and pending resize without a gap above status/editor.
 
 The I/O refactoring has passed the requirement-by-requirement
 [acceptance audit](INPUT_OUTPUT_ACCEPTANCE.md). That report records evidence,

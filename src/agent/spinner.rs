@@ -5,7 +5,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -33,14 +33,15 @@ impl Spinner {
         let thread_stop = Arc::clone(&stop);
         let _ = terminal_output::with_transient_stdout(|stdout| execute!(stdout, Hide));
         let handle = thread::spawn(move || {
-            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let mut index = 0;
+            let started = Instant::now();
 
             while !thread_stop.load(Ordering::Relaxed) {
                 let _ = terminal_output::with_transient_stdout(|stdout| {
-                    write_spinner_frame(stdout, frames[index % frames.len()])
+                    write_spinner_frame(
+                        stdout,
+                        crate::common::progress::spinner_frame(started.elapsed()),
+                    )
                 });
-                index += 1;
                 thread::sleep(Duration::from_millis(120));
             }
         });
