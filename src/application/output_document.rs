@@ -1,6 +1,6 @@
 //! Persistent semantic output with revisioned, disposable rendering caches.
 
-use std::{collections::HashMap, io};
+use std::{collections::HashMap, io, sync::Arc};
 
 use super::{
     RenderLine, TerminalColor, ansi::markdown_lines_with_groups, ansi_decoder::AnsiDecoder,
@@ -24,10 +24,11 @@ struct Block {
     id: BlockId,
     kind: BlockKind,
     source: Source,
+    // Source revision only: lifecycle changes don't reformat unchanged text.
     revision: u64,
     replacement_revision: u64,
     outcome: Option<Outcome>,
-    cache: Option<(u64, usize, Vec<RenderLine>)>,
+    cache: Option<(u64, usize, Arc<[RenderLine]>)>,
 }
 
 impl Block {
@@ -71,15 +72,10 @@ impl Block {
                             .filter(keep)
                             .map(char::len_utf8)
                             .sum();
-                        let (lines, groups, origins) = markdown_lines_with_groups(
-                            &safe,
-                            visible_offset,
-                            width,
-                            self.outcome.is_some(),
-                            check,
-                        )?;
+                        let (lines, groups, origins) =
+                            markdown_lines_with_groups(&safe, visible_offset, width, check)?;
                         self.groups = groups;
-                        self.origins = self.outcome.as_ref().map(|_| origins);
+                        self.origins = Some(origins);
                         lines
                     } else {
                         let lines = safe.lines().map(RenderLine::plain).collect::<Vec<_>>();
@@ -96,27 +92,7 @@ impl Block {
                     }
                 }
             }
-            match &self.outcome {
-                Some(Outcome::Cancelled) => lines.push(RenderLine::plain("[interrupted]")),
-                Some(Outcome::Failed(error)) => lines.push(RenderLine::plain(format!(
-                    "[failed: {}]",
-                    super::ansi::terminal_label(error)
-                ))),
-                _ => {}
-            }
-            while self.groups.len() < lines.len() {
-                self.groups
-                    .push(self.groups.last().copied().unwrap_or(0) + 1);
-            }
-            if let Some(origins) = &mut self.origins {
-                while origins.len() < lines.len() {
-                    origins.push(LineOrigins {
-                        characters: vec![None; lines[origins.len()].text.chars().count()].into(),
-                        preserve_columns: false,
-                    });
-                }
-            }
-            self.cache = Some((self.revision, width, lines));
+            self.cache = Some((self.revision, width, lines.into()));
         }
         Ok(&self.cache.as_ref().unwrap().2)
     }
@@ -223,9 +199,9 @@ impl OutputDocument {
             if block.operation == Some(operation) && block.outcome.is_none() {
                 if let Source::Ansi(decoder) = &mut block.source {
                     decoder.finish();
+                    block.revision += 1;
                 }
                 block.outcome = Some(outcome.clone());
-                block.revision += 1;
             }
         }
     }
@@ -300,12 +276,14 @@ impl OutputDocument {
                     self.rejected_events += 1;
                     return false;
                 };
-                match (event, &mut block.source) {
+                let source_changed = match (event, &mut block.source) {
                     (OutputEvent::TextAppended { text: delta, .. }, Source::Text { text, .. }) => {
-                        text.push_str(&delta)
+                        text.push_str(&delta);
+                        true
                     }
                     (OutputEvent::BytesAppended { bytes, stream, .. }, Source::Ansi(decoder)) => {
-                        decoder.push_stream(stream, &bytes)
+                        decoder.push_stream(stream, &bytes);
+                        true
                     }
                     (
                         OutputEvent::BlockReplaced {
@@ -319,19 +297,23 @@ impl OutputDocument {
                         *visible_from = rebase_clear_anchor(text, &replacement, *visible_from);
                         *text = replacement;
                         block.replacement_revision = revision;
+                        true
                     }
                     (OutputEvent::BlockFinished { outcome, .. }, source) => {
                         if let Source::Ansi(decoder) = source {
                             decoder.finish();
                         }
                         block.outcome = Some(outcome);
+                        matches!(source, Source::Ansi(_))
                     }
                     _ => {
                         self.rejected_events += 1;
                         return false;
                     }
+                };
+                if source_changed {
+                    block.revision += 1;
                 }
-                block.revision += 1;
             }
         }
         self.version += 1;
@@ -377,9 +359,6 @@ impl OutputDocument {
             stable_prefix &= block.outcome.is_some();
             let start = lines.len();
             lines.extend_from_slice(block.lines(width, check)?);
-            if stable_prefix {
-                stable_lines = lines.len();
-            }
             let mut group_start = 0;
             for (index, group) in block.groups.iter().enumerate() {
                 check()?;
@@ -398,6 +377,31 @@ impl OutputDocument {
                     });
                     group_start = index + 1;
                 }
+            }
+            // Outcome presentation has its own publication group. Keep it out
+            // of the source cache so finishing doesn't invalidate Markdown.
+            let diagnostic = match &block.outcome {
+                Some(Outcome::Cancelled) => Some(RenderLine::plain("[interrupted]")),
+                Some(Outcome::Failed(error)) => Some(RenderLine::plain(format!(
+                    "[failed: {}]",
+                    super::ansi::terminal_label(error)
+                ))),
+                _ => None,
+            };
+            if let Some(diagnostic) = diagnostic {
+                lines.push(diagnostic);
+                publication.push(PublicationUnit {
+                    id: RowIdentity {
+                        block: block.identity,
+                        group: block.groups.last().copied().unwrap_or(0) + 1,
+                    },
+                    end: lines.len(),
+                    stable: stable_prefix,
+                    origins: None,
+                });
+            }
+            if stable_prefix {
+                stable_lines = lines.len();
             }
         }
         self.dirty = false;
@@ -440,6 +444,118 @@ fn rebase_clear_anchor(previous: &str, next: &str, anchor: usize) -> usize {
 mod tests {
     use super::*;
     use crate::common::{cancellation::CancellationEvent, events::EventSink};
+
+    #[test]
+    fn finishing_text_reuses_preview_cache_and_adds_outcome_once() {
+        for outcome in [
+            Outcome::Completed,
+            Outcome::Cancelled,
+            Outcome::Failed("oops".into()),
+        ] {
+            for finish_operation in [false, true] {
+                let (sink, events) = EventSink::channel(CancellationEvent::new());
+                let mut doc = OutputDocument::default();
+                doc.start_operation(sink.operation());
+                let id = sink.start_block(BlockKind::Markdown).unwrap();
+                sink.text(id, "**FIRST**\n\n```rust\nlet value = 1;")
+                    .unwrap();
+                for event in events.try_iter() {
+                    assert!(doc.apply(event));
+                }
+                // Model UI snapshots: the previous worker owns the cache, but
+                // the new document snapshot was made before it was available.
+                let mut previous = doc.clone();
+                let preview = previous.render(40);
+                let cache = previous.blocks[0].cache.as_ref().unwrap().2.clone();
+                assert!(preview.publication.iter().all(|unit| !unit.stable));
+                if finish_operation {
+                    sink.finish(outcome.clone()).unwrap();
+                } else {
+                    sink.finish_block(id, outcome.clone()).unwrap();
+                }
+                for event in events.try_iter() {
+                    assert!(doc.apply(event));
+                }
+                doc.reuse_caches(&previous);
+                let completed = doc.render(40);
+                assert!(Arc::ptr_eq(
+                    &cache,
+                    &doc.blocks[0].cache.as_ref().unwrap().2
+                ));
+                assert_eq!(&completed.lines[..preview.lines.len()], preview.lines);
+                assert_eq!(completed.stable_lines, completed.lines.len());
+                assert!(completed.publication.iter().all(|unit| unit.stable));
+                assert!(
+                    completed
+                        .publication
+                        .iter()
+                        .any(|unit| unit.origins.is_some())
+                );
+                let marker = match outcome {
+                    Outcome::Completed => None,
+                    Outcome::Cancelled => Some("[interrupted]"),
+                    Outcome::Failed(_) => Some("[failed: oops]"),
+                };
+                assert_eq!(
+                    completed.lines.len(),
+                    preview.lines.len() + usize::from(marker.is_some())
+                );
+                if let Some(marker) = marker {
+                    assert_eq!(completed.lines.last().unwrap().text, marker);
+                }
+                assert_eq!(doc.render(40).lines, completed.lines);
+                assert_eq!(previous.render(40).lines, preview.lines);
+                assert_eq!(previous.render(40).stable_lines, 0);
+                // A width change must still invalidate the source cache.
+                doc.render(20);
+                assert!(!Arc::ptr_eq(
+                    &cache,
+                    &doc.blocks[0].cache.as_ref().unwrap().2
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn finishing_ansi_invalidates_cache_to_flush_incomplete_utf8() {
+        for finish_operation in [false, true] {
+            let (sink, events) = EventSink::channel(CancellationEvent::new());
+            let mut doc = OutputDocument::default();
+            doc.start_operation(sink.operation());
+            let id = sink.start_block(BlockKind::ToolOutput).unwrap();
+            sink.emit(OutputEvent::BytesAppended {
+                id,
+                stream: 0,
+                bytes: b"TOOL \xe2".to_vec(),
+            })
+            .unwrap();
+            for event in events.try_iter() {
+                assert!(doc.apply(event));
+            }
+            doc.render(40);
+            let cache = doc.blocks[0].cache.as_ref().unwrap().2.clone();
+            if finish_operation {
+                sink.finish(Outcome::Cancelled).unwrap();
+            } else {
+                sink.finish_block(id, Outcome::Cancelled).unwrap();
+            }
+            for event in events.try_iter() {
+                assert!(doc.apply(event));
+            }
+            let finished = doc.render(40);
+            assert!(
+                finished
+                    .lines
+                    .iter()
+                    .any(|line| line.text == "TOOL \u{fffd}")
+            );
+            assert_eq!(finished.lines.last().unwrap().text, "[interrupted]");
+            assert!(!Arc::ptr_eq(
+                &cache,
+                &doc.blocks[0].cache.as_ref().unwrap().2
+            ));
+        }
+    }
 
     #[test]
     fn backend_activity_and_failure_cannot_inject_terminal_controls() {

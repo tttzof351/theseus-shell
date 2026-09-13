@@ -546,7 +546,6 @@ pub(super) fn markdown_lines_with_groups(
     text: &str,
     visible_from: usize,
     width: usize,
-    track_origins: bool,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<(
     Vec<RenderLine>,
@@ -600,18 +599,12 @@ pub(super) fn markdown_lines_with_groups(
             _ => None,
         };
         group = group.max(origin.unwrap_or(group));
-        let (rendered, source_rows) = if track_origins {
-            let mut writer = super::markdown_source::SourceWriter::new(&source);
-            writeln!(&mut writer, "{}", DisplayLine(&skin, line, width))
-                .expect("String formatting cannot fail");
-            (ansi_render_lines(&writer.text), writer.character_rows())
-        } else {
-            (
-                ansi_render_lines(&format!("{}\n", DisplayLine(&skin, line, width))),
-                Vec::new(),
-            )
-        };
-        debug_assert!(!track_origins || source_rows.len() == rendered.len());
+        let mut writer = super::markdown_source::SourceWriter::new(&source);
+        writeln!(&mut writer, "{}", DisplayLine(&skin, line, width))
+            .expect("String formatting cannot fail");
+        let rendered = ansi_render_lines(&writer.text);
+        let source_rows = writer.character_rows();
+        debug_assert_eq!(source_rows.len(), rendered.len());
         origins.extend(
             source_rows
                 .into_iter()

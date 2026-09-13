@@ -3,7 +3,10 @@
 pub(crate) mod managed;
 mod publication;
 
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    sync::Arc,
+};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -379,7 +382,7 @@ impl HeightIndex {
 #[derive(Debug, Clone, Default)]
 pub struct IndexedPhysicalLayout {
     pub width: usize,
-    pub logical_lines: Vec<CachedLogicalLayout>,
+    pub logical_lines: Vec<Arc<CachedLogicalLayout>>,
     pub heights: HeightIndex,
     pub reflowed_last_frame: usize,
 }
@@ -439,21 +442,21 @@ impl IndexedPhysicalLayout {
             if !length_changed {
                 self.heights.set(index, layout.rows.len());
             }
-            self.logical_lines[index] = layout;
+            self.logical_lines[index] = Arc::new(layout);
             self.reflowed_last_frame += 1;
         }
 
         self.logical_lines.truncate(new_length);
         for index in common_length..new_length {
             check()?;
-            self.logical_lines.push(CachedLogicalLayout::build(
+            self.logical_lines.push(Arc::new(CachedLogicalLayout::build(
                 &screen.prefixes[index],
                 &screen.lines[index],
                 &screen.prefix_styles[index],
                 &screen.line_styles[index],
                 (screen.cursor.line == index).then_some(screen.cursor.char_offset),
                 size.width,
-            ));
+            )));
             self.reflowed_last_frame += 1;
         }
 

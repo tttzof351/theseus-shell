@@ -71,6 +71,7 @@ impl Worker {
                     }
                 };
                 let mut previous = None;
+                let mut previous_layout = IndexedPhysicalLayout::default();
                 loop {
                     let (key, mut document) = {
                         let (lock, ready) = &*worker_queue;
@@ -101,7 +102,10 @@ impl Worker {
                             },
                             true,
                         );
-                        let mut layout = IndexedPhysicalLayout::default();
+                        // Cloning shares immutable line layouts with the UI.
+                        // Reflow replaces only changed lines, preserving older
+                        // prepared frames and their publication metadata.
+                        let mut layout = previous_layout.clone();
                         layout.layout_checked(
                             &screen,
                             TerminalSize::new(key.width as u16, 1),
@@ -109,6 +113,7 @@ impl Worker {
                         )?;
                         screen.truncate(footer);
                         screen.dirty_from = footer;
+                        previous_layout = layout.clone();
                         Ok(Prepared {
                             key,
                             rendered,
@@ -221,6 +226,80 @@ mod tests {
             assert!(Instant::now() < deadline, "layout worker did not finish");
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn completion_and_new_output_share_unchanged_layout_without_mutating_preview() {
+        let mut document = OutputDocument::default();
+        let (sink, events) = EventSink::channel(CancellationEvent::new());
+        document.start_operation(sink.operation());
+        let id = sink.start_block(BlockKind::Markdown).unwrap();
+        sink.text(id, &"**UNCHANGED** text\n\n".repeat(100))
+            .unwrap();
+        for event in events.try_iter() {
+            assert!(document.apply(event));
+        }
+        let mut worker = Worker::new().unwrap();
+        let key = Key::of(&document, 60);
+        worker.request(key, &document);
+        wait_ready(&worker);
+        let preview = worker.take(key).unwrap().unwrap();
+        let body_lines = preview.rendered.lines.len();
+
+        sink.finish(Outcome::Cancelled).unwrap();
+        for event in events.try_iter() {
+            assert!(document.apply(event));
+        }
+        let key = Key::of(&document, 60);
+        worker.request(key, &document);
+        wait_ready(&worker);
+        let finished = worker.take(key).unwrap().unwrap();
+        assert_eq!(finished.rendered.lines, document.render(60).lines);
+        assert_eq!(
+            finished.layout.reflowed_last_frame, 2,
+            "only outcome and footer changed"
+        );
+        for index in 0..body_lines {
+            assert!(Arc::ptr_eq(
+                &preview.layout.logical_lines[index],
+                &finished.layout.logical_lines[index]
+            ));
+        }
+        assert!(preview.rendered.publication.iter().all(|unit| !unit.stable));
+        assert!(
+            !preview
+                .screen
+                .lines
+                .iter()
+                .any(|line| line.contains("interrupted"))
+        );
+        assert!(finished.rendered.publication.iter().all(|unit| unit.stable));
+
+        document.append_lines(vec![RenderLine::plain("user> /exit")]);
+        let key = Key::of(&document, 60);
+        worker.request(key, &document);
+        wait_ready(&worker);
+        let appended = worker.take(key).unwrap().unwrap();
+        assert_eq!(
+            appended.layout.reflowed_last_frame, 2,
+            "only submission and footer changed"
+        );
+        for index in 0..finished.rendered.lines.len() {
+            assert!(Arc::ptr_eq(
+                &finished.layout.logical_lines[index],
+                &appended.layout.logical_lines[index]
+            ));
+        }
+        // Keeping old Prepared frames alive must not prevent a fresh reflow.
+        let key = Key::of(&document, 20);
+        worker.request(key, &document);
+        wait_ready(&worker);
+        let resized = worker.take(key).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(
+            &resized.layout.logical_lines[0],
+            &appended.layout.logical_lines[0]
+        ));
+        assert_eq!(resized.rendered.lines, document.render(20).lines);
     }
 
     #[test]

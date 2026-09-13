@@ -27,6 +27,10 @@ reasoning, tool preview/output or diagnostics. Appending and replacing change th
 same block; completion seals it. The document rejects stale, duplicate and late
 events. Markdown is rendered from the current full source at an explicit width.
 Cached RenderLines are derived data, separate from input history and trajectory.
+Their cache key uses the source revision and width, independently of the block's
+outcome. Markdown source origins are retained during preview too. Finishing a text
+block reuses its formatted lines and adds any failure/cancellation marker as a
+separate publication group; finishing ANSI still flushes and invalidates its cache.
 Rejected events are logged as `backend_event_rejected` with operation/block ids,
 sequence and event kind; their payload is excluded. A `Finished` event only ends
 the UI operation after the frontend accepts it.
@@ -56,6 +60,10 @@ The worker prepares Markdown, VirtualScreen and IndexedPhysicalLayout from a
 snapshot without a terminal writer. It retains one pending request and one ready
 result, replacing superseded entries. The UI applies the document representation,
 publication metadata and physical layout together.
+The worker also retains the previous physical layout. Immutable logical-line
+layouts are shared through Arc with prepared UI frames; changed lines are replaced
+and resized documents reflow. Status changes and new trailing output reuse the
+unchanged prefix without copying its physical cells or mutating older frames.
 
 Results carry document version, display generation and width. Clear/replace and
 width changes reject old results. An earlier append-only snapshot at the same
@@ -288,7 +296,8 @@ types/order, final-response reasoning and tool context in the next request.
 A checkpoint handshake stops real formatting of an 890 KB paragraph after parsing:
 worker join takes 2.4 ms in a focused debug run (test budget 1 s), and no queued
 layout starts. Exiting immediately after cancellation of that paragraph completes
-publication in about 1.46 s (test budget 2 s), retains its tail and outcome once,
+publication in 1.36–1.38 s after cache reuse fixes (test budget unchanged at 2 s),
+retains its tail and outcome once,
 prints `/exit` once and restores ICANON/ECHO/ISIG.
 Reference links are resolved from the full Markdown source before termimad
 formatting. A late definition updates the existing open block; rendering does not
@@ -300,10 +309,13 @@ Additional tests exercise real MCP initialization/discovery with responsive inpu
 resize and cancellation, retry-backoff cancellation, plain-event validation and
 an interactive Vim round trip with a saved file and terminal resize.
 
-The final suite passes: 398 unit tests, 14 integration PTY/CLI tests and one stdout
-test (413 passed, two explicitly ignored tests). The ignored cases are a managed
+The final suite passes: 401 unit tests, 14 integration PTY/CLI tests and one stdout
+test (416 passed, two explicitly ignored tests). The ignored cases are a managed
 fixture subprocess entry point and an older Vim version smoke test; the new
 interactive Vim test ran successfully on the acceptance machine.
+Regression tests check preview cache reuse across success/error/cancel, separate
+outcome publication, ANSI finalization, shared physical layouts and unchanged older
+frames. Clippy also passes for all targets/features with `-D warnings`.
 
 The I/O refactoring has passed the requirement-by-requirement
 [acceptance audit](INPUT_OUTPUT_ACCEPTANCE.md). That report records evidence,
