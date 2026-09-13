@@ -1348,7 +1348,7 @@ impl Application {
 
     fn refresh_document(&mut self, width: usize) -> io::Result<()> {
         if self.terminal.is_some()
-            && (self.layout_worker.is_some() || self.document.source_bytes() >= 128 * 1024)
+            && (self.layout_worker.is_some() || self.document.requires_background_layout())
         {
             if self.layout_worker.is_none() {
                 self.layout_worker = Some(document_layout::Worker::new()?);

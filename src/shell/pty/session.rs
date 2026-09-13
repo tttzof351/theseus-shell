@@ -198,13 +198,18 @@ impl PersistentShellSession {
     }
 
     fn initialize_shell(&mut self) -> io::Result<()> {
-        // dash abandons the surrounding command group on SIGINT unless the
-        // shell handles it. Foreground children reset a caught signal to its
-        // default disposition, so Ctrl+C still stops them while the shell can
-        // report their exit status. Bash and Zsh already handle this case.
+        // POSIX shells and modern Bash can abandon the surrounding command
+        // group on SIGINT unless the shell handles it. Foreground children
+        // reset a caught signal to its default disposition, so Ctrl+C still
+        // stops them while the shell can report their exit status. Zsh uses
+        // an `always` block instead.
         let payload = self.command_payload(
             "stty -echo 2>/dev/null || true\n\
-             if [ -z \"${BASH_VERSION-}${ZSH_VERSION-}\" ]; then trap ':' INT; fi\n\
+             if [ -n \"${BASH_VERSION-}\" ]; then\n\
+               if [ -z \"$(trap -p INT)\" ]; then trap ':' INT; fi\n\
+             elif [ -z \"${ZSH_VERSION-}\" ]; then\n\
+               trap ':' INT\n\
+             fi\n\
              bind 'set enable-bracketed-paste off' 2>/dev/null || true\n\
              unsetopt zle prompt_cr prompt_sp 2>/dev/null || true\n\
              PROMPT=''\n\
@@ -1500,26 +1505,32 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn persistent_shell_loads_bash_and_zsh_startup_aliases() {
-        for (shell, rc_file) in [("/bin/bash", ".bashrc"), ("/bin/zsh", ".zshrc")] {
-            if !Path::new(shell).exists() {
+        for shell in available_shells() {
+            let rc_file = if shell.ends_with("/bash") {
+                ".bashrc"
+            } else if shell.ends_with("/zsh") {
+                ".zshrc"
+            } else {
                 continue;
-            }
+            };
 
             let home = TempTestDir::new();
             fs::write(
                 home.path().join(rc_file),
-                "alias theseus_rc_alias='printf rc-alias-ok'\n",
+                "alias theseus_rc_alias='printf rc-alias-ok'\ntrap 'printf rc-int-ok' INT\n",
             )
             .unwrap();
 
             let mut session = PersistentShellSession::start(PersistentShellConfig {
-                shell: PathBuf::from(shell),
-                env_vars: clean_home_env_vars(shell, Some(&home)),
+                shell: PathBuf::from(&shell),
+                env_vars: clean_home_env_vars(&shell, Some(&home)),
                 working_dir: None,
             })
             .unwrap();
 
             assert_success(&mut session, "theseus_rc_alias", "rc-alias-ok");
+            let traps = session.run_command("trap").unwrap();
+            assert!(traps.transcript_lossy().contains("rc-int-ok"), "{shell}");
         }
     }
 
@@ -1715,11 +1726,30 @@ mod tests {
 
     #[cfg(unix)]
     fn available_shells() -> Vec<String> {
-        ["/bin/sh", "/bin/dash", "/bin/bash", "/bin/zsh"]
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut shells = ["/bin/sh", "/bin/dash", "/bin/bash", "/bin/zsh"]
             .into_iter()
             .filter(|shell| Path::new(shell).exists())
             .map(str::to_string)
-            .collect()
+            .collect::<Vec<_>>();
+        // macOS ships Bash 3.2. Also exercise the Bash selected through PATH
+        // (e.g. Homebrew's Bash 5) so Linux protocol failures reproduce locally.
+        if let Some(path) = std::env::var_os("PATH")
+            && let Some(bash) = std::env::split_paths(&path)
+                .map(|directory| directory.join("bash"))
+                .find(|candidate| {
+                    candidate.metadata().is_ok_and(|metadata| {
+                        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                    })
+                })
+        {
+            let bash = bash.to_string_lossy().into_owned();
+            if !shells.contains(&bash) {
+                shells.push(bash);
+            }
+        }
+        shells
     }
 
     #[cfg(unix)]

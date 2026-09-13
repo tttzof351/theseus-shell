@@ -483,7 +483,20 @@ fn replacing_long_preview_then_shrinking_and_finishing_does_not_publish_drafts()
                 .trim_end()
                 .ends_with('>')
     });
-    let history = ui.history().join("\n");
+    // Backend completion can precede the final background layout/publication.
+    // Wait for all rows to reach history, then check that none were duplicated.
+    let deadline = Instant::now() + TIMEOUT;
+    let history = loop {
+        let history = ui.history().join("\n");
+        if (0..45).all(|i| history.contains(&format!("FINAL_{i:02}"))) {
+            break history;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "final rows were not published:\n{history}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
     for i in 0..45 {
         assert_eq!(
             history.matches(&format!("FINAL_{i:02}")).count(),
@@ -922,6 +935,30 @@ fn extended_keyboard_edits_busy_draft_and_broken_escape_does_not_swallow_cancel(
     assert!(parser.screen().contents().contains("!ab"));
     assert!(!parser.screen().contents().contains("!xab"));
     assert!(parser.screen().contents().contains("KEYBOARD_PREFIX"));
+}
+
+#[test]
+fn subthreshold_markdown_tail_does_not_delay_cancellation_frame() {
+    let mut ui = UiPty::start();
+    let prefix = format!("```rust\n{}", "let PREFIX = \"界\";\n".repeat(1000));
+    let tail = "let ACCEPTED_TAIL = \"界\";\n".repeat(2000);
+    assert!(prefix.len() + tail.len() < 128 * 1024);
+    ui.command("append", &prefix);
+    ui.wait(|screen| screen.contents().contains("PREFIX"));
+    ui.command("append", &tail);
+    let deadline = Instant::now() + TIMEOUT;
+    while !ui.directory.join("2.accepted").exists() {
+        assert!(Instant::now() < deadline, "tail was not queued");
+        thread::sleep(Duration::from_millis(2));
+    }
+    let started = Instant::now();
+    ui.write("\x03");
+    ui.wait(|screen| {
+        screen.contents().contains("interrupted") && !screen.contents().contains("Fixture waiting")
+    });
+    assert_responsive(started, "subthreshold Markdown cancel-to-frame");
+    // Immediate feedback must not discard text already accepted before Ctrl+C.
+    ui.wait(|screen| screen.contents().contains("ACCEPTED_TAIL"));
 }
 
 #[test]

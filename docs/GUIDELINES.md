@@ -33,6 +33,9 @@ cargo test --locked --lib shell::pty::session::tests::ignored_vim_smoke_starts_a
 The ignored `fixture_child` is launched by parent PTY tests; do not run it alone
 or use a blanket `cargo test -- --ignored`.
 
+Shell tests also exercise `bash` from `PATH`, so Bash 5 can be checked alongside
+the system Bash 3.2 on macOS.
+
 xterm.js records new PTY output and checks it with the real emulator. Artifacts:
 `target/xterm/run-*`. See [the xterm.js guide](../tests/xterm/README.md) for replay,
 coverage and known limits. An old recording does not verify a new application fix.

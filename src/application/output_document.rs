@@ -140,6 +140,14 @@ impl OutputDocument {
             })
             .sum()
     }
+    pub(super) fn requires_background_layout(&self) -> bool {
+        // Byte size does not bound Markdown formatting time. Keep even small
+        // streamed blocks and their final cancellation layout off the UI thread.
+        self.blocks
+            .iter()
+            .any(|block| block.kind == BlockKind::Markdown)
+            || self.source_bytes() >= 128 * 1024
+    }
     pub(super) fn reuse_caches(&mut self, previous: &Self) {
         let previous = previous
             .blocks
@@ -449,6 +457,36 @@ mod streaming_tests;
 mod tests {
     use super::*;
     use crate::common::{cancellation::CancellationEvent, events::EventSink};
+
+    #[test]
+    fn subthreshold_markdown_stays_in_background_layout_after_cancellation() {
+        let (sink, events) = EventSink::channel(CancellationEvent::new());
+        let mut document = OutputDocument::default();
+        document.append_lines(vec![RenderLine::plain("user> prompt")]);
+        assert!(!document.requires_background_layout());
+        document.start_operation(sink.operation());
+        let block = sink.start_block(BlockKind::Markdown).unwrap();
+        sink.text(
+            block,
+            &format!("```rust\n{}", "let x = \"界\";\n".repeat(1000)),
+        )
+        .unwrap();
+        for event in events.try_iter() {
+            assert!(document.apply(event));
+        }
+        assert!(document.source_bytes() < 128 * 1024);
+        assert!(document.requires_background_layout());
+
+        // Accepted tail events still need formatting when cancellation arrives;
+        // completing the block must not return that work to the input thread.
+        sink.text(block, &"let tail = 1;\n".repeat(1000)).unwrap();
+        sink.finish(Outcome::Cancelled).unwrap();
+        for event in events.try_iter() {
+            assert!(document.apply(event));
+        }
+        assert!(document.source_bytes() < 128 * 1024);
+        assert!(document.requires_background_layout());
+    }
 
     #[test]
     fn activity_updates_status_without_invalidating_source_or_layout() {
