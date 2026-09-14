@@ -398,15 +398,15 @@ fn json_fallback_uses_same_presentation_and_unknown_content_type_fails() {
 
 #[test]
 fn full_streaming_ingress_waits_without_idle_error_and_cancel_closes_http_before_cleanup() {
-    let (release, released) = mpsc::channel();
+    // Prepare the oversized SSE event before starting the idle clock. Waiting
+    // for the consumer or serializing 2 MiB after PREFIX would create genuine
+    // provider inactivity on a busy runner, before queue backpressure starts.
+    let mut response = SSE_HEADERS.to_vec();
+    response.extend_from_slice(delta("PREFIX").as_bytes());
+    response.extend_from_slice(delta(&"x".repeat(2 * 1024 * 1024)).as_bytes());
     let (closed_tx, closed) = mpsc::channel();
     let (url, server) = server(1, move |_, stream, _| {
-        stream.write_all(SSE_HEADERS).unwrap();
-        stream.write_all(delta("PREFIX").as_bytes()).unwrap();
-        released.recv_timeout(TIMEOUT).unwrap();
-        stream
-            .write_all(delta(&"x".repeat(2 * 1024 * 1024)).as_bytes())
-            .unwrap();
+        stream.write_all(&response).unwrap();
         assert_closed(stream);
         closed_tx.send(()).unwrap();
     });
@@ -424,11 +424,11 @@ fn full_streaming_ingress_waits_without_idle_error_and_cancel_closes_http_before
             break;
         }
     }
-    release.send(()).unwrap();
     // Wait for assembly to reach enqueue, then hold the bounded consumer beyond
     // both configured timeouts. Queue backpressure is not provider inactivity.
-    let OutputEvent::TextAppended { text, .. } = events.recv_timeout(TIMEOUT).unwrap().event else {
-        panic!("expected live text");
+    let event = events.recv_timeout(TIMEOUT).unwrap().event;
+    let OutputEvent::TextAppended { text, .. } = event else {
+        panic!("expected live text, got {event:?}");
     };
     let premature_close = closed.recv_timeout(Duration::from_millis(400));
     let started = Instant::now();
