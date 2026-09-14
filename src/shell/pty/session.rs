@@ -135,12 +135,10 @@ impl PersistentShellSession {
 
         let stream_output = output.is_some() || io::stdout().is_terminal();
         let _raw_mode = RawModeGuard::enable_if_terminal()?;
-        let mut input_forwarder = InputForwarder::start(Arc::clone(&self.writer), input)?;
+        let mut input_forwarder = InputForwarder::new(Arc::clone(&self.writer), input);
         let completed = match output {
-            Some(output) => {
-                self.read_until_sentinel_streaming(&payload, output, Some(&mut input_forwarder))
-            }
-            None => self.read_until_sentinel(&payload, stream_output, Some(&mut input_forwarder)),
+            Some(output) => self.read_until_sentinel_streaming(output, Some(&mut input_forwarder)),
+            None => self.read_until_sentinel(stream_output, Some(&mut input_forwarder)),
         };
         input_forwarder.stop()?;
         let completed = completed?;
@@ -188,7 +186,7 @@ impl PersistentShellSession {
         self.resize_to_current_terminal()?;
         let payload = self.command_payload(command);
         self.write_to_shell(payload.as_bytes())?;
-        let completed = self.read_until_sentinel(&payload, false, None)?;
+        let completed = self.read_until_sentinel(false, None)?;
 
         Ok(CommandOutput {
             transcript: completed.transcript,
@@ -218,7 +216,7 @@ impl PersistentShellSession {
              PS2=''",
         );
         self.write_to_shell(payload.as_bytes())?;
-        let _ = self.read_until_sentinel(&payload, false, None)?;
+        let _ = self.read_until_sentinel(false, None)?;
         self.drain_pending_output();
 
         Ok(())
@@ -239,24 +237,50 @@ impl PersistentShellSession {
         payload.replace('\n', "\r")
     }
 
+    fn read_until_command_ready(
+        &mut self,
+        mut resized: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Vec<u8>> {
+        let marker = ready_marker(&self.nonce);
+        let mut pending = Vec::new();
+        loop {
+            let chunk = self.recv_shell_chunk_notifying_resize(&mut resized)?;
+            if chunk.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "shell ended before command readiness marker",
+                ));
+            }
+            pending.extend_from_slice(&chunk);
+            if strip_ready_marker(&mut pending, &marker) {
+                return Ok(pending);
+            }
+        }
+    }
+
     fn read_until_sentinel(
         &mut self,
-        payload: &str,
         stream_output: bool,
-        input: Option<&mut InputForwarder>,
+        mut input: Option<&mut InputForwarder>,
     ) -> io::Result<CompletedCommand> {
         if stream_output {
             return terminal_output::with_stdout(|output| {
-                self.read_until_sentinel_streaming(payload, &mut LegacyOutput(output), input)
+                self.read_until_sentinel_streaming(&mut LegacyOutput(output), input)
             });
         }
 
+        let mut initial = Some(self.read_until_command_ready(|| Ok(()))?);
+        if let Some(input) = input.as_deref_mut() {
+            input.start()?;
+        }
         let mut pending = Vec::new();
         let mut transcript = Vec::new();
-        let mut strip_initial_separator = true;
 
         loop {
-            let chunk = self.recv_shell_chunk()?;
+            let chunk = match initial.take().filter(|chunk| !chunk.is_empty()) {
+                Some(chunk) => chunk,
+                None => self.recv_shell_chunk()?,
+            };
             if chunk.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -269,31 +293,12 @@ impl PersistentShellSession {
                 if let Some(input) = input {
                     input.stop()?;
                 }
-                strip_echoed_payload(&mut completed.transcript, payload);
-                if transcript.is_empty() && strip_initial_separator {
-                    let _ = strip_initial_shell_separators(&mut completed.transcript);
-                }
                 transcript.extend_from_slice(&completed.transcript);
                 completed.transcript = transcript;
                 self.drain_pending_output();
                 return Ok(completed);
             }
 
-            strip_echoed_payload_prefix(&mut pending, payload);
-            if is_partial_echoed_payload_prefix(&pending, payload) {
-                continue;
-            }
-            if transcript.is_empty() && strip_initial_separator && pending.is_empty() {
-                continue;
-            }
-            if transcript.is_empty() && strip_initial_separator {
-                match strip_initial_shell_separators(&mut pending) {
-                    StripInitialSeparator::Stripped | StripInitialSeparator::NotPresent => {
-                        strip_initial_separator = false;
-                    }
-                    StripInitialSeparator::Pending => continue,
-                }
-            }
             if pending.len() > STREAM_HOLD_BACK_BYTES {
                 let safe_len = pending.len() - STREAM_HOLD_BACK_BYTES;
                 transcript.extend_from_slice(&pending[..safe_len]);
@@ -304,16 +309,23 @@ impl PersistentShellSession {
 
     fn read_until_sentinel_streaming(
         &mut self,
-        payload: &str,
         output: &mut dyn PtyOutput,
-        input: Option<&mut InputForwarder>,
+        mut input: Option<&mut InputForwarder>,
     ) -> io::Result<CompletedCommand> {
+        let mut initial =
+            Some(self.read_until_command_ready(|| output.resized(current_pty_size()))?);
+        if let Some(input) = input.as_deref_mut() {
+            input.start()?;
+        }
         let mut pending = Vec::new();
         let mut transcript = Vec::new();
-        let mut strip_initial_separator = true;
         loop {
-            let chunk =
-                self.recv_shell_chunk_notifying_resize(|| output.resized(current_pty_size()))?;
+            let chunk = match initial.take().filter(|chunk| !chunk.is_empty()) {
+                Some(chunk) => chunk,
+                None => {
+                    self.recv_shell_chunk_notifying_resize(|| output.resized(current_pty_size()))?
+                }
+            };
             if chunk.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -328,10 +340,6 @@ impl PersistentShellSession {
                 if let Some(input) = input {
                     input.stop()?;
                 }
-                strip_echoed_payload(&mut completed.transcript, payload);
-                if transcript.is_empty() && strip_initial_separator {
-                    let _ = strip_initial_shell_separators(&mut completed.transcript);
-                }
                 let needs_prompt_separator =
                     output_ends_with_unfinished_visible_line(&transcript, &completed.transcript);
                 output.write_all(&completed.transcript)?;
@@ -345,21 +353,6 @@ impl PersistentShellSession {
                 return Ok(completed);
             }
 
-            strip_echoed_payload_prefix(&mut pending, payload);
-            if is_partial_echoed_payload_prefix(&pending, payload) {
-                continue;
-            }
-            if transcript.is_empty() && strip_initial_separator && pending.is_empty() {
-                continue;
-            }
-            if transcript.is_empty() && strip_initial_separator {
-                match strip_initial_shell_separators(&mut pending) {
-                    StripInitialSeparator::Stripped | StripInitialSeparator::NotPresent => {
-                        strip_initial_separator = false;
-                    }
-                    StripInitialSeparator::Pending => continue,
-                }
-            }
             let safe_len = streamable_prefix_len(&pending, &self.nonce);
             if safe_len > 0 {
                 output.write_all(&pending[..safe_len])?;
@@ -591,18 +584,32 @@ fn spawn_input_forwarder(
 }
 
 struct InputForwarder {
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    input: Option<crate::common::terminal_input::SharedInput>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl InputForwarder {
-    fn start(
+    fn new(
         writer: Arc<Mutex<Box<dyn Write + Send>>>,
         input: Option<crate::common::terminal_input::SharedInput>,
-    ) -> io::Result<Self> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread = spawn_input_forwarder(writer, Arc::clone(&stop), input)?;
-        Ok(Self { stop, thread })
+    ) -> Self {
+        Self {
+            writer,
+            input,
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        }
+    }
+
+    fn start(&mut self) -> io::Result<()> {
+        self.thread = spawn_input_forwarder(
+            Arc::clone(&self.writer),
+            Arc::clone(&self.stop),
+            self.input.take(),
+        )?;
+        Ok(())
     }
 
     fn stop(&mut self) -> io::Result<()> {
@@ -793,176 +800,20 @@ fn strip_sentinel_separator(transcript: &mut Vec<u8>) {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StripInitialSeparator {
-    Stripped,
-    Pending,
-    NotPresent,
+fn ready_marker(nonce: &str) -> Vec<u8> {
+    format!("\x1e__THESEUS_READY_{nonce}__\x1f").into_bytes()
 }
 
-fn strip_initial_shell_separator(transcript: &mut Vec<u8>) -> StripInitialSeparator {
-    match initial_shell_separator_len(transcript) {
-        Some(0) => StripInitialSeparator::NotPresent,
-        Some(len) => {
-            transcript.drain(..len);
-            StripInitialSeparator::Stripped
-        }
-        None => StripInitialSeparator::Pending,
+fn strip_ready_marker(pending: &mut Vec<u8>, marker: &[u8]) -> bool {
+    if let Some(start) = find_subslice(pending, marker) {
+        pending.drain(..start + marker.len());
+        return true;
     }
-}
-
-fn strip_initial_shell_separators(transcript: &mut Vec<u8>) -> StripInitialSeparator {
-    let mut stripped = false;
-    loop {
-        match strip_initial_shell_separator(transcript) {
-            StripInitialSeparator::Stripped => stripped = true,
-            StripInitialSeparator::Pending => return StripInitialSeparator::Pending,
-            StripInitialSeparator::NotPresent => {
-                return if stripped {
-                    StripInitialSeparator::Stripped
-                } else {
-                    StripInitialSeparator::NotPresent
-                };
-            }
-        }
-    }
-}
-
-fn initial_shell_separator_len(bytes: &[u8]) -> Option<usize> {
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != 0x1b {
-            break;
-        }
-
-        let consumed = initial_escape_sequence_len(&bytes[index..])?;
-        index += consumed;
-    }
-
-    if index >= bytes.len() {
-        return if index == 0 { Some(0) } else { None };
-    }
-
-    match bytes[index] {
-        b'\r' if bytes.get(index + 1) == Some(&b'\r') && bytes.get(index + 2) == Some(&b'\n') => {
-            Some(index + 3)
-        }
-        b'\r' if bytes.get(index + 1) == Some(&b'\r') && index + 2 >= bytes.len() => None,
-        b'\r' if bytes.get(index + 1) == Some(&b'\n') => Some(index + 2),
-        b'\r' if index + 1 >= bytes.len() => None,
-        b'\r' | b'\n' => Some(index + 1),
-        _ => Some(0),
-    }
-}
-
-fn initial_escape_sequence_len(bytes: &[u8]) -> Option<usize> {
-    debug_assert_eq!(bytes.first(), Some(&0x1b));
-    let introducer = *bytes.get(1)?;
-    match introducer {
-        b'[' => bytes
-            .iter()
-            .enumerate()
-            .skip(2)
-            .find_map(|(index, byte)| (0x40..=0x7e).contains(byte).then_some(index + 1)),
-        b']' => {
-            let mut index = 2;
-            while index < bytes.len() {
-                match bytes[index] {
-                    0x07 => return Some(index + 1),
-                    0x1b if bytes.get(index + 1) == Some(&b'\\') => return Some(index + 2),
-                    _ => index += 1,
-                }
-            }
-            None
-        }
-        0x40..=0x5f => Some(2),
-        _ => Some(2),
-    }
-}
-
-fn strip_echoed_payload(transcript: &mut Vec<u8>, payload: &str) {
-    strip_echoed_payload_prefix(transcript, payload);
-
-    let tail = echoed_protocol_tail(payload);
-    let Some(tail) = tail.as_deref() else {
-        return;
-    };
-
-    if transcript.ends_with(tail) {
-        let start = transcript.len() - tail.len();
-        if start >= 2 && &transcript[start - 2..start] == b"\r\n" {
-            transcript.truncate(start - 2);
-        } else {
-            transcript.truncate(start);
-        }
-        return;
-    }
-
-    strip_echoed_protocol_tail_with_control_bytes(transcript, payload);
-}
-
-fn strip_echoed_payload_prefix(transcript: &mut Vec<u8>, payload: &str) {
-    let echoed = echoed_payload(payload);
-    let echoed = echoed.as_slice();
-    if transcript.starts_with(echoed) {
-        transcript.drain(..echoed.len());
-    }
-}
-
-fn is_partial_echoed_payload_prefix(transcript: &[u8], payload: &str) -> bool {
-    let echoed = echoed_payload(payload);
-    transcript.len() < echoed.len() && echoed.starts_with(transcript)
-}
-
-fn echoed_payload(payload: &str) -> Vec<u8> {
-    payload.replace('\r', "\r\n").into_bytes()
-}
-
-fn strip_echoed_protocol_tail_with_control_bytes(transcript: &mut Vec<u8>, payload: &str) {
-    let Some(template) = echoed_done_template(payload) else {
-        return;
-    };
-
-    let status = b"__theseus_status=$?";
-    let mut search_from = 0;
-    while search_from < transcript.len() {
-        let Some(status_start) =
-            find_subslice(&transcript[search_from..], status).map(|index| index + search_from)
-        else {
-            return;
-        };
-
-        if find_subslice(&transcript[status_start..], &template).is_some() {
-            truncate_before_protocol_tail(transcript, status_start);
-            return;
-        }
-
-        search_from = status_start + status.len();
-    }
-}
-
-fn truncate_before_protocol_tail(transcript: &mut Vec<u8>, protocol_start: usize) {
-    if protocol_start >= 2 && &transcript[protocol_start - 2..protocol_start] == b"\r\n" {
-        transcript.truncate(protocol_start - 2);
-    } else {
-        transcript.truncate(protocol_start);
-    }
-}
-
-fn echoed_protocol_tail(payload: &str) -> Option<Vec<u8>> {
-    let lines = payload
-        .trim_end_matches('\r')
-        .split('\r')
-        .collect::<Vec<_>>();
-    let tail = lines.get(lines.len().checked_sub(2)?..)?;
-    Some(tail.join("\r\n").into_bytes())
-}
-
-fn echoed_done_template(payload: &str) -> Option<Vec<u8>> {
-    let bytes = payload.as_bytes();
-    let start = find_subslice(bytes, b"__THESEUS_DONE_")?;
-    let end = find_subslice(&bytes[start..], b"%s__")? + start + b"%s__".len();
-    Some(bytes[start..end].to_vec())
+    // Everything before readiness is shell echo/prompt. Retain enough for a
+    // marker split across reads without buffering an arbitrarily large echo.
+    let discard = pending.len().saturating_sub(marker.len() - 1);
+    pending.drain(..discard);
+    false
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -986,9 +837,15 @@ fn new_nonce() -> String {
 
 fn shell_group_payload(command: &str, nonce: &str, uses_zsh_protocol: bool) -> String {
     let command = shell_single_quote(&format!(" {command}"));
+    // Bash/Readline may consume or transform typeahead while parsing this
+    // group. Release stdin only after the group has been parsed and Readline
+    // has restored the command's terminal mode. Octal escapes keep the actual
+    // marker out of the echoed payload; neither it nor the echo is user output.
+    let ready = format!("printf '\\036__THESEUS_READY_{nonce}__\\037'");
     if uses_zsh_protocol {
         return format!(
             "{{ \n\
+             {ready}\n\
              unset __theseus_status\n\
              {{ \n\
              eval {command}\n\
@@ -1006,6 +863,7 @@ fn shell_group_payload(command: &str, nonce: &str, uses_zsh_protocol: bool) -> S
     // shells: a syntax error returns a status instead of skipping the sentinel.
     format!(
         "{{ \n\
+         {ready}\n\
          command eval {command}\n\
          __theseus_status=$?\n\
          printf '\\n__THESEUS_DONE_{nonce}_%s__\\n' \"$__theseus_status\"\n\
@@ -1190,32 +1048,31 @@ mod tests {
     }
 
     #[test]
-    fn strips_echoed_payload_from_transcript_prefix() {
-        let payload = "echo ok\r__theseus_status=$?\r";
-        let mut transcript = b"echo ok\r\n__theseus_status=$?\r\nok".to_vec();
-
-        strip_echoed_payload(&mut transcript, payload);
-
-        assert_eq!(transcript, b"ok");
+    fn readiness_discards_fragmented_echo_and_preserves_all_command_output() {
+        let marker = ready_marker("nonce");
+        let echo = shell_group_payload(&"x".repeat(8192), "nonce", false).replace('\n', "\r\n");
+        let output = b"\r\n\x1b[32mhello\x1b[0m\r\n__THESEUS_READY_other__";
+        for split in 0..marker.len() {
+            let mut pending = echo.as_bytes().to_vec();
+            pending.extend_from_slice(&marker[..split]);
+            assert!(!strip_ready_marker(&mut pending, &marker));
+            assert!(pending.len() < marker.len(), "unbounded shell echo");
+            pending.extend_from_slice(&marker[split..]);
+            pending.extend_from_slice(output);
+            assert!(strip_ready_marker(&mut pending, &marker));
+            assert_eq!(pending, output, "marker split at {split}");
+        }
     }
 
     #[test]
-    fn waits_for_complete_long_echoed_payload_before_draining() {
-        let command = format!("printf '{}'", "x".repeat(STREAM_HOLD_BACK_BYTES + 100));
-        let payload = shell_group_payload(&command, "nonce", false).replace('\n', "\r");
-        let echoed = echoed_payload(&payload);
-        let mut partial = echoed[..STREAM_HOLD_BACK_BYTES + 1].to_vec();
-
-        strip_echoed_payload_prefix(&mut partial, &payload);
-
-        assert!(is_partial_echoed_payload_prefix(&partial, &payload));
-        assert!(partial.len() > STREAM_HOLD_BACK_BYTES);
-
-        let mut complete = echoed.clone();
-        complete.extend_from_slice(b"ok");
-        strip_echoed_payload_prefix(&mut complete, &payload);
-
-        assert_eq!(complete, b"ok");
+    fn readiness_preserves_completion_in_the_same_chunk() {
+        let marker = ready_marker("nonce");
+        let mut pending = marker.clone();
+        pending.extend_from_slice(b"\n__THESEUS_DONE_nonce_0__\r\n");
+        assert!(strip_ready_marker(&mut pending, &marker));
+        let completed = parse_completed_command(&pending, "nonce").unwrap();
+        assert_eq!(completed.status_code, 0);
+        assert!(completed.transcript.is_empty());
     }
 
     #[test]
@@ -1224,7 +1081,7 @@ mod tests {
 
         assert_eq!(
             payload,
-            "{ \ncommand eval ' vim'\n__theseus_status=$?\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\n}\n"
+            "{ \nprintf '\\036__THESEUS_READY_nonce__\\037'\ncommand eval ' vim'\n__theseus_status=$?\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\n}\n"
         );
     }
 
@@ -1234,7 +1091,7 @@ mod tests {
 
         assert_eq!(
             payload,
-            "{ \ncommand eval ' printf '\\''%s'\\'' '\\''a b'\\'''\n__theseus_status=$?\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\n}\n"
+            "{ \nprintf '\\036__THESEUS_READY_nonce__\\037'\ncommand eval ' printf '\\''%s'\\'' '\\''a b'\\'''\n__theseus_status=$?\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\n}\n"
         );
     }
 
@@ -1245,39 +1102,6 @@ mod tests {
         assert!(payload.contains("} always {"));
         assert!(payload.contains("eval ' sleep 100'"));
         assert!(payload.contains("__THESEUS_DONE_nonce_%s__"));
-    }
-
-    #[test]
-    fn strips_initial_shell_separator_after_prompt_control_sequence() {
-        let mut transcript = b"\x1b[?2004l\r\r\nCargo.toml".to_vec();
-
-        assert_eq!(
-            strip_initial_shell_separator(&mut transcript),
-            StripInitialSeparator::Stripped
-        );
-        assert_eq!(transcript, b"Cargo.toml");
-    }
-
-    #[test]
-    fn waits_for_partial_initial_shell_separator() {
-        let mut transcript = b"\x1b[?2004l\r".to_vec();
-
-        assert_eq!(
-            strip_initial_shell_separator(&mut transcript),
-            StripInitialSeparator::Pending
-        );
-        assert_eq!(transcript, b"\x1b[?2004l\r");
-    }
-
-    #[test]
-    fn preserves_user_leading_blank_line_after_shell_separator() {
-        let mut transcript = b"\x1b[?2004l\r\r\n\r\nhello".to_vec();
-
-        assert_eq!(
-            strip_initial_shell_separator(&mut transcript),
-            StripInitialSeparator::Stripped
-        );
-        assert_eq!(transcript, b"\r\nhello");
     }
 
     #[test]
@@ -1306,39 +1130,102 @@ mod tests {
         assert_eq!(streamable_prefix_len(bytes, "nonce"), bytes.len() - 2);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn strips_echoed_protocol_tail_after_command_output() {
-        let payload = "git branch\r__theseus_status=$?\rprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\r";
-        let mut transcript = b"* dev\r\n  master\r\n__theseus_status=$?\r\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"".to_vec();
+    fn shell_waits_for_readiness_before_forwarding_queued_stdin() {
+        use crate::common::terminal_input::TerminalInput;
+        use crossterm::event::{Event, KeyCode, KeyEvent};
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
 
-        strip_echoed_payload(&mut transcript, payload);
+        struct ObservedWriter {
+            writer: Arc<Mutex<Box<dyn Write + Send>>>,
+            writes: mpsc::Sender<Vec<u8>>,
+        }
+        impl Write for ObservedWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writer.lock().unwrap().write_all(bytes)?;
+                let _ = self.writes.send(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.writer.lock().unwrap().flush()
+            }
+        }
 
-        assert_eq!(transcript, b"* dev\r\n  master");
-    }
+        for shell in available_shells() {
+            let (mut session, home) = start_clean_test_session(&shell);
+            let (reader, mut sender) = UnixStream::pair().unwrap();
+            reader.set_nonblocking(true).unwrap();
+            let input = TerminalInput::from_test_file(OwnedFd::from(reader).into());
+            sender.write_all(b"\rIMMEDIATE\r").unwrap();
+            assert!(matches!(
+                input.lock().unwrap().next_event(Duration::ZERO).unwrap(),
+                Some(Event::Key(KeyEvent {
+                    code: KeyCode::Enter,
+                    ..
+                }))
+            ));
 
-    #[test]
-    fn command_completion_strips_echoed_protocol_tail_before_real_sentinel() {
-        let payload = "git branch\r__theseus_status=$?\rprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\r";
-        let mut completed = parse_completed_command(
-            b"* dev\r\n  master\r\n__theseus_status=$?\r\nprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\r\n__THESEUS_DONE_nonce_0__\r\n",
-            "nonce",
-        )
-        .unwrap();
+            // Freeze the real shell before it parses the command. The pending
+            // stdin must stay in TerminalInput until the shell resumes and
+            // acknowledges readiness, regardless of thread scheduling speed.
+            let pid = session.child.process_id().unwrap() as libc::pid_t;
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+                pid
+            );
+            assert!(libc::WIFSTOPPED(status));
+            let (write_tx, write_rx) = mpsc::channel();
+            session.writer = Arc::new(Mutex::new(Box::new(ObservedWriter {
+                writer: Arc::clone(&session.writer),
+                writes: write_tx,
+            })));
+            let (result_tx, result_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let _home = home;
+                let mut visible = Vec::new();
+                let result = session.run_command_with_terminal(
+                    "read value; printf 'RECEIVED=%s\\n' \"$value\"",
+                    input,
+                    &mut LegacyOutput(&mut visible),
+                );
+                let recovery = session.run_command("printf recovered");
+                let _ = result_tx.send((result, visible, recovery));
+            });
 
-        strip_echoed_payload(&mut completed.transcript, payload);
-
-        assert_eq!(completed.transcript, b"* dev\r\n  master");
-        assert_eq!(completed.status_code, 0);
-    }
-
-    #[test]
-    fn strips_echoed_protocol_tail_with_terminal_control_bytes() {
-        let payload = "git branch\r__theseus_status=$?\rprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"\r";
-        let mut transcript = b"* dev\r\n  master\r\n__theseus_status=$?\r\n\x1b[?2004h\x1b[Kprintf '\\n__THESEUS_DONE_nonce_%s__\\n' \"$__theseus_status\"".to_vec();
-
-        strip_echoed_payload(&mut transcript, payload);
-
-        assert_eq!(transcript, b"* dev\r\n  master");
+            let payload = write_rx.recv_timeout(Duration::from_secs(2));
+            let early_input = write_rx.recv_timeout(Duration::from_millis(100));
+            // Resume even on assertion failure, so the stopped child can exit.
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+            if payload.is_err() || !matches!(early_input, Err(mpsc::RecvTimeoutError::Timeout)) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                worker.join().unwrap();
+                panic!(
+                    "shell {shell}: payload={payload:?}, input before readiness={early_input:?}"
+                );
+            }
+            let result = result_rx.recv_timeout(Duration::from_secs(2));
+            if result.is_err() {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                worker.join().unwrap();
+                panic!("queued stdin hung for shell: {shell}");
+            }
+            let (result, visible, recovery) = result.unwrap();
+            worker.join().unwrap();
+            let result = result.unwrap();
+            assert_eq!(result.status_code, Some(0), "{shell}");
+            assert_eq!(
+                normalized_transcript(&result),
+                "RECEIVED=IMMEDIATE\n",
+                "{shell}"
+            );
+            assert_eq!(visible, result.transcript, "{shell}");
+            let recovery = recovery.unwrap();
+            assert_eq!(recovery.status_code, Some(0), "{shell}");
+            assert_eq!(normalized_transcript(&recovery), "recovered", "{shell}");
+        }
     }
 
     #[cfg(unix)]
@@ -1379,8 +1266,7 @@ mod tests {
             reader.set_nonblocking(true).unwrap();
             let input = TerminalInput::from_test_file(OwnedFd::from(reader).into());
             let mut forwarding =
-                InputForwarder::start(Arc::clone(&session.writer), Some(Arc::clone(&input)))
-                    .unwrap();
+                InputForwarder::new(Arc::clone(&session.writer), Some(Arc::clone(&input)));
             let paste = "\x1b[200~NEXT_DRAFT\r\nПривет\x03\x1b[201~Z"
                 .as_bytes()
                 .to_vec();
@@ -1393,7 +1279,7 @@ mod tests {
             let payload = session.command_payload("printf EDGE");
             session.write_to_shell(payload.as_bytes()).unwrap();
             let completed = session
-                .read_until_sentinel_streaming(&payload, &mut output, Some(&mut forwarding))
+                .read_until_sentinel_streaming(&mut output, Some(&mut forwarding))
                 .unwrap();
             assert_eq!(completed.status_code, 0, "{shell}");
             assert!(
@@ -1431,6 +1317,8 @@ mod tests {
                 tx.send(()).unwrap();
             });
             let _forwarding = InputForwarder {
+                writer: Arc::new(Mutex::new(Box::new(io::sink()))),
+                input: None,
                 stop,
                 thread: Some(worker),
             };
@@ -1675,6 +1563,11 @@ mod tests {
         for shell in available_shells() {
             let (mut session, _home) = start_clean_test_session(&shell);
 
+            assert_success(
+                &mut session,
+                "printf '\\n\\n\\033[32m__THESEUS_READY_other__\\033[0m\\n'",
+                "\n\n\x1b[32m__THESEUS_READY_other__\x1b[0m\n",
+            );
             assert_success(
                 &mut session,
                 "printf '%s' '__THESEUS_DONE_other_0__'",

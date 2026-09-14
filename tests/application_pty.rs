@@ -227,15 +227,40 @@ fn screen_text(bytes: &[u8]) -> String {
 
 #[test]
 fn shell_handoff_preserves_input_sent_in_same_write_as_command_enter() -> io::Result<()> {
-    let mut app = ApplicationPty::start()?;
-    app.write("read value; printf 'RECEIVED=%s\\n' \"$value\"\rimmediate-stdin\r")?;
-    app.wait_until(|bytes| {
-        screen_rows(bytes)
-            .iter()
-            .any(|row| row == "RECEIVED=immediate-stdin")
-            && settled_prompt_is_visible(bytes)
-    })?;
-    app.exit()
+    for shell in ["/bin/sh", "/bin/dash", "/bin/bash", "/bin/zsh"]
+        .map(Path::new)
+        .into_iter()
+        .filter(|shell| shell.exists())
+    {
+        let mut app = ApplicationPty::start_with_shell(
+            temp_home()?,
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            Some(shell),
+        )?;
+        for (request, expected) in [
+            (
+                "read value; printf 'RECEIVED=%s\\n' \"$value\"\rimmediate-stdin\r",
+                "RECEIVED=immediate-stdin",
+            ),
+            (
+                "sh -c 'read first; read second; printf \"CHILD=%s/%s\\n\" \"$first\" \"$second\"'\rПривет\rsecond-line\r",
+                "CHILD=Привет/second-line",
+            ),
+        ] {
+            app.write(request)?;
+            let bytes = app
+                .wait_until(|bytes| {
+                    screen_rows(bytes).iter().any(|row| row == expected)
+                        && settled_prompt_is_visible(bytes)
+                })
+                .map_err(|error| {
+                    io::Error::new(error.kind(), format!("shell {}: {error}", shell.display()))
+                })?;
+            assert!(!String::from_utf8_lossy(&bytes).contains("__THESEUS_READY_"));
+        }
+        app.exit()?;
+    }
+    Ok(())
 }
 
 fn is_waiting_spinner(line: &str) -> bool {

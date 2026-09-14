@@ -54,6 +54,29 @@ Filter by test name and add `-- --nocapture` for diagnostics. Run
 `cargo test --locked --doc` when changing executable Rustdoc examples.
 Add regression coverage at the relevant layer; report checks run and any failures/skips.
 
+## Linux tests via Docker
+
+Start Docker, then build the [Ubuntu 24.04 test image](../tests/docker/Dockerfile)
+from the repository root:
+
+```sh
+docker build -t theseus-tests:local \
+  --build-arg RUST_VERSION="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" \
+  tests/docker
+
+docker run --rm -it \
+  --mount "type=bind,source=$PWD,target=/work/theseus-shell" \
+  theseus-tests:local bash
+```
+
+Inside the container, run **Required checks** and **Terminal checks** above.
+Sources and `target/xterm/run-*` are shared with the host;
+Linux build files stay in the container. `exit` removes the container.
+Rebuild the image after changing `rust-version`.
+
+Docker uses the host architecture by default. To match Ubuntu CI on Apple Silicon,
+add `--platform linux/amd64` to both commands; emulation can slow timing-sensitive tests.
+
 ## Releases
 
 1. Bump `[package].version` in [Cargo.toml](../Cargo.toml).
