@@ -307,7 +307,9 @@ impl Ui {
     }
 
     fn xterm_checkpoint(&self, name: &str) {
-        self.xterm.checkpoint(self.app.transcript_len(), name);
+        // Freeze the byte boundary whose decoded state satisfied wait(). The
+        // reader may already have appended part of a newer frame by now.
+        self.xterm.checkpoint(self.observer.borrow().offset, name);
     }
 
     fn export_xterm(&self, name: &str) -> io::Result<()> {
@@ -318,6 +320,7 @@ impl Ui {
         // Record the final checkpoint only once the editable prompt is back.
         self.wait(|screen| {
             !screen.alternate_screen()
+                && !screen.hide_cursor()
                 && spinner(screen).is_none()
                 && screen.cursor_position().1 > 0
                 && screen
@@ -326,22 +329,29 @@ impl Ui {
                     .is_some_and(|row| row.trim_end() == "tester theseus-shell>")
         })?;
         self.xterm_checkpoint("final");
-        self.xterm.export(name, &self.app.transcript())
+        self.xterm.export(
+            name,
+            &self.app.transcript()[..self.observer.borrow().offset],
+        )
     }
 
     fn history_with_scroll_on_erase(&self, scroll_on_erase: bool) -> String {
-        let mut parser = self.parser(&self.app.transcript(), scroll_on_erase);
-        let screen = parser.screen_mut();
-        let cols = screen.size().1;
-        screen.set_scrollback(usize::MAX);
-        let count = screen.scrollback();
-        let mut rows = screen.rows(0, cols).collect::<Vec<_>>();
-        for offset in (0..count).rev() {
-            screen.set_scrollback(offset);
-            rows.extend(screen.rows(0, cols).last());
-        }
-        rows.join("\n")
+        let parser = self.parser(&self.app.transcript(), scroll_on_erase);
+        normal_buffer_text(parser.screen())
     }
+}
+
+fn normal_buffer_text(screen: &vt100::Screen) -> String {
+    let mut screen = screen.clone();
+    let cols = screen.size().1;
+    screen.set_scrollback(usize::MAX);
+    let count = screen.scrollback();
+    let mut rows = screen.rows(0, cols).collect::<Vec<_>>();
+    for offset in (0..count).rev() {
+        screen.set_scrollback(offset);
+        rows.extend(screen.rows(0, cols).last());
+    }
+    rows.join("\n")
 }
 
 fn spinner(screen: &vt100::Screen) -> Option<(usize, String)> {
@@ -572,8 +582,29 @@ fn long_bash_output_then_streamed_table_publish_once_without_preview_in_history(
         }
     }
     ui.server.content("\nTABLE_SUMMARY")?;
+    // Finish only after the complete mutable preview has been rendered. The
+    // spinner may disappear before that preview's stable layout is installed.
+    ui.wait(|screen| screen.contents().contains("TABLE_SUMMARY") && spinner(screen).is_some())?;
     ui.server.finish("stop")?;
-    ui.wait(|screen| screen.contents().contains("TABLE_SUMMARY") && spinner(screen).is_none())?;
+    let markers = (0..180)
+        .map(|i| format!("BASH_ROW_{i:03}"))
+        .chain(["TABLE_REASONING".to_string(), "TABLE_INTRO".to_string()])
+        .chain((0..36).map(|i| format!("TABLE_ROW_{i:03}")))
+        .chain(["TABLE_SUMMARY".to_string()])
+        .collect::<Vec<_>>();
+    // Backend completion removes the spinner before the layout worker marks
+    // the answer stable. Wait for actual publication without a shell command
+    // forcing prepare_document(), or this checkpoint can still be a preview.
+    ui.wait(|screen| {
+        if !screen.contents().contains("TABLE_SUMMARY")
+            || spinner(screen).is_some()
+            || screen.hide_cursor()
+        {
+            return false;
+        }
+        let normal = normal_buffer_text(screen);
+        markers.iter().all(|marker| normal.contains(marker))
+    })?;
     ui.xterm_checkpoint("table-complete");
     // Grow native history again after completion, exposing a leaked preview
     // even if it would otherwise remain hidden above the live viewport.
@@ -591,19 +622,14 @@ fn long_bash_output_then_streamed_table_publish_once_without_preview_in_history(
     );
     for scroll_on_erase in [false, true] {
         let history = ui.history_with_scroll_on_erase(scroll_on_erase);
-        let markers = (0..180)
-            .map(|i| format!("BASH_ROW_{i:03}"))
-            .chain(["TABLE_REASONING".to_string(), "TABLE_INTRO".to_string()])
-            .chain((0..36).map(|i| format!("TABLE_ROW_{i:03}")))
-            .chain(["TABLE_SUMMARY".to_string(), "AFTER_TABLE".to_string()]);
         let mut previous = 0;
-        for marker in markers {
+        for marker in markers.iter().map(String::as_str).chain(["AFTER_TABLE"]) {
             assert_eq!(
-                history.matches(&marker).count(),
+                history.matches(marker).count(),
                 1,
                 "{marker}, scroll_on_erase={scroll_on_erase}: {history}"
             );
-            let position = history.find(&marker).unwrap();
+            let position = history.find(marker).unwrap();
             assert!(position >= previous, "{marker}: {history}");
             previous = position;
         }

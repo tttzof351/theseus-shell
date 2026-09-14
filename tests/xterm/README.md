@@ -14,7 +14,10 @@ npm --prefix tests/xterm test
 The command runs the real HTTP/SSE → application → PTY integration scenarios in
 `tests/application_pty/streaming.rs`. Selected scenarios export their actual output
 bytes, resize boundaries and named checkpoints into a fresh `target/xterm/run-*`
-directory. The runner then feeds those bytes into **@xterm/headless 6.0.0**. Both
+directory. Checkpoints use the exact bytes inspected by the Rust wait condition;
+completion checks must also wait for native history publication, since a hidden
+spinner alone does not mean the background layout has finished. The runner then
+feeds those bytes into **@xterm/headless 6.0.0**. Both
 dependencies are pinned in `package-lock.json`; no browser or native Node PTY addon
 is required. The HTTP provider is a local fixture and uses no API keys or external
 LLM service.
