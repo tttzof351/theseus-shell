@@ -1,4 +1,13 @@
-use super::*;
+use crate::agent::AgentConfig;
+use jsonc_parser::{
+    ParseOptions,
+    cst::{CstInputValue, CstObject, CstRootNode},
+};
+use std::{
+    fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+};
 
 pub(super) enum ConfigPatch {
     SetModel(String),
@@ -141,4 +150,88 @@ fn create_validation_config_file(path: &Path, text: &str) -> io::Result<Validati
         io::ErrorKind::AlreadyExists,
         "could not allocate a temporary config validation file",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::temporary_test_path;
+    use serde_json::Value;
+
+    #[test]
+    fn config_patch_preserves_jsonc_comments_and_validates_result() {
+        let path = temporary_test_path("config-patch");
+        let init = AgentConfig::load_or_create_at(path.clone()).unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(&path, original.replacen("{\n", "{\n  // keep me\n", 1)).unwrap();
+
+        let config = patch_config_jsonc_file(
+            &path,
+            ConfigPatch::SetModel("example/new-model".to_string()),
+        )
+        .unwrap();
+        let patched = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(init.path, path);
+        assert!(patched.contains("// keep me"));
+        assert!(patched.contains(r#""model": "example/new-model""#));
+        assert_eq!(
+            config
+                .llm_request_settings
+                .body
+                .get("model")
+                .and_then(Value::as_str),
+            Some("example/new-model")
+        );
+        let validation_prefix = format!(
+            ".{}.application-",
+            path.file_name().unwrap().to_string_lossy()
+        );
+        assert!(
+            fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    !name.starts_with(&validation_prefix) || !name.ends_with(".tmp")
+                })
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn config_model_and_key_edits_preserve_streaming_settings_and_comments() {
+        let path = temporary_test_path("streaming-config-patch");
+        AgentConfig::load_or_create_at(path.clone()).unwrap();
+        let original = fs::read_to_string(&path).unwrap()
+            .replacen("\"stream_idle_timeout_seconds\": 60", "// keep network timeout\n    \"stream_idle_timeout_seconds\": 17", 1)
+            .replacen("\"body\": {", "\"body\": {\n      // explicit streaming options\n      \"stream_options\": { \"include_usage\": true },", 1);
+        fs::write(&path, &original).unwrap();
+        for patch in [
+            ConfigPatch::SetModel("example/stream-model".into()),
+            ConfigPatch::SetAuthorization("Bearer new-fixture-key".into()),
+        ] {
+            let config = patch_config_jsonc_file(&path, patch).unwrap();
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(text.contains("// keep network timeout"));
+            assert!(text.contains("// explicit streaming options"));
+            assert!(text.contains("\"stream_options\": { \"include_usage\": true }"));
+            assert_eq!(
+                config.llm_request_settings.stream_idle_timeout_seconds,
+                Some(17)
+            );
+            assert_eq!(config.llm_request_settings.body["stream"], true);
+            assert_eq!(
+                config.llm_request_settings.body["stream_options"]["include_usage"],
+                true
+            );
+            assert_eq!(
+                config.llm_request_settings.body["model"],
+                "example/stream-model"
+            );
+        }
+        fs::remove_file(path).unwrap();
+    }
 }

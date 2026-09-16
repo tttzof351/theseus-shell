@@ -2,11 +2,10 @@
 
 use std::{collections::HashMap, io, sync::Arc};
 
-use super::{
-    RenderLine, TerminalColor, ansi::markdown_lines_with_groups, ansi_decoder::AnsiDecoder,
-};
+use super::{ansi::markdown_lines_with_groups, ansi_decoder::AnsiDecoder};
 use crate::common::events::{BackendEvent, BlockId, BlockKind, OperationId, Outcome, OutputEvent};
 use crate::terminal_renderer::managed::{LineOrigins, PublicationUnit, RowIdentity};
+use crate::terminal_renderer::{RenderLine, TerminalColor};
 
 #[derive(Debug, Clone)]
 enum Source {

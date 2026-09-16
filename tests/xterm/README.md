@@ -12,7 +12,7 @@ npm --prefix tests/xterm test
 ```
 
 The command runs the real HTTP/SSE → application → PTY integration scenarios in
-`tests/application_pty/streaming.rs`. Selected scenarios export their actual output
+`tests/application_pty/streaming/`, connected by `streaming.rs`. Selected scenarios export their actual output
 bytes, resize boundaries and named checkpoints into a fresh `target/xterm/run-*`
 directory. Checkpoints use the exact bytes inspected by the Rust wait condition;
 completion checks must also wait for native history publication, since a hidden

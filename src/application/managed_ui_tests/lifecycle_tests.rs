@@ -1,16 +1,6 @@
 use super::*;
 use std::{net::TcpListener, sync::mpsc};
 
-pub(super) fn waiting_spinner_is_visible(screen: &vt100::Screen) -> bool {
-    screen.rows(0, screen.size().1).any(|line| {
-        let mut chars = line.trim().chars();
-        chars
-            .next()
-            .is_some_and(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch))
-            && chars.next().is_none()
-    })
-}
-
 #[test]
 fn operation_without_activity_shows_only_spinner_and_preserves_draft() {
     let mut ui = UiPty::start_with_options(None, true);

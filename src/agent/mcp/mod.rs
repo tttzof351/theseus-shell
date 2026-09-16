@@ -1,33 +1,30 @@
+use super::{
+    config::McpServerConfig, messages::ToolCall, spinner::Spinner, tools::format_tool_call_name,
+};
+use crate::{
+    common::{
+        cancellation::CancellationEvent,
+        events::{BlockKind, EventSink},
+        terminal_output,
+    },
+    logging::AppLogger,
+};
+use rmcp::model::Tool;
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     io,
-    process::Stdio,
-    sync::{Arc, Mutex, mpsc},
-    thread,
-    time::Duration,
+    sync::{Arc, Mutex},
 };
 
-use reqwest::header::{HeaderName, HeaderValue};
-use rmcp::{
-    ServiceExt,
-    model::{CallToolRequestParams, CallToolResult, ClientInfo, JsonObject, Tool},
-    transport::{
-        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
-    },
-};
-use serde_json::{Value, json};
-use tokio::runtime::Runtime;
+mod session;
+mod tool_mapping;
+mod transport;
 
-use crate::common::cancellation::CancellationEvent;
-use crate::common::events::{BlockKind, EventSink};
-use crate::{common::terminal_output, logging::AppLogger};
-
-use super::{
-    config::{McpServerConfig, McpTransport},
-    messages::ToolCall,
-    spinner::Spinner,
-    tools::format_tool_call_name,
-};
+use session::{McpSession, McpSessionRequest, McpSessionResponse, mcp_interrupted};
+use tool_mapping::{parse_public_tool_name, parse_tool_arguments, tool_schema};
+pub(super) use tool_mapping::{public_tool_name_for_tool, tool_is_allowed};
+use transport::transport_label;
 
 #[derive(Debug, Clone)]
 pub(super) struct McpManager {
@@ -439,292 +436,6 @@ pub(super) struct McpServerStatus {
     pub error: Option<String>,
 }
 
-#[derive(Debug)]
-struct McpSession {
-    requests: mpsc::Sender<McpWorkerMessage>,
-    handle: Option<thread::JoinHandle<()>>,
-    shutdown: CancellationEvent,
-}
-
-impl McpSession {
-    fn start(
-        server_id: &str,
-        server: McpServerConfig,
-        cancellation: CancellationEvent,
-    ) -> io::Result<Self> {
-        let (tx, rx) = mpsc::channel();
-        let server_id = server_id.to_string();
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let thread_server_id = server_id.clone();
-        let shutdown = CancellationEvent::new();
-        let worker_shutdown = shutdown.clone();
-        let handle = thread::Builder::new()
-            .name(format!("theseus-mcp-{server_id}"))
-            .spawn(move || {
-                run_mcp_session(
-                    thread_server_id,
-                    server,
-                    rx,
-                    ready_tx,
-                    cancellation,
-                    worker_shutdown,
-                );
-            })?;
-
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
-                requests: tx,
-                handle: Some(handle),
-                shutdown,
-            }),
-            Ok(Err(err)) => {
-                let _ = handle.join();
-                Err(err)
-            }
-            Err(err) => {
-                let _ = handle.join();
-                Err(io::Error::other(format!(
-                    "MCP server `{server_id}` worker stopped during startup: {err}"
-                )))
-            }
-        }
-    }
-
-    fn is_open(&self) -> bool {
-        !self
-            .handle
-            .as_ref()
-            .is_some_and(thread::JoinHandle::is_finished)
-    }
-
-    fn request(
-        &self,
-        request: McpSessionRequest,
-        cancellation: CancellationEvent,
-    ) -> io::Result<McpSessionResponse> {
-        let (tx, rx) = mpsc::channel();
-        self.requests
-            .send(McpWorkerMessage::Request {
-                request,
-                response: tx,
-                cancellation,
-            })
-            .map_err(|err| io::Error::other(format!("MCP session worker stopped: {err}")))?;
-        rx.recv()
-            .map_err(|err| io::Error::other(format!("MCP session worker stopped: {err}")))?
-    }
-}
-
-impl Drop for McpSession {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
-        let _ = self.requests.send(McpWorkerMessage::Shutdown);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-#[derive(Debug)]
-enum McpWorkerMessage {
-    Request {
-        request: McpSessionRequest,
-        response: mpsc::Sender<io::Result<McpSessionResponse>>,
-        cancellation: CancellationEvent,
-    },
-    Shutdown,
-}
-
-#[derive(Debug, Clone)]
-enum McpSessionRequest {
-    ListTools,
-    CallTool { name: String, arguments: JsonObject },
-}
-
-#[derive(Debug)]
-enum McpSessionResponse {
-    Tools(Vec<Tool>),
-    Text(String),
-}
-
-impl McpSessionResponse {
-    fn into_tools(self) -> io::Result<Vec<Tool>> {
-        match self {
-            Self::Tools(tools) => Ok(tools),
-            Self::Text(_) => Err(io::Error::other(
-                "MCP session returned tool call result for tools/list",
-            )),
-        }
-    }
-
-    fn into_text(self) -> io::Result<String> {
-        match self {
-            Self::Text(text) => Ok(text),
-            Self::Tools(_) => Err(io::Error::other(
-                "MCP session returned tools/list result for tool call",
-            )),
-        }
-    }
-}
-
-fn run_mcp_session(
-    server_id: String,
-    server: McpServerConfig,
-    rx: mpsc::Receiver<McpWorkerMessage>,
-    ready_tx: mpsc::Sender<io::Result<()>>,
-    cancellation: CancellationEvent,
-    shutdown: CancellationEvent,
-) {
-    let runtime = match Runtime::new() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            let _ = ready_tx.send(Err(io::Error::other(format!(
-                "MCP server `{server_id}` failed to create Tokio runtime: {err}"
-            ))));
-            let _ = rx;
-            return;
-        }
-    };
-
-    runtime.block_on(async {
-        match server.transport {
-            McpTransport::Stdio => match stdio_transport(&server_id, &server) {
-                Ok((transport, mut child)) => {
-                    run_mcp_session_with_transport(
-                        &server_id,
-                        &server,
-                        transport,
-                        rx,
-                        ready_tx,
-                        cancellation,
-                        shutdown,
-                    )
-                    .await;
-                    // Own and reap the stdio server explicitly. rmcp's default
-                    // child wrapper schedules cleanup in Drop; that task can
-                    // otherwise be lost when the runtime immediately shuts down.
-                    let _ = child.kill().await;
-                }
-                Err(err) => {
-                    let _ = ready_tx.send(Err(err));
-                }
-            },
-            McpTransport::StreamableHttp => match streamable_http_transport(&server) {
-                Ok(transport) => {
-                    run_mcp_session_with_transport(
-                        &server_id,
-                        &server,
-                        transport,
-                        rx,
-                        ready_tx,
-                        cancellation,
-                        shutdown,
-                    )
-                    .await
-                }
-                Err(err) => {
-                    let _ = ready_tx.send(Err(err));
-                }
-            },
-        }
-    });
-}
-
-async fn run_mcp_session_with_transport<T, E, A>(
-    server_id: &str,
-    server: &McpServerConfig,
-    transport: T,
-    rx: mpsc::Receiver<McpWorkerMessage>,
-    ready_tx: mpsc::Sender<io::Result<()>>,
-    cancellation: CancellationEvent,
-    shutdown: CancellationEvent,
-) where
-    T: rmcp::transport::IntoTransport<rmcp::RoleClient, E, A> + Send + 'static,
-    E: std::error::Error + Send + Sync + 'static,
-{
-    let connect_timeout = Duration::from_secs(server.timeout_seconds as u64);
-    let connect = tokio::time::timeout(connect_timeout, ClientInfo::default().serve(transport));
-    let connection = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => { let _ = ready_tx.send(Err(mcp_interrupted())); return; }
-        _ = shutdown.cancelled() => { let _ = ready_tx.send(Err(mcp_interrupted())); return; }
-        result = connect => result,
-    };
-    let mut client = match connection {
-        Ok(Ok(client)) => client,
-        Ok(Err(err)) => {
-            let _ = ready_tx.send(Err(io::Error::other(format!(
-                "MCP server `{server_id}` connection failed: {err}"
-            ))));
-            return;
-        }
-        Err(_) => {
-            let _ = ready_tx.send(Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("MCP server `{server_id}` connection timed out"),
-            )));
-            return;
-        }
-    };
-    let _ = ready_tx.send(Ok(()));
-
-    for message in rx {
-        match message {
-            McpWorkerMessage::Request {
-                request,
-                response,
-                cancellation,
-            } => {
-                let result = tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => Err(mcp_interrupted()),
-                    _ = shutdown.cancelled() => Err(mcp_interrupted()),
-                    result = timeout(server, handle_mcp_request(&client, server_id, request)) => result,
-                };
-                let interrupted = result
-                    .as_ref()
-                    .is_err_and(|err| err.kind() == io::ErrorKind::Interrupted);
-                let _ = response.send(result);
-                if interrupted {
-                    break;
-                }
-            }
-            McpWorkerMessage::Shutdown => break,
-        }
-    }
-
-    // A peer that ignores shutdown cannot hold the worker indefinitely.
-    let _ = tokio::time::timeout(Duration::from_millis(500), client.close()).await;
-}
-
-async fn handle_mcp_request(
-    client: &rmcp::service::RunningService<rmcp::RoleClient, ClientInfo>,
-    server_id: &str,
-    request: McpSessionRequest,
-) -> io::Result<McpSessionResponse> {
-    match request {
-        McpSessionRequest::ListTools => {
-            let tools = client.list_all_tools().await.map_err(|err| {
-                io::Error::other(format!("MCP server `{server_id}` tools/list failed: {err}"))
-            })?;
-            Ok(McpSessionResponse::Tools(tools))
-        }
-        McpSessionRequest::CallTool { name, arguments } => {
-            let result = client
-                .call_tool(CallToolRequestParams::new(name).with_arguments(arguments))
-                .await
-                .map_err(|err| {
-                    io::Error::other(format!("MCP server `{server_id}` tools/call failed: {err}"))
-                })?;
-            Ok(McpSessionResponse::Text(format_call_tool_result(result)))
-        }
-    }
-}
-
-fn mcp_interrupted() -> io::Error {
-    io::Error::new(io::ErrorKind::Interrupted, "MCP operation interrupted")
-}
-
 fn log_mcp_tool_call(public_tool_name: &str) -> io::Result<()> {
     terminal_output::with_stdout(|stdout| {
         use std::io::Write;
@@ -749,213 +460,32 @@ fn warn_mcp_discovery_failed(error: &str) -> io::Result<()> {
     io::stderr().flush()
 }
 
-fn transport_label(transport: &McpTransport) -> &'static str {
-    match transport {
-        McpTransport::Stdio => "stdio",
-        McpTransport::StreamableHttp => "streamable_http",
-    }
-}
-
-async fn timeout<T>(
-    server: &McpServerConfig,
-    future: impl std::future::Future<Output = io::Result<T>>,
-) -> io::Result<T> {
-    tokio::time::timeout(Duration::from_secs(server.timeout_seconds as u64), future)
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "MCP request timed out"))?
-}
-
-type StdioTransport = (tokio::process::ChildStdout, tokio::process::ChildStdin);
-
-fn stdio_transport(
-    server_id: &str,
-    server: &McpServerConfig,
-) -> io::Result<(StdioTransport, tokio::process::Child)> {
-    let command = server.command.as_ref().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("stdio MCP server `{server_id}` requires command"),
-        )
-    })?;
-
-    if command.split_whitespace().nth(1).is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "stdio MCP server `{server_id}` command must be an executable name or path without arguments; put flags and URLs into args"
-            ),
-        ));
-    }
-
-    let mut child = tokio::process::Command::new(command)
-        .args(&server.args)
-        .envs(&server.env)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!(
-                    "stdio MCP server `{server_id}` failed to start command `{command}`: {err}"
-                ),
-            )
-        })?;
-    let stdout = child.stdout.take().expect("piped MCP stdout");
-    let stdin = child.stdin.take().expect("piped MCP stdin");
-    Ok(((stdout, stdin), child))
-}
-
-fn streamable_http_transport(
-    server: &McpServerConfig,
-) -> io::Result<StreamableHttpClientTransport<reqwest::Client>> {
-    let url = server.url.as_ref().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "streamable_http MCP server requires url",
-        )
-    })?;
-    let mut headers = std::collections::HashMap::new();
-    for (name, value) in &server.headers {
-        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid MCP request header name `{name}`: {err}"),
-            )
-        })?;
-        let value = HeaderValue::from_str(value).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid MCP request header value for `{name}`: {err}"),
-            )
-        })?;
-        headers.insert(name, value);
-    }
-
-    Ok(StreamableHttpClientTransport::from_config(
-        StreamableHttpClientTransportConfig::with_uri(url.clone())
-            .custom_headers(headers)
-            .reinit_on_expired_session(true),
-    ))
-}
-
-fn tool_schema(server_id: &str, tool: &Tool) -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": public_tool_name_for_tool(server_id, tool.name.as_ref()),
-            "description": tool.description.as_deref().unwrap_or("MCP tool"),
-            "parameters": Value::Object(tool.input_schema.as_ref().clone()),
-        }
-    })
-}
-
-fn format_call_tool_result(result: CallToolResult) -> String {
-    let mut parts = Vec::new();
-    if result.is_error == Some(true) {
-        parts.push("MCP tool returned an error.".to_string());
-    }
-    if let Some(value) = result.structured_content {
-        parts.push(value.to_string());
-    }
-    parts.extend(result.content.into_iter().map(|content| {
-        content
-            .as_text()
-            .map(|text| text.text.clone())
-            .unwrap_or_else(|| {
-                serde_json::to_string(&content).unwrap_or_else(|_| "<content>".to_string())
-            })
-    }));
-
-    if parts.is_empty() {
-        return "MCP tool returned no content.".to_string();
-    }
-
-    parts.join("\n")
-}
-
-pub(super) fn tool_is_allowed(server: &McpServerConfig, tool_name: &str) -> bool {
-    server.tools.iter().any(|allowed| allowed == "*")
-        || server.tools.iter().any(|allowed| allowed == tool_name)
-}
-
-struct ParsedPublicToolName<'a> {
-    server_id: &'a str,
-    public_tool_name: &'a str,
-}
-
-fn parse_public_tool_name(name: &str) -> Option<ParsedPublicToolName<'_>> {
-    let rest = name.strip_prefix("mcp__")?;
-    let (server_id, _) = rest.split_once("__")?;
-    Some(ParsedPublicToolName {
-        server_id,
-        public_tool_name: name,
-    })
-}
-
-pub(super) fn public_tool_name_for_tool(server_id: &str, tool_name: &str) -> String {
-    format!(
-        "mcp__{}__{}",
-        normalize_name(server_id),
-        normalize_name(tool_name)
-    )
-}
-
-fn normalize_name(name: &str) -> String {
-    name.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn parse_tool_arguments(arguments: &str) -> io::Result<JsonObject> {
-    let value = serde_json::from_str::<Value>(arguments).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("MCP tool arguments must be valid JSON: {err}"),
-        )
-    })?;
-
-    value.as_object().cloned().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "MCP tool arguments must be a JSON object",
-        )
-    })
-}
+#[cfg(test)]
+use crate::agent::config::McpTransport;
 
 #[cfg(test)]
-fn json_object(value: Value) -> JsonObject {
-    value.as_object().cloned().unwrap_or_default()
+fn test_server() -> McpServerConfig {
+    McpServerConfig {
+        enabled: true,
+        transport: McpTransport::Stdio,
+        command: Some("npx".to_string()),
+        args: Vec::new(),
+        env: BTreeMap::new(),
+        url: None,
+        headers: BTreeMap::new(),
+        tools: vec!["*".to_string()],
+        timeout_seconds: 60,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::config::{McpServerConfig, McpTransport};
-
-    #[test]
-    fn formats_public_tool_name_with_mcp_namespace() {
-        assert_eq!(
-            public_tool_name_for_tool("filesystem", "read-file"),
-            "mcp__filesystem__read-file"
-        );
-    }
-
-    #[test]
-    fn normalizes_public_tool_name() {
-        assert_eq!(
-            public_tool_name_for_tool("docs server", "search.query"),
-            "mcp__docs_server__search_query"
-        );
-    }
+    #[cfg(unix)]
+    use rmcp::model::JsonObject;
+    #[cfg(unix)]
+    use std::{sync::mpsc, thread, time::Duration};
 
     #[test]
     fn returns_no_schemas_when_all_servers_are_disabled() {
@@ -1061,80 +591,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_mcp_tool_name() {
-        let parsed = parse_public_tool_name("mcp__docs__search").unwrap();
-
-        assert_eq!(parsed.server_id, "docs");
-        assert_eq!(parsed.public_tool_name, "mcp__docs__search");
-    }
-
-    #[test]
-    fn ignores_non_mcp_tool_name() {
-        assert!(parse_public_tool_name("read_file").is_none());
-    }
-
-    #[test]
-    fn filters_allowed_tools() {
-        let mut server = test_server();
-        server.tools = vec!["search".to_string()];
-
-        assert!(tool_is_allowed(&server, "search"));
-        assert!(!tool_is_allowed(&server, "fetch"));
-    }
-
-    #[test]
-    fn wildcard_allows_all_tools() {
-        let server = test_server();
-
-        assert!(tool_is_allowed(&server, "search"));
-    }
-
-    #[test]
-    fn converts_mcp_tool_to_openai_schema() {
-        let tool = Tool::new(
-            "search",
-            "Search documents",
-            Arc::new(json_object(json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" }
-                },
-                "required": ["query"]
-            }))),
-        );
-
-        let schema = tool_schema("docs", &tool);
-
-        assert_eq!(
-            schema
-                .get("function")
-                .and_then(|function| function.get("name")),
-            Some(&json!("mcp__docs__search"))
-        );
-        assert_eq!(
-            schema
-                .get("function")
-                .and_then(|function| function.get("parameters"))
-                .and_then(|parameters| parameters.get("required")),
-            Some(&json!(["query"]))
-        );
-    }
-
-    #[test]
-    fn rejects_stdio_command_with_arguments() {
-        let mut server = test_server();
-        server.command = Some("npx -y mcp-remote".to_string());
-
-        let err = match stdio_transport("remote", &server) {
-            Ok(_) => panic!("expected command validation error"),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(err.to_string().contains("put flags and URLs into args"));
-    }
-
-    #[test]
     fn formats_mcp_tool_call_for_terminal_display() {
         let display = format_tool_call_name("mcp__docs__search");
 
@@ -1146,19 +602,5 @@ mod tests {
         let display = format_tool_call_name("mcp_discover");
 
         assert!(display.contains("mcp_discover"));
-    }
-
-    fn test_server() -> McpServerConfig {
-        McpServerConfig {
-            enabled: true,
-            transport: McpTransport::Stdio,
-            command: Some("npx".to_string()),
-            args: Vec::new(),
-            env: BTreeMap::new(),
-            url: None,
-            headers: BTreeMap::new(),
-            tools: vec!["*".to_string()],
-            timeout_seconds: 60,
-        }
     }
 }

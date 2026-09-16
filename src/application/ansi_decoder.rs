@@ -1,9 +1,7 @@
 //! Incremental decoder for non-interactive tool output, not a TUI emulator.
 
-use super::{
-    CellStyle, RenderLine,
-    ansi::{apply_erase_in_line, apply_sgr, push_ansi_render_line, write_ansi_scalar},
-};
+use super::ansi::{apply_erase_in_line, apply_sgr, push_ansi_render_line, write_ansi_scalar};
+use crate::terminal_renderer::{CellStyle, RenderLine};
 
 #[derive(Debug, Clone, Default)]
 enum EscapeState {
@@ -221,7 +219,7 @@ mod tests {
         assert_eq!(lines[1].styles[0], CellStyle::default());
         assert_eq!(
             lines[2].styles[0].foreground,
-            Some(super::super::TerminalColor::Red)
+            Some(crate::terminal_renderer::TerminalColor::Red)
         );
     }
 

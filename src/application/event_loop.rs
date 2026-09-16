@@ -1,7 +1,18 @@
 //! Managed scheduling: ready input, bounded backend work, then a coalesced frame.
 
-use super::*;
+use super::{
+    Application, Interaction,
+    ansi::char_len,
+    interaction::{interaction_needs_input, is_key_action},
+    terminal,
+};
 use crate::terminal_renderer::managed::{ExternalPublication, ManagedRenderer};
+use crate::terminal_renderer::{RenderLine, TerminalSize, VirtualCursor, VirtualScreen};
+use crossterm::{
+    event::{Event, KeyCode},
+    terminal::size,
+};
+use std::io;
 use std::time::{Duration, Instant};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
