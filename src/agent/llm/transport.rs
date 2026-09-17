@@ -212,6 +212,7 @@ impl Agent {
             self.log_event("info", "llm_stream_started", state.telemetry());
             let mut decoder = Decoder::default();
             let mut accumulator = Accumulator::default();
+            let mut first_text_enqueued = false;
             'network: loop {
                 state.phase = "body";
                 let Some(chunk) = state.network(idle, response.chunk()).await? else {
@@ -242,6 +243,17 @@ impl Agent {
                         state.phase = "enqueue";
                         output.reasoning(&delta.reasoning).await?;
                         output.content(&delta.content).await?;
+                        // Semantic receipt is logged before cancellable assembly.
+                        // This separate event confirms that the chat output queue
+                        // has accepted the text, even if it is not displayed yet.
+                        if !first_text_enqueued
+                            && state.purpose == "chat"
+                            && self.output.is_some()
+                            && (!delta.reasoning.is_empty() || !delta.content.is_empty())
+                        {
+                            first_text_enqueued = true;
+                            self.log_event("info", "llm_first_text_enqueued", state.telemetry());
+                        }
                         if accumulator.done {
                             break 'network;
                         }

@@ -127,7 +127,8 @@ fn retry_headers_heartbeat_and_tool_only_response_show_only_one_spinner() -> io:
     ui.server.request()?;
     ui.wait(|screen| screen.contents().contains("RETRY_TOOL"))?;
     ui.server.headers()?;
-    ui.server.content("RETRY_COMPLETE")?;
+    ui.server.content("RETRY_")?;
+    ui.server.content("COMPLETE")?;
     ui.server.finish("stop")?;
     ui.wait(|screen| screen.contents().contains("RETRY_COMPLETE") && spinner(screen).is_none())?;
     let history = ui.history();
@@ -165,6 +166,15 @@ fn retry_headers_heartbeat_and_tool_only_response_show_only_one_spinner() -> io:
             "{name}: {events:?}"
         );
     }
+    // Opaque reasoning/tool fragments count as semantic receipt, but only the
+    // later text response is enqueued. Multiple text deltas log this once.
+    let enqueued = events
+        .iter()
+        .filter(|event| event["event"] == "llm_first_text_enqueued")
+        .collect::<Vec<_>>();
+    assert_eq!(enqueued.len(), 1);
+    assert_eq!(enqueued[0]["fields"]["request_id"], starts[2]["request_id"]);
+    assert_eq!(enqueued[0]["fields"]["phase"], "enqueue");
     let telemetry = serde_json::to_string(&events)?;
     for secret in [
         "DO_NOT_LOG_ENCRYPTED",

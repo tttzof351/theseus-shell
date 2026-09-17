@@ -52,12 +52,17 @@ fn plain_sse_sigint_preserves_prefix_closes_http_and_exits_130() -> io::Result<(
         if prefix {
             server.headers()?;
             server.content("PLAIN_PREFIX")?;
+            // Plain text blocks stay buffered until completion/cancellation.
+            // Receipt telemetry precedes assembly and is not an enqueue barrier.
             let started = Instant::now();
             while !log_events(&home)?
                 .iter()
-                .any(|event| event["event"] == "llm_first_semantic_delta")
+                .any(|event| event["event"] == "llm_first_text_enqueued")
             {
-                assert!(started.elapsed() < WAIT_TIMEOUT);
+                assert!(
+                    started.elapsed() < WAIT_TIMEOUT,
+                    "prefix was not accepted by the output queue"
+                );
                 thread::sleep(Duration::from_millis(5));
             }
         }
