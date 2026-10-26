@@ -1,6 +1,6 @@
 //! Document layout and the managed screen's output/status/editor composition.
 use super::{
-    Application, Interaction,
+    Application, Interaction, PendingSubmission,
     ansi::{
         ansi_render_lines, char_len, render_markdown, style_interaction_lines, style_prompt,
         style_shell_lines, terminal_label,
@@ -25,6 +25,16 @@ impl Application {
             std::mem::take(&mut self.transcript_changed),
         );
         self.cached_transcript_lines = self.transcript.len();
+        // The editor is reset immediately on Enter, but its committed lines
+        // may not yet be in the background layout. Keep them in the footer
+        // until a snapshot containing their document version is installed.
+        // They have no publication units here, so only the canonical document
+        // can eventually publish them to native scrollback.
+        for submission in &self.pending_submissions {
+            for line in &submission.lines {
+                self.screen_cache.push_render_line(line);
+            }
+        }
         if let Some((_, outcome)) = &self.layout_feedback {
             let text = match outcome {
                 common::events::Outcome::Cancelled => "[interrupted]".into(),
@@ -136,7 +146,11 @@ impl Application {
         for line in &mut committed {
             style_prompt(line);
         }
-        self.document.append_lines(committed);
+        self.document.append_lines(committed.clone());
+        self.pending_submissions.push(PendingSubmission {
+            document_version: self.document.version(),
+            lines: committed,
+        });
     }
 
     pub(super) fn refresh_document(&mut self, width: usize) -> io::Result<()> {
@@ -159,6 +173,10 @@ impl Application {
                 self.cached_transcript_lines = self.transcript.len();
                 self.transcript_changed = false;
                 self.prepared_layout = Some(prepared.layout);
+                // An older append-only snapshot can arrive first. Retire only
+                // submissions it actually contains, not every pending input.
+                self.pending_submissions
+                    .retain(|submission| submission.document_version > prepared.key.version);
                 if self
                     .layout_feedback
                     .as_ref()
@@ -178,6 +196,7 @@ impl Application {
         self.publication = rendered.publication;
         self.transcript = rendered.lines;
         self.transcript_changed = true;
+        self.pending_submissions.clear();
         Ok(())
     }
 
@@ -200,6 +219,7 @@ impl Application {
     pub(super) fn clear_output(&mut self) {
         self.document.clear_visible();
         self.transcript.clear();
+        self.pending_submissions.clear();
         self.transcript_changed = true;
         self.cached_transcript_lines = 0;
         self.prepared_layout = None;

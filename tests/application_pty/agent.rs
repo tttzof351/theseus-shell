@@ -198,12 +198,17 @@ fn assert_natural_language_submission_does_not_blink(
     held.ready
         .recv_timeout(WAIT_TIMEOUT)
         .map_err(io::Error::other)?;
-    let after = app.wait_until(|bytes| {
+    app.wait_until(|bytes| {
         screen_text(bytes).contains(QUESTION) && waiting_spinner_row(bytes).is_some()
     })?;
+    held.release.send(()).map_err(io::Error::other)?;
+    let after = app.wait_until(|bytes| {
+        screen_text(bytes).contains("HELD_ANSWER") && waiting_spinner_row(bytes).is_none()
+    })?;
     assert!(after.starts_with(&before));
-    // Capture the full transition, including any temporarily blank frame that
-    // was hidden by wait_until's final-state predicate.
+    assert_eq!(screen_text(&after).matches(QUESTION).count(), 1);
+    // Capture the entire transition through completion, including promotion
+    // of the provisional submission into the background document's snapshot.
     let disappearance = first_question_disappearance(&before, &after[before.len()..], QUESTION);
     if let Some((offset, screen)) = disappearance {
         let transition = &after[before.len()..];
@@ -214,10 +219,19 @@ fn assert_natural_language_submission_does_not_blink(
             String::from_utf8_lossy(&transition[start..end])
         );
     }
-    held.release.send(()).map_err(io::Error::other)?;
-    app.wait_until(|bytes| {
-        screen_text(bytes).contains("HELD_ANSWER") && waiting_spinner_row(bytes).is_none()
+    // Once promoted, the input must enter native history exactly once, never
+    // as both a provisional footer and a committed document line.
+    app.write("seq 1 60\r")?;
+    let scrolled = app.wait_until(|bytes| {
+        screen_rows(bytes).iter().any(|row| row == "60") && settled_prompt_is_visible(bytes)
     })?;
+    assert_eq!(
+        terminal_history_rows(&scrolled)
+            .join("\n")
+            .matches(QUESTION)
+            .count(),
+        1
+    );
     app.exit()
 }
 
@@ -229,6 +243,44 @@ fn natural_language_submission_does_not_blink_in_fresh_session() -> io::Result<(
 #[test]
 fn natural_language_submission_does_not_blink_after_previous_answer() -> io::Result<()> {
     assert_natural_language_submission_does_not_blink(Some("PREVIOUS_ANSWER"))
+}
+
+#[test]
+fn clearing_pending_submission_does_not_restore_it_from_background_layout() -> io::Result<()> {
+    const QUESTION: &str = "Что ты умеешь?";
+    let (home, held) = held_json_fixture_after_answer(Some("PREVIOUS_ANSWER"))?;
+    let mut app =
+        ApplicationPty::start_with_home_and_cwd(home, Path::new(env!("CARGO_MANIFEST_DIR")))?;
+    app.write("\x0c/ask prepare previous answer\r")?;
+    app.wait_until(|bytes| {
+        screen_text(bytes).contains("PREVIOUS_ANSWER") && waiting_spinner_row(bytes).is_none()
+    })?;
+    app.write(QUESTION)?;
+    app.wait_until(|bytes| screen_text(bytes).contains(QUESTION))?;
+    // Deliver clear with Enter, while the newly committed input is still
+    // awaiting its first background layout. Keep editing the next draft.
+    app.write("\r\x0cKEPT_DRAFT")?;
+    held.ready
+        .recv_timeout(WAIT_TIMEOUT)
+        .map_err(io::Error::other)?;
+    app.wait_until(|bytes| {
+        let text = screen_text(bytes);
+        !text.contains(QUESTION)
+            && text.contains("KEPT_DRAFT")
+            && waiting_spinner_row(bytes).is_some()
+    })?;
+    held.release.send(()).map_err(io::Error::other)?;
+    let after = app.wait_until(|bytes| {
+        screen_text(bytes).contains("HELD_ANSWER") && waiting_spinner_row(bytes).is_none()
+    })?;
+    let text = screen_text(&after);
+    assert!(text.contains("KEPT_DRAFT"), "{text}");
+    assert!(
+        !text.contains(QUESTION),
+        "cleared submission returned: {text}"
+    );
+    app.write(&"\x7f".repeat("KEPT_DRAFT".len()))?;
+    app.exit()
 }
 
 #[test]

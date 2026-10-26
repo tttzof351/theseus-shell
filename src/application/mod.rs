@@ -63,6 +63,11 @@ struct ShellPresentation {
     published: Option<crate::terminal_renderer::managed::PublicationAnchor>,
 }
 
+struct PendingSubmission {
+    document_version: u64,
+    lines: Vec<RenderLine>,
+}
+
 struct Application {
     document: output_document::OutputDocument,
     rendered_stable_lines: usize,
@@ -73,6 +78,7 @@ struct Application {
     screen_cache: VirtualScreen,
     cached_transcript_lines: usize,
     transcript_changed: bool,
+    pending_submissions: Vec<PendingSubmission>,
     interaction: Interaction,
     history: Vec<HistoryEntry>,
     history_path: Option<PathBuf>,
@@ -131,6 +137,7 @@ impl Application {
             screen_cache: VirtualScreen::new(SHELL_PROMPT),
             cached_transcript_lines: 0,
             transcript_changed: true,
+            pending_submissions: Vec::new(),
             interaction,
             history,
             history_path,
