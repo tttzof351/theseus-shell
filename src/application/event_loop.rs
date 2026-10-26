@@ -28,6 +28,8 @@ pub(super) fn run_interactive_application(
     let mut last_frame = Instant::now() - FRAME_INTERVAL;
     let mut pending_input = None;
     let mut dirty = true;
+    let mut last_size = None;
+    let mut last_status = None;
 
     loop {
         // Drain a bounded input batch before potentially expensive Markdown work.
@@ -129,9 +131,18 @@ pub(super) fn run_interactive_application(
         dirty |= app.poll_operation()?;
         let (width, height) = size()?;
         let terminal_size = TerminalSize::new(width, height);
-        if last_frame.elapsed() >= FRAME_INTERVAL {
-            // Timed frames also refresh activity and terminal geometry even when
-            // no backend event arrives (e.g. while HTTP is waiting for headers).
+        let status = app.operation_status_line();
+        let status_changed = status != last_status;
+        dirty |= last_size != Some(terminal_size);
+        if frame_due(
+            last_frame.elapsed(),
+            dirty,
+            status_changed,
+            renderer.publication_pending(),
+            app.layout_pending(terminal_size.width),
+        ) {
+            // Only changed content/animation, resize, or unfinished publication/layout
+            // needs a frame. Input remains interruptible during the wait below.
             app.refresh_document(terminal_size.width)?;
             if let Some(layout) = app.prepared_layout.take() {
                 renderer.install_layout(layout);
@@ -159,6 +170,8 @@ pub(super) fn run_interactive_application(
                 )?;
             }
             last_frame = Instant::now();
+            last_size = Some(terminal_size);
+            last_status = status;
             dirty = false;
             if exit_when_command_editor_returns
                 && app.active_operation.is_none()
@@ -169,13 +182,45 @@ pub(super) fn run_interactive_application(
                 return Ok(app.last_command_status);
             }
         }
-        let until_frame = FRAME_INTERVAL.saturating_sub(last_frame.elapsed());
-        let wait = if dirty || app.active_operation.is_some() {
-            until_frame.min(Duration::from_millis(5))
-        } else {
-            until_frame
-        };
+        let wait = event_wait(
+            last_frame.elapsed(),
+            dirty || status_changed,
+            app.active_operation.is_some(),
+            app.layout_pending(terminal_size.width),
+            renderer.publication_pending(),
+        );
         pending_input = app.terminal.as_ref().unwrap().next_event(wait)?;
+    }
+}
+
+// Kept separate so scheduling budgets can be checked without wall-clock timing.
+fn frame_due(
+    elapsed: Duration,
+    dirty: bool,
+    status_changed: bool,
+    publication: bool,
+    layout: bool,
+) -> bool {
+    elapsed >= FRAME_INTERVAL && (dirty || status_changed || publication || layout)
+}
+
+fn event_wait(
+    elapsed: Duration,
+    dirty: bool,
+    active: bool,
+    layout: bool,
+    publication: bool,
+) -> Duration {
+    if dirty || publication {
+        FRAME_INTERVAL.saturating_sub(elapsed)
+    } else if active || layout {
+        // Backend channels are polled once per frame budget. Do not use the
+        // expired last-frame deadline when no frame was necessary.
+        FRAME_INTERVAL
+    } else {
+        // Raw input wakes poll immediately. Geometry is sampled at this bound
+        // because our raw byte decoder does not produce Resize events.
+        Duration::from_millis(100)
     }
 }
 
@@ -227,4 +272,78 @@ fn handle_event(
         renderer.clear_document();
     }
     Ok(changed)
+}
+
+#[cfg(test)]
+mod performance_tests {
+    use super::*;
+
+    #[test]
+    fn idle_has_no_frames_even_after_the_frame_deadline() {
+        for milliseconds in 33..=1000 {
+            assert!(!frame_due(
+                Duration::from_millis(milliseconds),
+                false,
+                false,
+                false,
+                false
+            ));
+        }
+    }
+
+    #[test]
+    fn waiting_for_provider_only_renders_changed_status() {
+        let mut frames = 0;
+        let mut last_frame = 0;
+        let mut last_spinner = 0;
+        for now in 1..=1000 {
+            let spinner = now / 120;
+            if frame_due(
+                Duration::from_millis(now - last_frame),
+                false,
+                spinner != last_spinner,
+                false,
+                false,
+            ) {
+                frames += 1;
+                last_frame = now;
+                last_spinner = spinner;
+            }
+        }
+        assert_eq!(
+            frames, 8,
+            "a waiting request needs only the eight animation updates"
+        );
+    }
+
+    #[test]
+    fn idle_wait_does_not_expire_with_the_last_frame() {
+        assert!(
+            event_wait(Duration::from_secs(1), false, false, false, false)
+                >= Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn backend_wait_uses_a_frame_budget_without_five_ms_polling() {
+        assert!(event_wait(Duration::ZERO, false, true, false, false) >= Duration::from_millis(30));
+    }
+
+    #[test]
+    fn input_publication_and_layout_still_schedule_frames() {
+        for (dirty, publication, layout) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert!(frame_due(FRAME_INTERVAL, dirty, false, publication, layout));
+            assert!(!frame_due(
+                Duration::ZERO,
+                dirty,
+                false,
+                publication,
+                layout
+            ));
+        }
+    }
 }

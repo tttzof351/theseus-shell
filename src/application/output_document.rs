@@ -85,10 +85,10 @@ impl Block {
             };
             if self.kind == BlockKind::Reasoning {
                 for line in &mut lines {
-                    for style in &mut line.styles {
+                    line.styles.map(|style| {
                         style.foreground = Some(TerminalColor::BrightBlack);
                         style.italic = true;
-                    }
+                    });
                 }
             }
             self.cache = Some((self.revision, width, lines.into()));

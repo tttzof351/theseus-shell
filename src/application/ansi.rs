@@ -3,7 +3,7 @@ use crate::commands::parse_slash_command;
 use crate::{
     input,
     shell::{self, markdown_preprocessor},
-    terminal_renderer::{CellStyle, RenderLine, TerminalColor, push_style_escape},
+    terminal_renderer::{CellStyle, CellStyles, RenderLine, TerminalColor, push_style_escape},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::io;
@@ -325,9 +325,7 @@ pub(super) fn style_interaction_lines(
                             },
                         );
                     } else {
-                        for style in &mut line.styles {
-                            style.italic = true;
-                        }
+                        line.styles.map(|style| style.italic = true);
                     }
                 }
                 style_prompt(line);
@@ -375,15 +373,18 @@ pub(super) fn style_prompt(line: &mut RenderLine) {
         if index == final_marker && ch == '>' {
             continue;
         }
-        line.prefix_styles[index] = CellStyle {
-            foreground: Some(if first_word {
-                TerminalColor::Cyan
-            } else {
-                TerminalColor::Magenta
-            }),
-            bold: true,
-            ..CellStyle::default()
-        };
+        line.prefix_styles.set_range(
+            index..index + 1,
+            CellStyle {
+                foreground: Some(if first_word {
+                    TerminalColor::Cyan
+                } else {
+                    TerminalColor::Magenta
+                }),
+                bold: true,
+                ..CellStyle::default()
+            },
+        );
     }
 }
 
@@ -694,7 +695,7 @@ mod primary_tests {
     }
 }
 
-pub(super) fn terminal_styled_text(text: &str, styles: &[CellStyle]) -> String {
+pub(super) fn terminal_styled_text(text: &str, styles: &CellStyles) -> String {
     let mut output = String::new();
     let mut current = CellStyle::default();
     for (index, ch) in text.chars().enumerate() {

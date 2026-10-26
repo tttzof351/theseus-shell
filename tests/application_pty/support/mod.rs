@@ -2,7 +2,9 @@ mod http;
 mod pty;
 mod screen;
 
-pub(crate) use http::{held_json_fixture, interrupted_agent_fixture};
+pub(crate) use http::{
+    held_json_fixture, held_json_fixture_after_answer, interrupted_agent_fixture,
+};
 pub(crate) use pty::{ApplicationPty, SIZE, WAIT_TIMEOUT, temp_home};
 pub(crate) use screen::{
     find_bytes, is_waiting_spinner, output_marker_column, screen_rows, screen_text,

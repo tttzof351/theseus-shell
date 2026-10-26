@@ -1,5 +1,8 @@
 //! Virtual-screen layout and physical terminal diff engine.
 
+mod styles;
+pub use styles::CellStyles;
+
 pub(crate) mod managed;
 mod publication;
 
@@ -32,8 +35,8 @@ pub struct VirtualCursor {
 pub struct VirtualScreen {
     pub lines: Vec<String>,
     pub prefixes: Vec<String>,
-    pub line_styles: Vec<Vec<CellStyle>>,
-    pub prefix_styles: Vec<Vec<CellStyle>>,
+    pub line_styles: Vec<CellStyles>,
+    pub prefix_styles: Vec<CellStyles>,
     pub cursor: VirtualCursor,
     pub cursor_visible: bool,
     pub dirty_from: usize,
@@ -44,8 +47,8 @@ impl VirtualScreen {
         Self {
             lines: vec![String::new()],
             prefixes: vec![prompt.to_string()],
-            line_styles: vec![Vec::new()],
-            prefix_styles: vec![vec![CellStyle::default(); char_len(prompt)]],
+            line_styles: vec![CellStyles::default()],
+            prefix_styles: vec![CellStyles::plain(char_len(prompt))],
             cursor: VirtualCursor {
                 line: 0,
                 char_offset: 0,
@@ -62,8 +65,8 @@ impl VirtualScreen {
         Self {
             lines: vec![text],
             prefixes: vec![prompt.to_string()],
-            line_styles: vec![vec![CellStyle::default(); line_len]],
-            prefix_styles: vec![vec![CellStyle::default(); char_len(prompt)]],
+            line_styles: vec![CellStyles::plain(line_len)],
+            prefix_styles: vec![CellStyles::plain(char_len(prompt))],
             cursor: VirtualCursor {
                 line: 0,
                 char_offset,
@@ -119,8 +122,8 @@ impl VirtualScreen {
 pub struct RenderLine {
     pub prefix: String,
     pub text: String,
-    pub prefix_styles: Vec<CellStyle>,
-    pub styles: Vec<CellStyle>,
+    pub prefix_styles: CellStyles,
+    pub styles: CellStyles,
 }
 
 impl RenderLine {
@@ -128,8 +131,8 @@ impl RenderLine {
         let prefix = prefix.into();
         let text = text.into();
         Self {
-            prefix_styles: vec![CellStyle::default(); char_len(&prefix)],
-            styles: vec![CellStyle::default(); char_len(&text)],
+            prefix_styles: CellStyles::plain(char_len(&prefix)),
+            styles: CellStyles::plain(char_len(&text)),
             prefix,
             text,
         }
@@ -139,21 +142,20 @@ impl RenderLine {
         Self::new("", text)
     }
 
-    pub fn styled(text: impl Into<String>, styles: Vec<CellStyle>) -> Self {
+    pub fn styled(text: impl Into<String>, styles: impl Into<CellStyles>) -> Self {
         let text = text.into();
+        let styles = styles.into();
         debug_assert_eq!(char_len(&text), styles.len());
         Self {
             prefix: String::new(),
-            prefix_styles: Vec::new(),
+            prefix_styles: CellStyles::default(),
             text,
             styles,
         }
     }
 
     pub fn style_range(&mut self, start: usize, end: usize, style: CellStyle) {
-        for cell_style in self.styles.iter_mut().take(end).skip(start) {
-            *cell_style = style;
-        }
+        self.styles.set_range(start..end, style);
     }
 }
 
@@ -257,10 +259,11 @@ pub struct PhysicalTerminal {
 pub struct CachedLogicalLayout {
     pub prefix: String,
     pub text: String,
-    pub prefix_styles: Vec<CellStyle>,
-    pub styles: Vec<CellStyle>,
+    pub prefix_styles: CellStyles,
+    pub styles: CellStyles,
     pub cursor_offset: Option<usize>,
-    pub rows: Vec<PhysicalRow>,
+    width: usize,
+    row_byte_ranges: Vec<std::ops::Range<usize>>,
     pub text_characters: Vec<char>,
     pub row_text_ranges: Vec<std::ops::Range<usize>>,
     pub prefix_width: usize,
@@ -271,22 +274,23 @@ impl CachedLogicalLayout {
     pub fn build(
         prefix: &str,
         text: &str,
-        prefix_styles: &[CellStyle],
-        styles: &[CellStyle],
+        prefix_styles: &CellStyles,
+        styles: &CellStyles,
         cursor_offset: Option<usize>,
         width: usize,
     ) -> Self {
-        let mut builder = LayoutBuilder::new(width);
+        let mut builder = LayoutBuilder::measuring(width);
         builder.write_prompt(prefix, prefix_styles);
         let prefix_width = builder.column;
         builder.write_line(text, cursor_offset, styles);
         Self {
             prefix: prefix.to_string(),
             text: text.to_string(),
-            prefix_styles: prefix_styles.to_vec(),
-            styles: styles.to_vec(),
+            prefix_styles: prefix_styles.clone(),
+            styles: styles.clone(),
             cursor_offset,
-            rows: builder.rows,
+            width,
+            row_byte_ranges: builder.row_byte_ranges,
             text_characters: text.chars().collect(),
             row_text_ranges: builder.row_text_ranges,
             prefix_width,
@@ -294,18 +298,35 @@ impl CachedLogicalLayout {
         }
     }
 
+    pub fn row_count(&self) -> usize {
+        self.row_text_ranges.len()
+    }
+
+    /// Materialize only rows used by the viewport or native publication. The
+    /// retained layout stores source ranges instead of a heap object per cell.
+    pub fn row(&self, index: usize) -> PhysicalRow {
+        let mut builder = LayoutBuilder::new(self.width);
+        if index == 0 {
+            builder.write_prompt(&self.prefix, &self.prefix_styles);
+        }
+        let text = &self.text[self.row_byte_ranges[index].clone()];
+        let styles = self.styles.slice(self.row_text_ranges[index].clone());
+        builder.write_line(text, None, &styles);
+        builder.rows.remove(0)
+    }
+
     pub fn matches(
         &self,
         prefix: &str,
         text: &str,
-        prefix_styles: &[CellStyle],
-        styles: &[CellStyle],
+        prefix_styles: &CellStyles,
+        styles: &CellStyles,
         cursor_offset: Option<usize>,
     ) -> bool {
         self.prefix == prefix
             && self.text == text
-            && self.prefix_styles == prefix_styles
-            && self.styles == styles
+            && self.prefix_styles == *prefix_styles
+            && self.styles == *styles
             && self.cursor_offset == cursor_offset
     }
 }
@@ -440,7 +461,7 @@ impl IndexedPhysicalLayout {
                 size.width,
             );
             if !length_changed {
-                self.heights.set(index, layout.rows.len());
+                self.heights.set(index, layout.row_count());
             }
             self.logical_lines[index] = Arc::new(layout);
             self.reflowed_last_frame += 1;
@@ -462,7 +483,7 @@ impl IndexedPhysicalLayout {
 
         if length_changed {
             self.heights
-                .rebuild(self.logical_lines.iter().map(|line| line.rows.len()));
+                .rebuild(self.logical_lines.iter().map(|line| line.row_count()));
         }
 
         check()?;
@@ -482,7 +503,7 @@ impl IndexedPhysicalLayout {
             .map(|viewport_row| {
                 self.heights
                     .line_containing_row(viewport_top + viewport_row)
-                    .and_then(|(line, row)| self.logical_lines[line].rows.get(row).cloned())
+                    .map(|(line, row)| self.logical_lines[line].row(row))
                     .unwrap_or_else(|| PhysicalRow::empty(size.width))
             })
             .collect();
@@ -560,6 +581,8 @@ pub struct LayoutBuilder {
     pub column: usize,
     pub cursor: Option<PhysicalPosition>,
     pub row_text_ranges: Vec<std::ops::Range<usize>>,
+    row_byte_ranges: Vec<std::ops::Range<usize>>,
+    measure_only: bool,
 }
 
 impl LayoutBuilder {
@@ -571,17 +594,29 @@ impl LayoutBuilder {
             column: 0,
             cursor: None,
             row_text_ranges: std::iter::once(0..0).collect(),
+            row_byte_ranges: std::iter::once(0..0).collect(),
+            measure_only: false,
+        }
+    }
+
+    fn measuring(width: usize) -> Self {
+        Self {
+            measure_only: true,
+            ..Self::new(width)
         }
     }
 
     pub fn start_row(&mut self) {
-        self.rows.push(PhysicalRow::empty(self.width));
+        if !self.measure_only {
+            self.rows.push(PhysicalRow::empty(self.width));
+        }
         self.row_text_ranges.push(0..0);
-        self.row = self.rows.len() - 1;
+        self.row_byte_ranges.push(0..0);
+        self.row += 1;
         self.column = 0;
     }
 
-    pub fn write_prompt(&mut self, prompt: &str, styles: &[CellStyle]) {
+    pub fn write_prompt(&mut self, prompt: &str, styles: &CellStyles) {
         // Keep at least one physical cell available for the input cursor when
         // the terminal is narrower than the prompt.
         let prompt_limit = self.width.saturating_sub(1);
@@ -602,10 +637,10 @@ impl LayoutBuilder {
         }
     }
 
-    pub fn write_line(&mut self, text: &str, cursor_offset: Option<usize>, styles: &[CellStyle]) {
+    pub fn write_line(&mut self, text: &str, cursor_offset: Option<usize>, styles: &CellStyles) {
         let mut char_offset = 0;
 
-        for ch in text.chars() {
+        for (byte_offset, ch) in text.char_indices() {
             let mut width = if ch == '\t' {
                 (TERMINAL_TAB_STOP - self.column % TERMINAL_TAB_STOP).min(self.width)
             } else {
@@ -633,8 +668,10 @@ impl LayoutBuilder {
 
             if self.row_text_ranges[self.row].is_empty() {
                 self.row_text_ranges[self.row].start = char_offset;
+                self.row_byte_ranges[self.row].start = byte_offset;
             }
             self.row_text_ranges[self.row].end = char_offset + 1;
+            self.row_byte_ranges[self.row].end = byte_offset + ch.len_utf8();
 
             if width == 0 {
                 self.append_zero_width(rendered);
@@ -658,6 +695,7 @@ impl LayoutBuilder {
             if self.column == self.width {
                 self.start_row();
                 self.row_text_ranges[self.row] = char_offset..char_offset;
+                self.row_byte_ranges[self.row] = text.len()..text.len();
             }
             self.cursor = Some(PhysicalPosition {
                 row: self.row,
@@ -667,10 +705,18 @@ impl LayoutBuilder {
     }
 
     pub fn put_glyph(&mut self, ch: char, width: usize, style: CellStyle) {
-        self.put_text(ch.to_string(), width, style);
+        if self.measure_only {
+            self.column += width;
+        } else {
+            self.put_text(ch.to_string(), width, style);
+        }
     }
 
     pub fn put_text(&mut self, text: String, width: usize, style: CellStyle) {
+        if self.measure_only {
+            self.column += width;
+            return;
+        }
         debug_assert!(width > 0);
         debug_assert!(self.column + width <= self.width);
 
@@ -683,6 +729,9 @@ impl LayoutBuilder {
     }
 
     pub fn append_zero_width(&mut self, ch: char) {
+        if self.measure_only {
+            return;
+        }
         let Some((row, column)) = self.previous_glyph_position() else {
             return;
         };
@@ -1132,5 +1181,57 @@ mod tests {
                 .operations
                 .contains(&PhysicalOperation::ClearAll)
         );
+    }
+}
+
+#[cfg(test)]
+mod compact_layout_tests {
+    use super::*;
+
+    #[test]
+    fn lazy_rows_match_full_layout_for_unicode_tabs_styles_prefixes_and_cursor() {
+        let red = CellStyle {
+            foreground: Some(TerminalColor::Red),
+            bold: true,
+            ..Default::default()
+        };
+        for width in 1..=17 {
+            for prefix in ["", "user> ", "界> ", "a\u{301}"] {
+                for text in [
+                    "",
+                    "a\tb\t",
+                    "a界🙂b",
+                    "\u{301}a\u{301}界\u{301}b",
+                    "0123456789abcdefghijk",
+                    "界\t界\t尾",
+                ] {
+                    let mut styles = CellStyles::plain(char_len(text));
+                    styles.set_range(1..4, red);
+                    let prefix_styles = CellStyles::plain(char_len(prefix));
+                    for cursor in 0..=char_len(text) {
+                        let mut full = LayoutBuilder::new(width);
+                        full.write_prompt(prefix, &prefix_styles);
+                        full.write_line(text, Some(cursor), &styles);
+                        let cached = CachedLogicalLayout::build(
+                            prefix,
+                            text,
+                            &prefix_styles,
+                            &styles,
+                            Some(cursor),
+                            width,
+                        );
+                        assert_eq!(cached.cursor, full.cursor);
+                        assert_eq!(cached.row_count(), full.rows.len());
+                        for (index, row) in full.rows.iter().enumerate() {
+                            assert_eq!(
+                                &cached.row(index),
+                                row,
+                                "width={width} prefix={prefix:?} text={text:?} cursor={cursor} row={index}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

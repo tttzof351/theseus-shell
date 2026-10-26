@@ -101,7 +101,7 @@ impl PartialPublication {
         line: usize,
         unit: &PublicationUnit,
     ) -> Option<RowPublication> {
-        let physical = &layout.rows[row];
+        let physical = layout.row(row);
         let provenance = unit.origins.as_ref().and_then(|lines| lines.get(line));
         let mapped =
             provenance.is_some_and(|origins| origins.characters.iter().any(Option::is_some));

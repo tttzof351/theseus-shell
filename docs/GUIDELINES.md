@@ -16,6 +16,9 @@ cargo test --locked --all-targets --all-features
 Use `cargo fmt` to fix formatting. Fix warnings and failing tests rather than
 weakening checks or timeouts. For documentation-only changes, check links and commands.
 
+For performance budgets, focused commands, and the initial red/green measurements,
+see [the performance regression guide](PERFORMANCE.md).
+
 ## Terminal checks
 
 Run for input/output, rendering, streaming or PTY changes, and before releases:

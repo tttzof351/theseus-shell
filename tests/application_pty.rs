@@ -34,3 +34,7 @@ mod plain;
 #[path = "application_pty/support/mod.rs"]
 mod support;
 use support::*;
+
+#[cfg(target_os = "linux")]
+#[path = "application_pty/performance.rs"]
+mod performance;

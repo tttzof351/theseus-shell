@@ -94,7 +94,16 @@ impl TerminalInput {
                 }
                 polled = true;
                 let mut bytes = [0; 8192];
-                let count = self.read_tty(&mut bytes, remaining.min(Duration::from_millis(10)))?;
+                // A lone Escape needs its ambiguity deadline; ordinary input
+                // can sleep until the caller's deadline without periodic polling.
+                let wait = if self.pending.len() == 1 {
+                    self.escape_since.map_or(remaining, |since| {
+                        remaining.min(Duration::from_millis(25).saturating_sub(since.elapsed()))
+                    })
+                } else {
+                    remaining
+                };
+                let count = self.read_tty(&mut bytes, wait)?;
                 self.pending.extend(&bytes[..count]);
             }
         }
@@ -127,11 +136,15 @@ impl TerminalInput {
             events: libc::POLLIN,
             revents: 0,
         };
+        #[cfg(test)]
+        POLL_CALLS.with(|count| count.set(count.get() + 1));
         let ready = unsafe {
             libc::poll(
                 &mut descriptor,
                 1,
-                timeout.as_millis().min(i32::MAX as u128) as i32,
+                // poll takes whole milliseconds. Rounding down would busy-spin
+                // for the fractional remainder at every frame/escape deadline.
+                timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32,
             )
         };
         if ready < 0 {
@@ -590,5 +603,92 @@ mod tests {
             panic!()
         };
         assert_eq!(event, KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+    }
+}
+
+#[cfg(all(test, unix))]
+thread_local! { static POLL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(all(test, unix))]
+mod performance_tests {
+    use super::*;
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+
+    #[test]
+    fn incomplete_escape_sequences_do_not_spin_after_the_escape_deadline() {
+        use std::io::Write;
+        for (prefix, suffix) in [
+            (b"\x1b[200~pending".as_slice(), b"\x1b[201~".as_slice()),
+            (b"\x1b[1;", b"5D"),
+            (b"\x1b\xd0", b"\xb0"),
+        ] {
+            let (reader, mut writer) = UnixStream::pair().unwrap();
+            reader.set_nonblocking(true).unwrap();
+            let input = TerminalInput::from_test_file(std::fs::File::from(OwnedFd::from(reader)));
+            writer.write_all(prefix).unwrap();
+            POLL_CALLS.with(|count| count.set(0));
+            assert!(
+                input
+                    .lock()
+                    .unwrap()
+                    .next_event(Duration::from_millis(100))
+                    .unwrap()
+                    .is_none()
+            );
+            let calls = POLL_CALLS.with(|count| count.get());
+            assert!(
+                calls <= 3,
+                "incomplete sequence {prefix:?} caused {calls} polls"
+            );
+            writer.write_all(suffix).unwrap();
+            assert!(
+                input
+                    .lock()
+                    .unwrap()
+                    .next_event(Duration::from_millis(100))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn lone_escape_keeps_its_short_ambiguity_deadline() {
+        use std::io::Write;
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let input = TerminalInput::from_test_file(std::fs::File::from(OwnedFd::from(reader)));
+        writer.write_all(b"\x1b").unwrap();
+        let started = Instant::now();
+        let event = input
+            .lock()
+            .unwrap()
+            .next_event(Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(event, Some(Event::Key(key)) if key.code == KeyCode::Esc));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "Escape waited for the caller's long deadline"
+        );
+    }
+
+    #[test]
+    fn quiet_input_wait_does_not_poll_in_ten_ms_slices_or_spin_at_deadline() {
+        let (reader, _writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let input = TerminalInput::from_test_file(std::fs::File::from(OwnedFd::from(reader)));
+        POLL_CALLS.with(|count| count.set(0));
+        let started = Instant::now();
+        assert!(
+            input
+                .lock()
+                .unwrap()
+                .next_event(Duration::from_millis(100))
+                .unwrap()
+                .is_none()
+        );
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        let calls = POLL_CALLS.with(|count| count.get());
+        assert!(calls <= 2, "one quiet wait made {calls} poll calls");
     }
 }

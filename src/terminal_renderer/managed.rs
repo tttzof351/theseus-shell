@@ -170,7 +170,7 @@ impl ManagedRenderer {
                             .unwrap_or_else(|| PhysicalRow::empty(size.width));
                     }
                 }
-                fit_row(&self.layout.logical_lines[line].rows[row], size.width)
+                fit_row(&self.layout.logical_lines[line].row(row), size.width)
             })
             .chain(footer_frame.rows.into_iter().take(footer_height))
             .collect::<Vec<_>>();
@@ -281,14 +281,16 @@ impl ManagedRenderer {
                 let tail = CachedLogicalLayout::build(
                     "",
                     &line.text[offset..],
-                    &[],
-                    &line.styles[anchor.characters.min(line.styles.len())..],
+                    &super::CellStyles::default(),
+                    &line
+                        .styles
+                        .slice(anchor.characters.min(line.styles.len())..line.styles.len()),
                     None,
                     size.width,
                 );
                 clear_viewport(output)?;
-                for row in &tail.rows {
-                    publish_row(output, row)?;
+                for row in 0..tail.row_count() {
+                    publish_row(output, &tail.row(row))?;
                 }
                 output.flush()?;
             }
@@ -333,7 +335,7 @@ impl ManagedRenderer {
                         .expect("publication row");
                     publish_row_at_width(
                         output,
-                        &self.layout.logical_lines[line].rows[row],
+                        &self.layout.logical_lines[line].row(row),
                         size.width,
                     )?;
                 }
@@ -524,7 +526,7 @@ impl ManagedRenderer {
                                     .unwrap_or_else(|| PhysicalRow::empty(size.width));
                             }
                         }
-                        self.layout.logical_lines[line].rows[row].clone()
+                        self.layout.logical_lines[line].row(row)
                     })
                     .unwrap_or_else(|| PhysicalRow::empty(size.width))
             })
@@ -614,9 +616,16 @@ fn publish_row_at_width(
             PhysicalCell::Continuation { .. } => {}
         }
     }
-    let layout = CachedLogicalLayout::build("", &text, &[], &styles, None, width);
-    for row in &layout.rows {
-        publish_row(output, row)?;
+    let layout = CachedLogicalLayout::build(
+        "",
+        &text,
+        &super::CellStyles::default(),
+        &styles.into(),
+        None,
+        width,
+    );
+    for row in 0..layout.row_count() {
+        publish_row(output, &layout.row(row))?;
     }
     Ok(())
 }
@@ -863,10 +872,17 @@ mod tests {
             bold: true,
             ..CellStyle::default()
         };
-        let cached = CachedLogicalLayout::build("", "ab界z", &[], &[style; 4], None, 5);
-        let narrow = fit_row(&cached.rows[0], 3);
+        let cached = CachedLogicalLayout::build(
+            "",
+            "ab界z",
+            &super::CellStyles::default(),
+            &vec![style; 4].into(),
+            None,
+            5,
+        );
+        let narrow = fit_row(&cached.row(0), 3);
         assert_eq!(narrow.cells[2], PhysicalCell::Empty);
-        let exact = fit_row(&cached.rows[0], 4);
+        let exact = fit_row(&cached.row(0), 4);
         assert!(
             matches!(&exact.cells[2], PhysicalCell::Glyph { text, width: 2, style: s } if text == "界" && *s == style)
         );
@@ -874,8 +890,8 @@ mod tests {
             exact.cells[3],
             PhysicalCell::Continuation { leading_column: 2 }
         );
-        let wide = fit_row(&cached.rows[0], 8);
-        assert_eq!(&wide.cells[..5], cached.rows[0].cells.as_slice());
+        let wide = fit_row(&cached.row(0), 8);
+        assert_eq!(&wide.cells[..5], cached.row(0).cells.as_slice());
         assert!(
             wide.cells[5..]
                 .iter()

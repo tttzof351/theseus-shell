@@ -144,6 +144,117 @@ fn managed_waiting_spinner_animates_in_place_and_does_not_enter_history() -> io:
     app.exit()
 }
 
+/// Replay output incrementally and inspect completed editor frames, not just
+/// the final screen. The renderer hides the cursor while applying a diff and
+/// shows it again at frame end. A missing question at that boundary is a real
+/// blank frame, rather than an intermediate UTF-8 scalar or partial row write.
+fn first_question_disappearance(
+    before: &[u8],
+    after: &[u8],
+    question: &str,
+) -> Option<(usize, String)> {
+    let mut parser = vt100::Parser::new(SIZE.rows, SIZE.cols, 0);
+    parser.process(before);
+    assert!(
+        parser.screen().contents().contains(question),
+        "question must be visible before Enter"
+    );
+    for (offset, byte) in after.iter().enumerate() {
+        parser.process(std::slice::from_ref(byte));
+        let contents = parser.screen().contents();
+        if !parser.screen().hide_cursor() && !contents.contains(question) {
+            return Some((offset, contents));
+        }
+    }
+    None
+}
+
+fn assert_natural_language_submission_does_not_blink(
+    previous_answer: Option<&str>,
+) -> io::Result<()> {
+    const QUESTION: &str = "Что ты умеешь?";
+    let (home, held) = held_json_fixture_after_answer(previous_answer)?;
+    let mut app =
+        ApplicationPty::start_with_home_and_cwd(home, Path::new(env!("CARGO_MANIFEST_DIR")))?;
+    // Keep the question away from the viewport edge: no scrolling is needed
+    // when the spinner and next editor appear below this short submission.
+    app.write("\x0c")?;
+    app.wait_until(|bytes| !screen_text(bytes).contains("Theseus shell wrapper"))?;
+    if let Some(answer) = previous_answer {
+        app.write("/ask prepare previous answer\r")?;
+        app.wait_until(|bytes| {
+            screen_text(bytes).contains(answer) && waiting_spinner_row(bytes).is_none()
+        })?;
+    }
+    // Wait for the fully typed draft to be rendered BEFORE sending Enter.
+    // Sending text and Enter together can bypass the frame which is blinking.
+    app.write(QUESTION)?;
+    let before = app.wait_until(|bytes| {
+        screen_rows(bytes)
+            .iter()
+            .any(|row| row == &format!("tester theseus-shell> {QUESTION}"))
+    })?;
+    app.write("\r")?;
+    held.ready
+        .recv_timeout(WAIT_TIMEOUT)
+        .map_err(io::Error::other)?;
+    let after = app.wait_until(|bytes| {
+        screen_text(bytes).contains(QUESTION) && waiting_spinner_row(bytes).is_some()
+    })?;
+    assert!(after.starts_with(&before));
+    // Capture the full transition, including any temporarily blank frame that
+    // was hidden by wait_until's final-state predicate.
+    let disappearance = first_question_disappearance(&before, &after[before.len()..], QUESTION);
+    if let Some((offset, screen)) = disappearance {
+        let transition = &after[before.len()..];
+        let start = offset.saturating_sub(100);
+        let end = (offset + 100).min(transition.len());
+        panic!(
+            "submitted question disappeared in a completed frame at transition byte {offset}; previous_answer={previous_answer:?}\nscreen:\n{screen}\nANSI around disappearance: {:?}",
+            String::from_utf8_lossy(&transition[start..end])
+        );
+    }
+    held.release.send(()).map_err(io::Error::other)?;
+    app.wait_until(|bytes| {
+        screen_text(bytes).contains("HELD_ANSWER") && waiting_spinner_row(bytes).is_none()
+    })?;
+    app.exit()
+}
+
+#[test]
+fn natural_language_submission_does_not_blink_in_fresh_session() -> io::Result<()> {
+    assert_natural_language_submission_does_not_blink(None)
+}
+
+#[test]
+fn natural_language_submission_does_not_blink_after_previous_answer() -> io::Result<()> {
+    assert_natural_language_submission_does_not_blink(Some("PREVIOUS_ANSWER"))
+}
+
+#[test]
+fn submission_blink_detector_catches_erase_and_restore_with_identical_final_screen() {
+    const QUESTION: &str = "Что ты умеешь?";
+    let before = format!("tester theseus-shell> {QUESTION}");
+    // This is a valid incremental transition: only the two new rows change.
+    let incremental = "\x1b[?25l\x1b[2;1H⠋\x1b[3;1Htester theseus-shell> \x1b[?25h";
+    assert!(
+        first_question_disappearance(before.as_bytes(), incremental.as_bytes(), QUESTION).is_none()
+    );
+    // A final-screen assertion alone cannot distinguish these outputs.
+    let repaint = format!("\x1b[?25l\x1b[1;1H\x1b[2K{before}{incremental}");
+    assert!(
+        first_question_disappearance(before.as_bytes(), repaint.as_bytes(), QUESTION).is_none()
+    );
+    let blinking = format!("\x1b[?25l\x1b[1;1H\x1b[2K\x1b[?25h\x1b[?25l{before}{incremental}");
+    assert_eq!(
+        screen_text(format!("{before}{incremental}").as_bytes()),
+        screen_text(format!("{before}{blinking}").as_bytes())
+    );
+    assert!(
+        first_question_disappearance(before.as_bytes(), blinking.as_bytes(), QUESTION).is_some()
+    );
+}
+
 #[test]
 fn submitting_short_request_keeps_status_and_draft_next_to_the_prompt() -> io::Result<()> {
     for submission in ["/ask Что ты умеешь?\r", "/ask\rЧто ты умеешь?\r/end\r"]
